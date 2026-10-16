@@ -59,6 +59,18 @@ pub fn estrutura(string codigo) -> ItemEstrutura[] ={
     return json_decode(_estrutura[codigo]) as ItemEstrutura[];
 }
 
+pub fn posto_existe(string codigo) -> bool ={
+    return has(_postos, codigo);
+}
+
+pub fn postos_codigos() -> string[] ={
+    return sort(keys(_postos));
+}
+
+pub fn posto_json(string codigo) -> string ={
+    return _postos[codigo];
+}
+
 // ── ciclo de vida ─────────────────────────────────────────
 
 fn iniciar(string dir) -> bool ={

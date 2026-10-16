@@ -39,7 +39,7 @@ pub fn salvar(string dir, string colecao, map<string,string> dados) -> bool ={
 pub fn maior_id(map<string,string> dados) -> int ={
     int topo = 0;
     for (string chave in keys(dados)) {
-        int n = to_int(chave);
+        int n = parse_int(chave) ?? 0;
         if (n > topo) { topo = n; }
     }
     return topo;

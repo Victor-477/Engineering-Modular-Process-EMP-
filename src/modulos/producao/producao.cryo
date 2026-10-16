@@ -19,6 +19,11 @@
 //  Eventos publicados:
 //    op.criada, op.liberada, op.cancelada, op.concluida,
 //    producao.apontada (op, produto, boa, refugo, posto, operador)
+//
+//  Eventos assinados:
+//    maquina.parada / maquina.liberada — um posto parado recusa
+//    apontamento (409). A produção não conhece o módulo de manutenção:
+//    só o evento.
 // ============================================================
 
 import "../../nucleo/contrato.cryo" as k;
@@ -41,6 +46,7 @@ pub struct OrdemProducao {
 
 string _dir = "";
 map<string,string> _ordens = {};    // id -> json(OrdemProducao)
+map<string,string> _parados = {};   // posto -> id da parada aberta
 int _proximo = 1;
 
 fn _ler(int id) -> OrdemProducao ={
@@ -76,6 +82,10 @@ fn iniciar(string dir) -> bool ={
 }
 
 fn ao_evento(k::Evento e) -> bool ={
+    map<string,string> d = form::ler(e.dados);
+    string posto = form::campo(d, "posto");
+    if (e.tipo == "maquina.parada") { _parados[posto] = form::campo(d, "parada"); }
+    if (e.tipo == "maquina.liberada" && has(_parados, posto)) { remove(_parados, posto); }
     return true;
 }
 
@@ -85,13 +95,15 @@ fn _criar(k::Requisicao r) -> k::Resposta ={
     map<string,string> f = form::ler(r.corpo);
     string produto = upper(form::campo(f, "produto"));
     number qtd = form::numero(f, "quantidade", 0.0);
+    string posto = upper(form::campo(f, "posto"));
     if (!cadastros::existe(produto)) { return k::erro(422, "produto " + produto + " não cadastrado"); }
+    if (len(posto) > 0 && !cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
     if (cadastros::produto(produto).tipo == "MP") { return k::erro(422, "matéria-prima não é produzida"); }
     if (qtd <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
     int agora = now_ms();
     OrdemProducao op = OrdemProducao {
         id: _proximo, produto: produto, quantidade: qtd, produzido: 0.0, refugo: 0.0,
-        status: "PLANEJADA", posto: upper(form::campo(f, "posto")),
+        status: "PLANEJADA", posto: posto,
         criada_em: agora, atualizada_em: agora
     };
     _proximo = _proximo + 1;
@@ -101,7 +113,8 @@ fn _criar(k::Requisicao r) -> k::Resposta ={
 }
 
 fn _transicao(k::Requisicao r, string de1, string de2, string para, string evento) -> k::Resposta ={
-    int id = to_int(k::param(r, "id"));
+    // parse_int, nunca to_int: to_int("abc") aborta o processo inteiro.
+    int id = parse_int(k::param(r, "id")) ?? 0;
     if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
     OrdemProducao op = _ler(id);
     if (op.status != de1 && op.status != de2) {
@@ -114,11 +127,15 @@ fn _transicao(k::Requisicao r, string de1, string de2, string para, string event
 }
 
 fn _apontar(k::Requisicao r) -> k::Resposta ={
-    int id = to_int(k::param(r, "id"));
+    int id = parse_int(k::param(r, "id")) ?? 0;
     if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
     OrdemProducao op = _ler(id);
     if (op.status != "LIBERADA" && op.status != "EM_PRODUCAO") {
         return k::erro(409, "só se aponta OP liberada ou em produção (atual: " + op.status + ")");
+    }
+    if (len(op.posto) > 0 && has(_parados, op.posto)) {
+        return k::erro(409, "posto " + op.posto + " está parado (parada #"
+            + _parados[op.posto] + "): encerre a parada antes de apontar");
     }
     map<string,string> f = form::ler(r.corpo);
     number boa = form::numero(f, "boa", 0.0);
@@ -157,7 +174,7 @@ fn _indicadores() -> string ={
     number produzido = 0.0;
     number refugo = 0.0;
     for (string id in keys(_ordens)) {
-        OrdemProducao op = _ler(to_int(id));
+        OrdemProducao op = _ler(parse_int(id) ?? 0);
         if (has(por_status, op.status)) {
             por_status[op.status] = por_status[op.status] + 1;
         } else {
@@ -197,7 +214,7 @@ pub fn descritor() -> k::Modulo ={
         contrato: 1,
         prefixo: "/api/producao",
         depende: ["cadastros"],
-        assina: [],
+        assina: ["maquina.*"],
         perfis_escrita: ["admin", "pcp", "operador"],
         iniciar: iniciar,
         rotear: rotear,

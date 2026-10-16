@@ -53,6 +53,15 @@ fn caso_tokens() -> bool ={
         && seg::identificar(anon) == "";
 }
 
+fn caso_inteiros() -> bool ={
+    // parse_int/inteiro nunca abortam — to_int("abc") derrubaria o servidor.
+    map<string,string> f = form::ler("id=12&lixo=abc&grande=99999999999999999999");
+    return form::inteiro(f, "id", 0) == 12
+        && form::inteiro(f, "lixo", -1) == -1
+        && form::inteiro(f, "grande", -1) == -1
+        && form::inteiro(f, "ausente", 7) == 7;
+}
+
 fn caso_respostas() -> bool ={
     k::Resposta r = k::erro(422, "campo \"x\" inválido");
     return r.status == 422 && starts_with(r.corpo, "{\"erro\":")
@@ -68,9 +77,9 @@ fn relatar(string nome, bool ok) ={
 }
 
 string[] nomes = ["assinatura de eventos", "fila de eventos", "form-urlencoded",
-                  "números", "tokens e perfis", "respostas JSON"];
+                  "números", "inteiros sem abortar", "tokens e perfis", "respostas JSON"];
 bool[] resultados = [caso_assinatura(), caso_fila(), caso_form(),
-                     caso_numeros(), caso_tokens(), caso_respostas()];
+                     caso_numeros(), caso_inteiros(), caso_tokens(), caso_respostas()];
 for (int i in 0..len(nomes)) {
     total = total + 1;
     if (!resultados[i]) { falhas = falhas + 1; }

@@ -28,15 +28,16 @@ Requisitos que orientaram a arquitetura:
 
 ## 2. Escopo funcional
 
-### 2.1 Entregue no esqueleto (v0.1)
+### 2.1 Entregue (v0.2)
 
 | Módulo | Tipo | Responsabilidade | Eventos publicados | Assina |
 |---|---|---|---|---|
 | **Cadastros** | interno | Produtos (MP/SA/PA), estrutura de produto (BOM), postos de trabalho | `produto.salvo`, `estrutura.alterada` | — |
-| **Produção** | interno | Ordens de produção (OP), máquina de estados, apontamento de produção boa/refugo, indicadores | `op.criada`, `op.liberada`, `op.cancelada`, `op.concluida`, `producao.apontada` | — |
+| **Produção** | interno | Ordens de produção (OP), máquina de estados, apontamento de produção boa/refugo, indicadores; recusa apontar em posto parado | `op.criada`, `op.liberada`, `op.cancelada`, `op.concluida`, `producao.apontada` | `maquina.*` |
 | **Estoque** | interno | Saldos, movimentos, entrada manual, ajuste de inventário, **backflush** (baixa automática por estrutura ao apontar), alerta de falta na liberação | `estoque.movimentado`, `estoque.falta`, `estoque.negativo` | `producao.apontada`, `op.liberada` |
+| **Manutenção** | interno | Paradas de posto por categoria, registro retroativo, encerramento com solução, disponibilidade na janela de 8 h, MTTR | `maquina.parada`, `maquina.liberada` | — |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
-| **Sistema** | núcleo | Saúde, lista de módulos e estado, autenticação, perfis, auditoria, painel | — | — |
+| **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
 
 Máquina de estados da OP:
 
@@ -52,7 +53,7 @@ PLANEJADA --liberar--> LIBERADA --apontar--> EM_PRODUCAO --(produzido >= qtd)-->
 |---|---|---|---|
 | PCP / MRP (planejamento de necessidades) | interno | cadastros, estoque, produção | Explode estrutura × demanda; precisa de datas de calendário (L-12) |
 | Programação da produção (sequenciamento por posto) | interno | produção, cadastros | Capacidade em horas por posto já existe no cadastro |
-| Manutenção (preventiva/corretiva) | plugin | — | Ouve `maquina.parada`; publica `maquina.liberada` |
+| Manutenção preventiva (planos por horas/ciclos) | interno | manutencao | A corretiva entrou na v0.2; a preventiva precisa de calendário (L-12) |
 | OEE / Coleta de chão de fábrica | plugin | produção | Disponibilidade × desempenho × qualidade; integração com CLP depende de L-19 |
 | Rastreabilidade de lotes | interno | estoque, produção | Lote/série no apontamento e no consumo |
 | Compras | plugin | estoque | Ouve `estoque.falta` |
@@ -152,6 +153,7 @@ Catálogo de eventos v1:
 | `estoque.movimentado` | estoque | `produto`, `quantidade`, `saldo` |
 | `estoque.falta` | estoque | `op`, `componente`, `necessario`, `disponivel` |
 | `estoque.negativo` | estoque | `produto`, `saldo` |
+| `maquina.parada` / `maquina.liberada` | manutenção | `parada`, `posto`, `categoria`, `minutos` |
 
 ## 4. Contrato de módulo (ABI) — `src/nucleo/contrato.cryo`
 
@@ -184,9 +186,10 @@ Regras:
 ## 5. Estrutura de diretórios
 
 ```
-
+Engineering-Modular-Process-EMP-/
 ├── ESCOPO.md                  este documento
-├── README.md                  como compilar, rodar e usar a API
+├── README.md                  como compilar, rodar e usar a API (com capturas)
+├── CHANGELOG.md               histórico de versões
 ├── build.ps1                  testes + build dos .exe
 ├── src/
 │   ├── main.cryo              bootstrap, configuração, laço HTTP, rotas /api/sistema
@@ -204,7 +207,8 @@ Regras:
 │       ├── catalogo.cryo      ÚNICO arquivo editado para incluir módulo interno
 │       ├── cadastros/cadastros.cryo
 │       ├── producao/producao.cryo
-│       └── estoque/estoque.cryo
+│       ├── estoque/estoque.cryo
+│       └── manutencao/manutencao.cryo
 ├── plugins/                   manifestos lidos em tempo de execução
 │   └── qualidade.plugin
 ├── plugins_src/
@@ -212,6 +216,9 @@ Regras:
 ├── tests/
 │   ├── test_nucleo.cryo       harness em programa comum
 │   └── test_eventos.cryo      `test fn` rodado por `cryoc test`
+├── tools/
+│   └── demo.cryo              carga de demonstração (via HTTP, modo dev)
+├── docs/screenshots/          capturas do painel
 └── build/                     emp.exe, qualidade.exe (gerados)
 ```
 
@@ -254,7 +261,7 @@ C:\EMP\
 | Plugins | Só via HTTP local; manifesto chave=valor; prefixo obrigatório `/api/` | Plugin roda com os mesmos privilégios do usuário do serviço |
 | Sandbox | `PYRO_POLICY` (capabilities) disponível no runtime | A definir por instalação: `fs.read/fs.write=./dados`, `net=127.0.0.1` |
 
-Perfis previstos: `admin`, `pcp`, `operador`, `almoxarife`, `qualidade`, `consulta`.
+Perfis previstos: `admin`, `pcp`, `operador`, `almoxarife`, `manutencao`, `qualidade`, `consulta`.
 
 ## 8. Build e implantação no Windows
 
@@ -309,11 +316,11 @@ Legenda — **Verificado**: reproduzido durante a construção deste esqueleto.
 
 | ID | Lacuna | Evidência | Impacto no ERP | Contorno usado no esqueleto | Prioridade |
 |---|---|---|---|---|---|
-| **L-01** | O otimizador AST **apaga** uma variável local do tipo função cujo único uso é uma chamada (`fn(T)->R h = m.f; h(x);`) — gera código que referencia `h` inexistente | Verificado (pyro e node; some com `--no-opt`). Causa: `_read_counts` em `Cryo/optimize.py` conta só `Identifier`, não o nome de um `Call` | Despacho dinâmico de módulos — o coração da arquitetura — quebra em silêncio. `pyro build` não tem `--no-opt` | Chamar sempre via **parâmetro** (`_chamar_rotear(f, r)`) | **Crítica** |
+| **L-01** | ✅ *Corrigido em `Cryo` af8eb26 (otimizador e inliner) e `Burnout` 8cf4104 (testes pyro/go/node); reprodução original conferida no EMP. As funções-ponte `_chamar_*` do registro continuam válidas, só deixaram de ser obrigatórias.* Original: o otimizador AST **apaga** uma variável local do tipo função cujo único uso é uma chamada (`fn(T)->R h = m.f; h(x);`) — gera código que referencia `h` inexistente | Verificado (pyro e node; some com `--no-opt`). Causa: `_read_counts` em `Cryo/optimize.py` conta só `Identifier`, não o nome de um `Call` | Despacho dinâmico de módulos — o coração da arquitetura — quebra em silêncio. `pyro build` não tem `--no-opt` | Chamar sempre via **parâmetro** (`_chamar_rotear(f, r)`) | **Crítica** |
 | **L-02** | Sem banco de dados, índices, transações, travas de arquivo | Código (tabela de natives) | Regravação O(n) por escrita; saldo e histórico podem divergir se a 2ª gravação falhar; duas instâncias corrompem dados | JSON por coleção + `write_file_atomic` | **Crítica** para escala |
 | **L-03** | Sem *append* em arquivo | Código | Log/auditoria exige regravar tudo | Cada descarga cria um arquivo novo e imutável | Média |
 | **L-04** | Sem hash (SHA-256/bcrypt), HMAC, aleatório criptográfico, comparação em tempo constante; servidor sem TLS | Código | Tokens/senhas em texto puro; sessão não assinável; tráfego em claro na rede da fábrica | Tokens fixos em variável de ambiente; proxy HTTPS externo | **Crítica** |
-| **L-05** | `json_decode` em texto inválido **aborta a VM e o `try/catch` não captura**; `as T` **não valida** (campo ausente vira `null`, `"codigo":5` entra como int em campo `string`) | Verificado | Um POST malformado derrubaria o servidor inteiro; dados de tipo errado persistidos em silêncio | Entrada externa só em form-urlencoded; JSON só para dados que o próprio ERP gravou | **Crítica** |
+| **L-05** | 🟡 *`to_int`/`to_number` têm o mesmo defeito (abortam em texto inválido, sem captura); `parse_int`/`parse_number` (Cryo ad3c869) devolvem opcional e o EMP v0.2 passou a usá-los em toda entrada externa.* Original: `json_decode` em texto inválido **aborta a VM e o `try/catch` não captura**; `as T` **não valida** (campo ausente vira `null`, `"codigo":5` entra como int em campo `string`) | Verificado | Um POST malformado derrubaria o servidor inteiro; dados de tipo errado persistidos em silêncio | Entrada externa só em form-urlencoded; JSON só para dados que o próprio ERP gravou | **Crítica** |
 | **L-06** | Sem carregamento dinâmico de código (carregar `.pyro`/DLL em runtime) | Código | Módulo interno exige recompilar o núcleo | Plugins como processos HTTP | Alta |
 | **L-07** | **Sem atribuição a campo de struct** (`op.status = "X"` é erro de sintaxe) | Verificado | Toda mudança de estado reconstrói a struct campo a campo; esquecer um campo zera o dado | Funções `_com(...)` que reconstroem a struct num só lugar | Alta |
 | **L-08** | Sem tratamento de sinais / desligamento gracioso / timers; `print` de um `.exe` redirecionado é **bufferizado e perdido** ao matar o processo | Verificado (log vazio após `Stop-Process`) | Serviço sem log observável; buffer de auditoria perdido ao parar o serviço | Buffer pequeno de auditoria; nenhum para o log | Alta |
@@ -330,6 +337,7 @@ Legenda — **Verificado**: reproduzido durante a construção deste esqueleto.
 | **L-19** | Sem sockets TCP/UDP crus, porta serial, nem protocolos industriais (Modbus TCP, OPC UA, MQTT) | Código | Coleta automática de CLPs/sensores (OEE, contadores de máquina) impossível nativamente | Apontamento manual por HTTP | **Crítica** para integração com máquinas |
 | **L-20** | Sem regex, compressão, geração de PDF/XLSX | Código | Validações complexas e relatórios formatados | CSV/JSON; impressão pelo navegador | Baixa |
 | **L-21** | Sem integração com o Service Control Manager do Windows | Código | Não roda como serviço sozinho | NSSM/WinSW | Média |
+| **L-22** | O servidor nativo só escuta **IPv4** (`INADDR_ANY`), e por ser sequencial fica preso nas conexões especulativas que o navegador abre e não usa | Verificado: pelo navegador, `localhost` → 260–320 ms por requisição e 669 ms por atualização do painel; `127.0.0.1` → 12–20 ms e 67 ms. Um curl esperou 2,8 s atrás de uma conexão ociosa do navegador | Painel lento se aberto por `localhost`; picos de espera de até `PYRO_HTTP_TIMEOUT_MS` | Acessar por IP; `PYRO_HTTP_TIMEOUT_MS` 1000–2000 | Média |
 
 ## 11. Problemas que podem ocorrer se os recursos não forem criados
 
@@ -354,8 +362,8 @@ Legenda — **Verificado**: reproduzido durante a construção deste esqueleto.
 
 ## 12. Roadmap sugerido
 
-**Fase A — Linguagem (bloqueadores de produção).** ✅ L-13 e o grosso de
-L-09/L-18 (timeouts, cliente nativo) já entraram. Faltam: L-01 (otimizador),
+**Fase A — Linguagem (bloqueadores de produção).** ✅ L-01, L-13 e o grosso
+de L-09/L-18 (timeouts, cliente nativo) já entraram. Faltam:
 L-05 (`json_decode` que devolve erro capturável + validação de `as T`),
 cabeçalhos de resposta HTTP (L-09), L-07 (atribuição a campo), L-08
 (flush de stdout/stderr e `on_shutdown`), L-11 (overflow verificado na VM; tipo
@@ -391,7 +399,19 @@ Executado nesta máquina (Windows 11, MinGW gcc, VM Pyro em C):
 - Plugin: descoberto pelo manifesto, `ativo`, NC automática aberta pelo evento
   (refugo 16,7% > 5%), NC manual via proxy; plugin parado → 502/503 e o resto do
   ERP continua; plugin ausente na partida → `falhou` e 503 em ~1 ms.
-- Testes do núcleo: 6/6 na VM Pyro (`tests/test_nucleo.cryo`).
+- Testes do núcleo: 7/7 na VM Pyro (`tests/test_nucleo.cryo`) e 2/2 com `cryoc test`.
+
+**v0.2 (painel e manutenção)**, com `emp.exe` e `qualidade.exe` reais:
+- `tools/demo.cryo` popula tudo sem falhas; a Produção recusou apontar na
+  SOLDA-01 parada (409) — integração só por evento.
+- Após reinício, a recusa continua (a Manutenção reanuncia as paradas abertas).
+- `POST /api/producao/apontar?id=abc` → 404, servidor no ar (antes abortaria).
+- Pelo navegador (painel): parada encerrada com solução, apontamento de 45/2
+  na OP #4 (liberada após a parada), OP #7 criada, parada de Qualidade aberta
+  retroativamente — refletidos em todas as abas e no feed de eventos.
+- Disponibilidade conferida à mão: PINTURA-01 com 160 min parados em 480 → 66,7%.
+- Capturas em `docs/screenshots/` feitas desse estado.
 
 **Não verificado:** carga/concorrência, execução como serviço Windows, backends
-go/node para o ERP completo (não compilam — L-17), o painel num navegador real.
+go/node para o ERP completo (não compilam — L-17), navegadores além do
+Chromium/Edge.

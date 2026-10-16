@@ -13,11 +13,13 @@ import "../nucleo/contrato.cryo"       as k;
 import "cadastros/cadastros.cryo"      as cadastros;
 import "producao/producao.cryo"        as producao;
 import "estoque/estoque.cryo"          as estoque;
+import "manutencao/manutencao.cryo"    as manutencao;
 
 pub fn todos() -> k::Modulo[] ={
     return [
         cadastros::descritor(),
         producao::descritor(),
-        estoque::descritor()
+        estoque::descritor(),
+        manutencao::descritor()
     ];
 }

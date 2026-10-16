@@ -31,7 +31,7 @@ int _proximo = 1;
 
 pub fn saldo(string produto) -> number ={
     if (!has(_saldos, produto)) { return 0.0; }
-    return to_number(_saldos[produto]);
+    return parse_number(_saldos[produto]) ?? 0.0;
 }
 
 // Um movimento grava as DUAS coleções. Não há transação na

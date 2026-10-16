@@ -97,7 +97,7 @@ fn _proxy(string url, k::Requisicao r) -> k::Resposta ={
     string cab = bruto[0..nl];
     int bar = find(cab, "|");
     if (bar <= 0) { return k::erro(502, "resposta de plugin malformada"); }
-    return k::Resposta { status: to_int(cab[0..bar]), tipo: cab[bar + 1..], corpo: bruto[nl + 1..] };
+    return k::Resposta { status: parse_int(cab[0..bar]) ?? 502, tipo: cab[bar + 1..], corpo: bruto[nl + 1..] };
 }
 
 fn _evento(string url, k::Evento e) -> bool ={
@@ -116,7 +116,7 @@ fn _fabricar(map<string,string> m) -> k::Modulo ={
         id: m["id"],
         nome: form::campo_ou(m, "nome", m["id"]),
         versao: form::campo_ou(m, "versao", "0.0.0"),
-        contrato: to_int(form::campo_ou(m, "contrato", "1")),
+        contrato: parse_int(form::campo_ou(m, "contrato", "1")) ?? 1,
         prefixo: m["prefixo"],
         depende: _lista(form::campo(m, "depende")),
         assina: _lista(form::campo(m, "assina")),

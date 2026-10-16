@@ -27,7 +27,7 @@ import "nucleo/plugins.cryo"   as plugins;
 import "nucleo/painel.cryo"    as painel;
 import "modulos/catalogo.cryo" as catalogo;
 
-const string VERSAO = "0.1.0";
+const string VERSAO = "0.2.0";
 
 fn cfg(string nome, string padrao) -> string ={
     string v = env(nome);
@@ -45,6 +45,15 @@ fn sistema(string path, k::Requisicao r) -> k::Resposta ={
     }
     if (path == "/api/sistema/modulos") {
         return k::ok(reg::listar_json());
+    }
+    if (path == "/api/sistema/eventos") {
+        int n = parse_int(k::param(r, "n")) ?? 30;
+        return k::ok(ev::recentes_json(clamp(n, 1, 100)));
+    }
+    if (path == "/api/sistema/sessao") {
+        return k::ok("{\"usuario\":" + json_encode(r.usuario)
+            + ",\"perfil\":" + json_encode(r.perfil)
+            + ",\"modo_aberto\":" + to_string(seg::modo_aberto()) + "}");
     }
     return k::nao_encontrado();
 }
@@ -79,7 +88,7 @@ fn atender(map<string,string> req) -> k::Resposta ={
 
 // ── inicialização ─────────────────────────────────────────
 
-int porta = to_int(cfg("ERP_PORTA", "8080"));
+int porta = parse_int(cfg("ERP_PORTA", "8080")) ?? 8080;
 string dir_dados = cfg("ERP_DADOS", "dados");
 string dir_plugins = cfg("ERP_PLUGINS", "plugins");
 
@@ -97,6 +106,9 @@ for (k::Modulo m in plugins::descobrir(dir_plugins)) {
     if (len(falha) > 0) { print("  [plugin recusado] " + falha); }
 }
 int ativos = reg::iniciar_todos(dir_dados);
+// Entrega já o que os módulos publicaram ao iniciar (ex.: manutenção
+// reanuncia paradas abertas), antes da primeira requisição.
+reg::drenar_eventos(1000);
 print("  módulos ativos: " + to_string(ativos) + " de " + to_string(reg::total()));
 if (seg::modo_aberto()) {
     print("  ATENÇÃO: ERP_TOKENS vazio — modo desenvolvimento, sem autenticação");
@@ -107,7 +119,9 @@ if (seg::modo_aberto()) {
 if (!http_listen(porta)) {
     print("não foi possível abrir a porta " + to_string(porta));
 } else {
-    print("  ouvindo em http://localhost:" + to_string(porta));
+    // 127.0.0.1, não "localhost": o servidor nativo só escuta IPv4 e o
+    // Windows tenta ::1 primeiro — ~200 ms a mais por conexão (L-22).
+    print("  ouvindo em http://127.0.0.1:" + to_string(porta) + "  (painel em /)");
     while (true) {
         map<string,string> req = http_accept();
         if (len(req["method"]) > 0) {

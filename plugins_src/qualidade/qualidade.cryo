@@ -77,13 +77,13 @@ fn _req(map<string,string> r) -> string ={
 string porta = env("QUALIDADE_PORTA");
 if (len(porta) == 0) { porta = "8091"; }
 string lim = env("QUALIDADE_LIMITE");
-if (form::eh_numero(lim)) { _limite = to_number(lim); }
+if (form::eh_numero(lim)) { _limite = parse_number(lim) ?? 5.0; }
 if (!is_dir("dados")) { make_dir("dados"); }
 if (!is_dir(_dir)) { make_dir(_dir); }
 _ncs = db::carregar(_dir, "ncs");
 _proximo = db::maior_id(_ncs) + 1;
 
-if (!http_listen(to_int(porta))) {
+if (!http_listen(parse_int(porta) ?? 8091)) {
     print("qualidade: porta " + porta + " indisponível");
 } else {
     print("plugin qualidade ouvindo em 127.0.0.1:" + porta + " (limite de refugo " + to_string(_limite) + "%)");

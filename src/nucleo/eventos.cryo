@@ -15,14 +15,21 @@
 import "contrato.cryo" as k;
 
 k::Evento[] _fila = [];
+k::Evento[] _recentes = [];   // últimos eventos, para o painel e auditoria
 int _seq = 0;
 int _publicados = 0;
+int _max_recentes = 100;
 
 pub fn publicar(string tipo, string origem, string dados) -> int ={
     _seq = _seq + 1;
     _publicados = _publicados + 1;
-    _fila = concat(_fila, [k::Evento { id: _seq, tipo: tipo, origem: origem,
-                                       dados: dados, ts: now_ms() }]);
+    k::Evento e = k::Evento { id: _seq, tipo: tipo, origem: origem,
+                              dados: dados, ts: now_ms() };
+    _fila = concat(_fila, [e]);
+    _recentes = concat(_recentes, [e]);
+    if (len(_recentes) > _max_recentes) {
+        _recentes = _recentes[len(_recentes) - _max_recentes..];
+    }
     return _seq;
 }
 
@@ -32,6 +39,17 @@ pub fn pendentes() -> int ={
 
 pub fn total_publicados() -> int ={
     return _publicados;
+}
+
+// Os `n` eventos mais recentes, do mais novo para o mais antigo.
+pub fn recentes_json(int n) -> string ={
+    string[] itens = [];
+    int i = len(_recentes) - 1;
+    while (i >= 0 && len(itens) < n) {
+        itens = concat(itens, [json_encode(_recentes[i])]);
+        i = i - 1;
+    }
+    return "[" + join(itens, ",") + "]";
 }
 
 // Retira e devolve a fila inteira de uma vez.

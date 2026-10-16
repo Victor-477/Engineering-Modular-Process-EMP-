@@ -1,0 +1,231 @@
+// ============================================================
+//  manutencao.cryo — Módulo de Manutenção (paradas de posto)
+//
+//  Registra paradas de máquina por posto de trabalho e calcula a
+//  disponibilidade de cada posto numa janela móvel (padrão: 8 h, um
+//  turno) — o primeiro fator do OEE.
+//
+//  Integração SÓ por eventos: ao abrir uma parada publica
+//  `maquina.parada`, ao encerrar `maquina.liberada`. A produção
+//  assina esses eventos e recusa apontamento num posto parado — sem
+//  que um módulo importe o outro.
+//
+//  Rotas (prefixo /api/manutencao):
+//    GET  /paradas[?status=ABERTA|ENCERRADA]
+//    POST /paradas            posto=&categoria=&motivo=[&ha_minutos=N]
+//                             ha_minutos: registro retroativo (0..720) — a
+//                             parada é anotada depois de ter começado
+//    POST /encerrar?id=N      solucao=
+//    GET  /postos             estado e disponibilidade de cada posto
+//    GET  /indicadores        paradas abertas, MTTR, minutos por categoria
+//
+//  Categorias: MECANICA, ELETRICA, SETUP, FALTA_MATERIAL, QUALIDADE, OUTROS
+// ============================================================
+
+import "../../nucleo/contrato.cryo"  as k;
+import "../../nucleo/persist.cryo"   as db;
+import "../../nucleo/eventos.cryo"   as ev;
+import "../../nucleo/form.cryo"      as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+
+pub struct Parada {
+    int id;
+    string posto;
+    string categoria;
+    string motivo;
+    string solucao;
+    string status;          // ABERTA | ENCERRADA
+    string aberta_por;
+    int inicio;             // ms
+    int fim;                // ms; 0 enquanto aberta
+}
+
+const int JANELA_MS = 28800000;      // 8 h
+
+string _dir = "";
+map<string,string> _paradas = {};    // id -> json(Parada)
+int _proximo = 1;
+
+fn _ler(string id) -> Parada ={
+    return json_decode(_paradas[id]) as Parada;
+}
+
+fn _categoria_valida(string c) -> bool ={
+    return index_of(["MECANICA", "ELETRICA", "SETUP", "FALTA_MATERIAL", "QUALIDADE", "OUTROS"], c) >= 0;
+}
+
+// id da parada aberta do posto, ou "".
+fn _aberta_em(string posto) -> string ={
+    for (string id in keys(_paradas)) {
+        Parada p = _ler(id);
+        if (p.posto == posto && p.status == "ABERTA") { return id; }
+    }
+    return "";
+}
+
+// Milissegundos parados do posto dentro de [agora - janela, agora].
+fn _parado_na_janela(string posto, int agora) -> int ={
+    int ini_janela = agora - JANELA_MS;
+    int total = 0;
+    for (string id in keys(_paradas)) {
+        Parada p = _ler(id);
+        if (p.posto != posto) { continue; }
+        int fim = p.fim;
+        if (p.status == "ABERTA") { fim = agora; }
+        int a = max(p.inicio, ini_janela);
+        int b = min(fim, agora);
+        if (b > a) { total = total + (b - a); }
+    }
+    return total;
+}
+
+fn _anunciar(string tipo, Parada p) ={
+    ev::publicar(tipo, "manutencao", "parada=" + to_string(p.id)
+        + "&posto=" + url_encode(p.posto)
+        + "&categoria=" + url_encode(p.categoria)
+        + "&minutos=" + to_string((max(p.fim, p.inicio) - p.inicio) / 60000));
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _paradas = db::carregar(dir, "paradas");
+    _proximo = db::maior_id(_paradas) + 1;
+    // Reanuncia as paradas abertas: quem guarda estado derivado delas
+    // (a produção) volta a saber após um reinício.
+    for (string id in keys(_paradas)) {
+        Parada p = _ler(id);
+        if (p.status == "ABERTA") { _anunciar("maquina.parada", p); }
+    }
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    return true;
+}
+
+// ── handlers ──────────────────────────────────────────────
+
+fn _abrir(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string posto = upper(form::campo(f, "posto"));
+    string categoria = upper(form::campo_ou(f, "categoria", "OUTROS"));
+    string motivo = form::campo(f, "motivo");
+    if (!cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
+    if (!_categoria_valida(categoria)) { return k::erro(422, "categoria inválida: " + categoria); }
+    if (len(motivo) == 0) { return k::erro(422, "motivo é obrigatório"); }
+    int ha = form::inteiro(f, "ha_minutos", 0);
+    if (ha < 0 || ha > 720) { return k::erro(422, "ha_minutos deve estar entre 0 e 720"); }
+    string aberta = _aberta_em(posto);
+    if (len(aberta) > 0) { return k::erro(409, "posto " + posto + " já tem a parada #" + aberta + " aberta"); }
+
+    Parada p = Parada {
+        id: _proximo, posto: posto, categoria: categoria, motivo: motivo, solucao: "",
+        status: "ABERTA", aberta_por: r.usuario, inicio: now_ms() - ha * 60000, fim: 0
+    };
+    _proximo = _proximo + 1;
+    _paradas[to_string(p.id)] = json_encode(p);
+    if (!db::salvar(_dir, "paradas", _paradas)) { return k::erro(500, "falha ao gravar a parada"); }
+    _anunciar("maquina.parada", p);
+    return k::criado(_paradas[to_string(p.id)]);
+}
+
+fn _encerrar(k::Requisicao r) -> k::Resposta ={
+    string id = to_string(parse_int(k::param(r, "id")) ?? 0);
+    if (!has(_paradas, id)) { return k::erro(404, "parada inexistente"); }
+    Parada p = _ler(id);
+    if (p.status != "ABERTA") { return k::erro(409, "parada #" + id + " já está encerrada"); }
+    map<string,string> f = form::ler(r.corpo);
+    // Sem atribuição a campo de struct (ESCOPO.md, L-07): reconstrói.
+    Parada nova = Parada {
+        id: p.id, posto: p.posto, categoria: p.categoria, motivo: p.motivo,
+        solucao: form::campo(f, "solucao"), status: "ENCERRADA",
+        aberta_por: p.aberta_por, inicio: p.inicio, fim: now_ms()
+    };
+    _paradas[id] = json_encode(nova);
+    if (!db::salvar(_dir, "paradas", _paradas)) { return k::erro(500, "falha ao gravar a parada"); }
+    _anunciar("maquina.liberada", nova);
+    return k::ok(_paradas[id]);
+}
+
+fn _listar(string status) -> string ={
+    string[] itens = [];
+    for (string id in keys(_paradas)) {
+        if (len(status) == 0 || contains(_paradas[id], "\"status\":\"" + status + "\"")) {
+            itens = concat(itens, [_paradas[id]]);
+        }
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _postos() -> string ={
+    int agora = now_ms();
+    string[] itens = [];
+    for (string posto in cadastros::postos_codigos()) {
+        string aberta = _aberta_em(posto);
+        int parado = _parado_na_janela(posto, agora);
+        number disp = round((JANELA_MS - parado) * 1000.0 / JANELA_MS) / 10.0;
+        string item = "{\"posto\":" + cadastros::posto_json(posto)
+            + ",\"estado\":" + json_encode(len(aberta) > 0 ? "PARADO" : "OPERANDO")
+            + ",\"minutos_parado_janela\":" + to_string(parado / 60000)
+            + ",\"disponibilidade_pct\":" + to_string(disp);
+        if (len(aberta) > 0) { item = item + ",\"parada\":" + _paradas[aberta]; }
+        itens = concat(itens, [item + "}"]);
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _indicadores() -> string ={
+    int abertas = 0;
+    int encerradas = 0;
+    int soma_reparo = 0;
+    map<string,int> por_categoria = {};
+    int agora = now_ms();
+    for (string id in keys(_paradas)) {
+        Parada p = _ler(id);
+        int fim = p.fim;
+        if (p.status == "ABERTA") {
+            abertas = abertas + 1;
+            fim = agora;
+        } else {
+            encerradas = encerradas + 1;
+            soma_reparo = soma_reparo + (p.fim - p.inicio);
+        }
+        int minutos = (fim - p.inicio) / 60000;
+        if (has(por_categoria, p.categoria)) {
+            por_categoria[p.categoria] = por_categoria[p.categoria] + minutos;
+        } else {
+            por_categoria[p.categoria] = minutos;
+        }
+    }
+    number mttr = 0.0;
+    if (encerradas > 0) { mttr = round(soma_reparo / 6000.0 / encerradas) / 10.0; }
+    return "{\"paradas_abertas\":" + to_string(abertas)
+        + ",\"paradas_encerradas\":" + to_string(encerradas)
+        + ",\"mttr_min\":" + to_string(mttr)
+        + ",\"minutos_por_categoria\":" + json_encode(por_categoria) + "}";
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/paradas" && r.metodo == "GET")  { return k::ok(_listar(upper(k::param(r, "status")))); }
+    if (r.rota == "/paradas" && r.metodo == "POST") { return _abrir(r); }
+    if (r.rota == "/encerrar" && r.metodo == "POST") { return _encerrar(r); }
+    if (r.rota == "/postos" && r.metodo == "GET")   { return k::ok(_postos()); }
+    if (r.rota == "/indicadores" && r.metodo == "GET") { return k::ok(_indicadores()); }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "manutencao",
+        nome: "Manutenção e Disponibilidade",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/manutencao",
+        depende: ["cadastros"],
+        assina: [],
+        perfis_escrita: ["admin", "manutencao", "operador"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

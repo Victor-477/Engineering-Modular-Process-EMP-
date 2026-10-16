@@ -1,0 +1,144 @@
+// ============================================================
+//  demo.cryo — carga de demonstração do EMP, escrita em Cryo
+//
+//  Popula um EMP em execução com uma linha de suportes metálicos:
+//  matérias-primas, semiacabado, acabados, estrutura (BOM), postos,
+//  entradas de estoque, ordens em vários estados, apontamentos,
+//  paradas de máquina e — se o plugin estiver no ar — NCs.
+//
+//  Exige o EMP em MODO DEV (ERP_TOKENS vazio): http_post não envia
+//  cabeçalhos, então não há como mandar o token (ESCOPO.md, L-09).
+//
+//    python ../Burnout/cryoc.py tools/demo.cryo --backend pyro --run
+//    EMP_URL=http://127.0.0.1:8080   (padrão)
+// ============================================================
+
+string _url = env("EMP_URL");
+if (len(_url) == 0) { _url = "http://127.0.0.1:8080"; }
+
+int _falhas = 0;
+
+fn post(string caminho, string corpo) -> string ={
+    string r = http_post(_url + caminho, corpo);
+    if (len(r) == 0 || starts_with(r, "{\"erro\"")) {
+        _falhas = _falhas + 1;
+        print("  ! " + caminho + "  " + corpo + "  -> " + r);
+    }
+    return r;
+}
+
+// O id de uma resposta JSON `{"...","id":N,...}`.
+fn id_de(string json) -> string ={
+    int i = find(json, "\"id\":");
+    if (i < 0) { return "0"; }
+    string resto = json[i + 5..];
+    int fim = find(resto, ",");
+    if (fim < 0) { fim = find(resto, "}"); }
+    return resto[0..fim];
+}
+
+fn produto(string codigo, string descricao, string unidade, string tipo) ={
+    post("/api/cadastros/produtos", "codigo=" + codigo + "&descricao=" + url_encode(descricao)
+        + "&unidade=" + unidade + "&tipo=" + tipo);
+}
+
+fn componente(string pai, string comp, string qtd) ={
+    post("/api/cadastros/estrutura", "produto=" + pai + "&componente=" + comp + "&quantidade=" + qtd);
+}
+
+fn posto(string codigo, string descricao, string horas) ={
+    post("/api/cadastros/postos", "codigo=" + codigo + "&descricao=" + url_encode(descricao)
+        + "&capacidade_h=" + horas);
+}
+
+fn op(string produto, string qtd, string posto) -> string ={
+    return id_de(post("/api/producao/ordens", "produto=" + produto + "&quantidade=" + qtd + "&posto=" + posto));
+}
+
+fn liberar(string id) ={ post("/api/producao/liberar?id=" + id, ""); }
+
+fn apontar(string id, string boa, string refugo, string operador) ={
+    post("/api/producao/apontar?id=" + id, "boa=" + boa + "&refugo=" + refugo + "&operador=" + operador);
+}
+
+fn parada(string posto, string categoria, string motivo, string ha_minutos) -> string ={
+    return id_de(post("/api/manutencao/paradas", "posto=" + posto + "&categoria=" + categoria
+        + "&motivo=" + url_encode(motivo) + "&ha_minutos=" + ha_minutos));
+}
+
+print("carga de demonstração em " + _url);
+string saude = http_get(_url + "/api/sistema/saude");
+if (!contains(saude, "\"status\":\"ok\"")) {
+    print("EMP não respondeu (ou exige token). Suba o emp.exe em modo dev e tente de novo.");
+} else {
+    print("- cadastros");
+    produto("ACO-CH2",  "Chapa de aço 2 mm",        "KG", "MP");
+    produto("PARAF-M6", "Parafuso M6 x 20",         "UN", "MP");
+    produto("TINTA-PO", "Tinta epóxi em pó",        "KG", "MP");
+    produto("BUCHA-08", "Bucha de nylon 8 mm",      "UN", "MP");
+    produto("BASE-SUP", "Base estampada do suporte", "UN", "SA");
+    produto("SUP-01",   "Suporte de parede simples", "UN", "PA");
+    produto("SUP-02",   "Suporte de parede reforçado", "UN", "PA");
+
+    componente("BASE-SUP", "ACO-CH2", "0.65");
+    componente("SUP-01", "BASE-SUP", "1");
+    componente("SUP-01", "PARAF-M6", "2");
+    componente("SUP-01", "TINTA-PO", "0.03");
+    componente("SUP-02", "ACO-CH2", "1.4");
+    componente("SUP-02", "PARAF-M6", "4");
+    componente("SUP-02", "BUCHA-08", "4");
+    componente("SUP-02", "TINTA-PO", "0.05");
+
+    posto("PRENSA-01",  "Prensa excêntrica 80 t", "16");
+    posto("PRENSA-02",  "Prensa hidráulica 120 t", "16");
+    posto("SOLDA-01",   "Célula de solda robotizada", "16");
+    posto("PINTURA-01", "Cabine de pintura a pó", "8");
+    posto("MONT-01",    "Bancada de montagem", "8");
+
+    print("- estoque inicial");
+    post("/api/estoque/entrada", "produto=ACO-CH2&quantidade=900&origem=NF+48213+Usiminas");
+    post("/api/estoque/entrada", "produto=PARAF-M6&quantidade=6000&origem=NF+10377+Ciser");
+    post("/api/estoque/entrada", "produto=TINTA-PO&quantidade=60&origem=NF+2201+WEG+Tintas");
+    post("/api/estoque/entrada", "produto=BUCHA-08&quantidade=1500&origem=NF+10377+Ciser");
+
+    print("- ordens de produção e apontamentos");
+    string op1 = op("BASE-SUP", "400", "PRENSA-01");
+    liberar(op1);
+    apontar(op1, "180", "4", "joao");
+    apontar(op1, "160", "3", "marcos");
+
+    string op2 = op("SUP-01", "250", "MONT-01");
+    liberar(op2);
+    apontar(op2, "150", "2", "ana");
+    apontar(op2, "100", "1", "ana");          // conclui a OP
+
+    string op3 = op("SUP-02", "200", "PRENSA-02");
+    liberar(op3);
+    apontar(op3, "70", "11", "joao");         // refugo alto -> NC automática (plugin)
+
+    string op4 = op("SUP-02", "120", "SOLDA-01");
+    liberar(op4);
+    apontar(op4, "35", "1", "rui");
+
+    string op5 = op("SUP-01", "300", "PINTURA-01");
+    string op6 = op("BASE-SUP", "600", "PRENSA-01");
+    liberar(op6);                             // falta de aço -> estoque.falta
+
+    print("- manutenção");
+    string p1 = parada("PRENSA-02", "SETUP", "Troca de matriz para SUP-02", "95");
+    post("/api/manutencao/encerrar?id=" + p1, "solucao=" + url_encode("Matriz 02 montada e aferida"));
+    string p2 = parada("PINTURA-01", "MECANICA", "Esteira travada no forno de cura", "160");
+    post("/api/manutencao/encerrar?id=" + p2, "solucao=" + url_encode("Corrente da esteira substituída"));
+    parada("SOLDA-01", "ELETRICA", "Disjuntor do robô desarmou", "42");
+
+    // A produção recusa apontar num posto parado (evento maquina.parada).
+    string bloqueado = http_post(_url + "/api/producao/apontar?id=" + op4, "boa=5");
+    print("  apontar na SOLDA-01 parada -> " + bloqueado);
+
+    if (contains(http_get(_url + "/api/sistema/modulos"), "\"id\":\"qualidade\"")) {
+        print("- qualidade");
+        post("/api/qualidade/ncs", "op=" + op1 + "&produto=BASE-SUP&motivo=" + url_encode("Rebarba acima de 0,3 mm na estampagem"));
+    }
+
+    print("feito: " + to_string(_falhas) + " falha(s)");
+}

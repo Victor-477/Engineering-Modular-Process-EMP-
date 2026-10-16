@@ -27,8 +27,9 @@ pub fn campo_ou(map<string,string> f, string nome, string padrao) -> string ={
     return v;
 }
 
-// Só dígitos, um ponto (ou vírgula) e sinal opcional. Evita depender
-// do comportamento de to_number em texto inválido.
+// Só dígitos, um ponto (ou vírgula) e sinal opcional. Nunca chamar
+// to_int/to_number em texto do usuário: em texto inválido eles ABORTAM
+// o processo (não é capturável). parse_int/parse_number devolvem null.
 pub fn eh_numero(string s) -> bool ={
     if (len(s) == 0) { return false; }
     int pontos = 0;
@@ -51,5 +52,9 @@ pub fn eh_numero(string s) -> bool ={
 pub fn numero(map<string,string> f, string nome, number padrao) -> number ={
     string v = replace(campo(f, nome), ",", ".");
     if (!eh_numero(v)) { return padrao; }
-    return to_number(v);
+    return parse_number(v) ?? padrao;
+}
+
+pub fn inteiro(map<string,string> f, string nome, int padrao) -> int ={
+    return parse_int(campo(f, nome)) ?? padrao;
 }
