@@ -1,0 +1,23 @@
+// ============================================================
+//  catalogo.cryo — os módulos INTERNOS compilados neste binário
+//
+//  Este é o ÚNICO arquivo editado para acrescentar um módulo
+//  interno: uma linha de import e uma linha na lista. Nenhum
+//  arquivo do núcleo e nenhum outro módulo muda.
+//
+//  Módulos EXTERNOS (plugins) não passam por aqui: são descobertos
+//  em tempo de execução a partir de plugins/*.json (nucleo/plugins).
+// ============================================================
+
+import "../nucleo/contrato.cryo"       as k;
+import "cadastros/cadastros.cryo"      as cadastros;
+import "producao/producao.cryo"        as producao;
+import "estoque/estoque.cryo"          as estoque;
+
+pub fn todos() -> k::Modulo[] ={
+    return [
+        cadastros::descritor(),
+        producao::descritor(),
+        estoque::descritor()
+    ];
+}

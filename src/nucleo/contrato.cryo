@@ -1,0 +1,97 @@
+// ============================================================
+//  contrato.cryo — o "ABI" de um módulo do EMP
+//
+//  Todo módulo, interno ou externo, é descrito por um `Modulo`.
+//  O núcleo NUNCA importa um módulo: ele recebe o descritor e
+//  guarda as funções como VALORES. É isso que permite ao núcleo
+//  chamar código que foi escrito depois dele, sem ciclo de import
+//  (o compilador recusa ciclos — [Module Error]).
+//
+//  Regra de compatibilidade: campos só são ACRESCENTADOS ao fim
+//  das structs abaixo. Um módulo escrito para a versão N do
+//  contrato continua compilando na N+1.
+// ============================================================
+
+pub const int VERSAO_CONTRATO = 1;
+
+// Uma requisição já autenticada. `rota` é o caminho SEM o prefixo
+// do módulo ("/api/producao/ordens" -> "/ordens").
+pub struct Requisicao {
+    string metodo;
+    string rota;
+    string query;
+    string corpo;
+    string usuario;
+    string perfil;
+}
+
+pub struct Resposta {
+    int status;
+    string tipo;
+    string corpo;
+}
+
+// Evento de domínio. `dados` vai em form-encoding ("op=3&qtd=10"),
+// lido com form::ler — nunca aborta, ao contrário de json_decode em
+// texto inválido (L-05). O barramento não conhece o formato de cada
+// evento, só o roteia pelo `tipo`.
+pub struct Evento {
+    int id;
+    string tipo;
+    string origem;
+    string dados;
+    int ts;
+}
+
+pub struct Modulo {
+    string id;              // "producao"
+    string nome;            // "Ordens de Produção"
+    string versao;          // semver do módulo
+    int contrato;           // VERSAO_CONTRATO contra a qual foi escrito
+    string prefixo;         // "/api/producao"
+    string[] depende;       // ids de módulos que precisam estar ativos
+    string[] assina;        // tipos de evento; "*" = todos; "op.*" = prefixo
+    string[] perfis_escrita;// perfis que podem POST/PUT/DELETE
+    fn(string)->bool iniciar;          // recebe o diretório de dados
+    fn(Requisicao)->Resposta rotear;
+    fn(Evento)->bool ao_evento;
+}
+
+// ── construtores de resposta ──────────────────────────────
+
+pub fn json(int status, string corpo) -> Resposta ={
+    return Resposta { status: status, tipo: "application/json", corpo: corpo };
+}
+
+pub fn ok(string corpo) -> Resposta ={
+    return json(200, corpo);
+}
+
+pub fn criado(string corpo) -> Resposta ={
+    return json(201, corpo);
+}
+
+pub fn erro(int status, string mensagem) -> Resposta ={
+    return json(status, "{\"erro\":" + json_encode(mensagem) + "}");
+}
+
+pub fn nao_encontrado() -> Resposta ={
+    return erro(404, "rota inexistente");
+}
+
+// ── utilidades de requisição ──────────────────────────────
+
+// Um parâmetro de `a=1&b=2`, já decodificado. "" quando ausente.
+pub fn param(Requisicao r, string nome) -> string ={
+    for (string p in split(r.query, "&")) {
+        int eq = find(p, "=");
+        if (eq > 0 && p[0..eq] == nome) {
+            return url_decode(p[eq + 1..]);
+        }
+    }
+    return "";
+}
+
+pub fn eh_leitura(Requisicao r) -> bool ={
+    return r.metodo == "GET" || r.metodo == "HEAD";
+}

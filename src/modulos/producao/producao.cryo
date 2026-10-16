@@ -1,0 +1,206 @@
+// ============================================================
+//  producao.cryo — Módulo de Ordens de Produção e Apontamento
+//
+//  Ciclo de vida de uma OP:
+//
+//    PLANEJADA --liberar--> LIBERADA --apontar--> EM_PRODUCAO
+//        |                     |                      |
+//        +------cancelar-------+------cancelar--------+--(produzido >= qtd)--> CONCLUIDA
+//
+//  Rotas (prefixo /api/producao):
+//    GET  /ordens[?status=X]          lista
+//    GET  /ordem?id=N                 uma OP
+//    POST /ordens                     produto=&quantidade=&posto=
+//    POST /liberar?id=N
+//    POST /apontar?id=N               boa=&refugo=&operador=
+//    POST /cancelar?id=N
+//    GET  /indicadores                OPs por status, produzido, % refugo
+//
+//  Eventos publicados:
+//    op.criada, op.liberada, op.cancelada, op.concluida,
+//    producao.apontada (op, produto, boa, refugo, posto, operador)
+// ============================================================
+
+import "../../nucleo/contrato.cryo" as k;
+import "../../nucleo/persist.cryo"  as db;
+import "../../nucleo/eventos.cryo"  as ev;
+import "../../nucleo/form.cryo"     as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+
+pub struct OrdemProducao {
+    int id;
+    string produto;
+    number quantidade;
+    number produzido;
+    number refugo;
+    string status;
+    string posto;
+    int criada_em;
+    int atualizada_em;
+}
+
+string _dir = "";
+map<string,string> _ordens = {};    // id -> json(OrdemProducao)
+int _proximo = 1;
+
+fn _ler(int id) -> OrdemProducao ={
+    return json_decode(_ordens[to_string(id)]) as OrdemProducao;
+}
+
+// Structs não têm atribuição de campo (L-07): toda mudança de estado
+// reconstrói a OP inteira aqui, num único lugar.
+fn _com(OrdemProducao op, string status, number produzido, number refugo) -> OrdemProducao ={
+    return OrdemProducao {
+        id: op.id, produto: op.produto, quantidade: op.quantidade,
+        produzido: produzido, refugo: refugo, status: status, posto: op.posto,
+        criada_em: op.criada_em, atualizada_em: now_ms()
+    };
+}
+
+fn _gravar(OrdemProducao op) -> bool ={
+    _ordens[to_string(op.id)] = json_encode(op);
+    return db::salvar(_dir, "ordens", _ordens);
+}
+
+fn _evento_op(string tipo, OrdemProducao op) ={
+    ev::publicar(tipo, "producao", "op=" + to_string(op.id)
+        + "&produto=" + url_encode(op.produto)
+        + "&quantidade=" + to_string(op.quantidade));
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _ordens = db::carregar(dir, "ordens");
+    _proximo = db::maior_id(_ordens) + 1;
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    return true;
+}
+
+// ── handlers ──────────────────────────────────────────────
+
+fn _criar(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string produto = upper(form::campo(f, "produto"));
+    number qtd = form::numero(f, "quantidade", 0.0);
+    if (!cadastros::existe(produto)) { return k::erro(422, "produto " + produto + " não cadastrado"); }
+    if (cadastros::produto(produto).tipo == "MP") { return k::erro(422, "matéria-prima não é produzida"); }
+    if (qtd <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
+    int agora = now_ms();
+    OrdemProducao op = OrdemProducao {
+        id: _proximo, produto: produto, quantidade: qtd, produzido: 0.0, refugo: 0.0,
+        status: "PLANEJADA", posto: upper(form::campo(f, "posto")),
+        criada_em: agora, atualizada_em: agora
+    };
+    _proximo = _proximo + 1;
+    if (!_gravar(op)) { return k::erro(500, "falha ao gravar a OP"); }
+    _evento_op("op.criada", op);
+    return k::criado(_ordens[to_string(op.id)]);
+}
+
+fn _transicao(k::Requisicao r, string de1, string de2, string para, string evento) -> k::Resposta ={
+    int id = to_int(k::param(r, "id"));
+    if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
+    OrdemProducao op = _ler(id);
+    if (op.status != de1 && op.status != de2) {
+        return k::erro(409, "OP " + to_string(id) + " está " + op.status + ", não pode ir para " + para);
+    }
+    OrdemProducao nova = _com(op, para, op.produzido, op.refugo);
+    _gravar(nova);
+    _evento_op(evento, nova);
+    return k::ok(_ordens[to_string(id)]);
+}
+
+fn _apontar(k::Requisicao r) -> k::Resposta ={
+    int id = to_int(k::param(r, "id"));
+    if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
+    OrdemProducao op = _ler(id);
+    if (op.status != "LIBERADA" && op.status != "EM_PRODUCAO") {
+        return k::erro(409, "só se aponta OP liberada ou em produção (atual: " + op.status + ")");
+    }
+    map<string,string> f = form::ler(r.corpo);
+    number boa = form::numero(f, "boa", 0.0);
+    number refugo = form::numero(f, "refugo", 0.0);
+    if (boa < 0.0 || refugo < 0.0 || boa + refugo <= 0.0) {
+        return k::erro(422, "informe boa e/ou refugo positivos");
+    }
+    number produzido = op.produzido + boa;
+    bool concluiu = produzido >= op.quantidade;
+    string status = "EM_PRODUCAO";
+    if (concluiu) { status = "CONCLUIDA"; }
+    OrdemProducao nova = _com(op, status, produzido, op.refugo + refugo);
+    if (!_gravar(nova)) { return k::erro(500, "falha ao gravar apontamento"); }
+
+    ev::publicar("producao.apontada", "producao", "op=" + to_string(op.id)
+        + "&produto=" + url_encode(op.produto)
+        + "&boa=" + to_string(boa) + "&refugo=" + to_string(refugo)
+        + "&posto=" + url_encode(op.posto)
+        + "&operador=" + url_encode(form::campo_ou(f, "operador", r.usuario)));
+    if (concluiu) { _evento_op("op.concluida", nova); }
+    return k::ok(_ordens[to_string(op.id)]);
+}
+
+fn _listar(string status) -> string ={
+    string[] itens = [];
+    for (string id in keys(_ordens)) {
+        if (len(status) == 0 || contains(_ordens[id], "\"" + status + "\"")) {
+            itens = concat(itens, [_ordens[id]]);
+        }
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _indicadores() -> string ={
+    map<string,int> por_status = {};
+    number produzido = 0.0;
+    number refugo = 0.0;
+    for (string id in keys(_ordens)) {
+        OrdemProducao op = _ler(to_int(id));
+        if (has(por_status, op.status)) {
+            por_status[op.status] = por_status[op.status] + 1;
+        } else {
+            por_status[op.status] = 1;
+        }
+        produzido = produzido + op.produzido;
+        refugo = refugo + op.refugo;
+    }
+    number taxa = 0.0;
+    if (produzido + refugo > 0.0) { taxa = refugo * 100.0 / (produzido + refugo); }
+    return "{\"ordens\":" + json_encode(por_status)
+        + ",\"produzido\":" + to_string(produzido)
+        + ",\"refugo\":" + to_string(refugo)
+        + ",\"refugo_pct\":" + to_string(round(taxa * 100.0) / 100.0) + "}";
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/ordens" && r.metodo == "GET") { return k::ok(_listar(upper(k::param(r, "status")))); }
+    if (r.rota == "/ordem" && r.metodo == "GET") {
+        string id = k::param(r, "id");
+        if (!has(_ordens, id)) { return k::erro(404, "OP inexistente"); }
+        return k::ok(_ordens[id]);
+    }
+    if (r.rota == "/ordens" && r.metodo == "POST")   { return _criar(r); }
+    if (r.rota == "/liberar" && r.metodo == "POST")  { return _transicao(r, "PLANEJADA", "PLANEJADA", "LIBERADA", "op.liberada"); }
+    if (r.rota == "/cancelar" && r.metodo == "POST") { return _transicao(r, "PLANEJADA", "LIBERADA", "CANCELADA", "op.cancelada"); }
+    if (r.rota == "/apontar" && r.metodo == "POST")  { return _apontar(r); }
+    if (r.rota == "/indicadores" && r.metodo == "GET") { return k::ok(_indicadores()); }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "producao",
+        nome: "Ordens de Produção e Apontamento",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/producao",
+        depende: ["cadastros"],
+        assina: [],
+        perfis_escrita: ["admin", "pcp", "operador"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

@@ -1,0 +1,104 @@
+// ============================================================
+//  qualidade.cryo — PLUGIN EXTERNO de Qualidade (processo próprio)
+//
+//  Demonstra como um módulo novo entra no EMP SEM recompilar
+//  o núcleo: este programa é compilado à parte (qualidade.exe) e
+//  anunciado por um manifesto em plugins/qualidade.plugin.
+//
+//  Regra de negócio: cada apontamento cujo refugo passe de
+//  QUALIDADE_LIMITE % (padrão 5) abre uma Não Conformidade (NC).
+//
+//  Protocolo: ver src/nucleo/plugins.cryo
+//    GET  /saude    POST /req    POST /evento
+//
+//  Build:
+//    python Burnout/pyro.py build plugins_src/qualidade/qualidade.cryo -o build/qualidade.exe
+// ============================================================
+
+import "../../src/nucleo/form.cryo"    as form;
+import "../../src/nucleo/persist.cryo" as db;
+
+string _dir = "dados/qualidade";
+map<string,string> _ncs = {};
+int _proximo = 1;
+number _limite = 5.0;
+
+fn _resp(int status, string corpo) -> string ={
+    return to_string(status) + "|application/json\n" + corpo;
+}
+
+fn _abrir_nc(string op, string produto, string motivo, string origem) -> string ={
+    string id = to_string(_proximo);
+    _proximo = _proximo + 1;
+    _ncs[id] = "{\"id\":" + id + ",\"op\":" + json_encode(op)
+        + ",\"produto\":" + json_encode(produto)
+        + ",\"motivo\":" + json_encode(motivo)
+        + ",\"origem\":" + json_encode(origem)
+        + ",\"status\":\"ABERTA\",\"ts\":" + to_string(now_ms()) + "}";
+    db::salvar(_dir, "ncs", _ncs);
+    return _ncs[id];
+}
+
+fn _evento(map<string,string> e) -> string ={
+    if (form::campo(e, "tipo") != "producao.apontada") { return "ok"; }
+    map<string,string> d = form::ler(form::campo(e, "dados"));
+    number boa = form::numero(d, "boa", 0.0);
+    number refugo = form::numero(d, "refugo", 0.0);
+    if (boa + refugo <= 0.0) { return "ok"; }
+    number pct = refugo * 100.0 / (boa + refugo);
+    if (pct > _limite) {
+        _abrir_nc(form::campo(d, "op"), form::campo(d, "produto"),
+            "refugo de " + to_string(round(pct * 10.0) / 10.0) + "% no apontamento (limite "
+            + to_string(_limite) + "%)", "automatica");
+    }
+    return "ok";
+}
+
+fn _req(map<string,string> r) -> string ={
+    string metodo = form::campo(r, "metodo");
+    string rota = form::campo(r, "rota");
+    if (rota == "/ncs" && metodo == "GET") {
+        string[] itens = [];
+        for (string id in keys(_ncs)) { itens = concat(itens, [_ncs[id]]); }
+        return _resp(200, "[" + join(itens, ",") + "]");
+    }
+    if (rota == "/ncs" && metodo == "POST") {
+        map<string,string> f = form::ler(form::campo(r, "corpo"));
+        string motivo = form::campo(f, "motivo");
+        if (len(motivo) == 0) { return _resp(400, "{\"erro\":\"motivo é obrigatório\"}"); }
+        return _resp(201, _abrir_nc(form::campo(f, "op"), upper(form::campo(f, "produto")),
+            motivo, "manual:" + form::campo(r, "usuario")));
+    }
+    return _resp(404, "{\"erro\":\"rota inexistente no plugin qualidade\"}");
+}
+
+// ── servidor do plugin ────────────────────────────────────
+
+string porta = env("QUALIDADE_PORTA");
+if (len(porta) == 0) { porta = "8091"; }
+string lim = env("QUALIDADE_LIMITE");
+if (form::eh_numero(lim)) { _limite = to_number(lim); }
+if (!is_dir("dados")) { make_dir("dados"); }
+if (!is_dir(_dir)) { make_dir(_dir); }
+_ncs = db::carregar(_dir, "ncs");
+_proximo = db::maior_id(_ncs) + 1;
+
+if (!http_listen(to_int(porta))) {
+    print("qualidade: porta " + porta + " indisponível");
+} else {
+    print("plugin qualidade ouvindo em 127.0.0.1:" + porta + " (limite de refugo " + to_string(_limite) + "%)");
+    while (true) {
+        map<string,string> req = http_accept();
+        string m = req["method"];
+        if (len(m) == 0) { continue; }
+        if (req["path"] == "/saude") {
+            http_respond(200, "text/plain", "ok");
+        } else if (req["path"] == "/req" && m == "POST") {
+            http_respond(200, "text/plain", _req(form::ler(req["body"])));
+        } else if (req["path"] == "/evento" && m == "POST") {
+            http_respond(200, "text/plain", _evento(form::ler(req["body"])));
+        } else {
+            http_respond(404, "text/plain", "");
+        }
+    }
+}

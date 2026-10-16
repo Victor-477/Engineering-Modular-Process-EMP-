@@ -1,0 +1,55 @@
+// ============================================================
+//  form.cryo — leitura de corpos application/x-www-form-urlencoded
+//
+//  Usado no lugar de JSON para entrada externa: um corpo malformado
+//  aqui vira um campo vazio e um 400, nunca uma queda do servidor.
+// ============================================================
+
+pub fn ler(string corpo) -> map<string,string> ={
+    map<string,string> m = {};
+    for (string par in split(trim(corpo), "&")) {
+        int eq = find(par, "=");
+        if (eq > 0) {
+            m[url_decode(par[0..eq])] = url_decode(replace(par[eq + 1..], "+", " "));
+        }
+    }
+    return m;
+}
+
+pub fn campo(map<string,string> f, string nome) -> string ={
+    if (has(f, nome)) { return trim(f[nome]); }
+    return "";
+}
+
+pub fn campo_ou(map<string,string> f, string nome, string padrao) -> string ={
+    string v = campo(f, nome);
+    if (len(v) == 0) { return padrao; }
+    return v;
+}
+
+// Só dígitos, um ponto (ou vírgula) e sinal opcional. Evita depender
+// do comportamento de to_number em texto inválido.
+pub fn eh_numero(string s) -> bool ={
+    if (len(s) == 0) { return false; }
+    int pontos = 0;
+    int digitos = 0;
+    for (int i in 0..len(s)) {
+        string c = s[i..i + 1];
+        if (c == "." || c == ",") {
+            pontos = pontos + 1;
+        } else if (c == "-" && i == 0) {
+            // sinal
+        } else if (is_digit(c)) {
+            digitos = digitos + 1;
+        } else {
+            return false;
+        }
+    }
+    return pontos <= 1 && digitos > 0;
+}
+
+pub fn numero(map<string,string> f, string nome, number padrao) -> number ={
+    string v = replace(campo(f, nome), ",", ".");
+    if (!eh_numero(v)) { return padrao; }
+    return to_number(v);
+}

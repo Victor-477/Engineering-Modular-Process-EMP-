@@ -1,0 +1,11 @@
+# Manifesto do plugin externo de Qualidade.
+# Copie este arquivo + qualidade.exe e reinicie o núcleo — nada é recompilado.
+id=qualidade
+nome=Qualidade e Não Conformidades
+versao=1.0.0
+contrato=1
+prefixo=/api/qualidade
+url=http://127.0.0.1:8091
+depende=producao
+assina=producao.apontada
+perfis_escrita=admin,qualidade

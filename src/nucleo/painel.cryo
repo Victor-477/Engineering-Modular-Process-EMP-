@@ -1,0 +1,42 @@
+// ============================================================
+//  painel.cryo — painel web mínimo, gerado em Cryo
+//
+//  O navegador só executa HTML/JS (ou WASM). Esta versão monta a
+//  página como string Cryo; a evolução prevista é compilar a UI
+//  com `--backend wasm`/`frontend` a partir de Cryo (ESCOPO.md §7).
+//  A página lê os módulos ativos de /api/sistema/modulos, então um
+//  módulo novo aparece no painel sem alterar este arquivo.
+// ============================================================
+
+pub fn pagina() -> string ={
+    return "<!doctype html><html lang=pt-br><head><meta charset=utf-8>"
+        + "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        + "<title>EMP</title><style>"
+        + "body{font-family:system-ui,sans-serif;margin:0;background:#f4f5f7;color:#1d2330}"
+        + "header{background:#1d2330;color:#fff;padding:12px 20px;display:flex;gap:12px;align-items:center}"
+        + "header input{margin-left:auto;padding:6px;border-radius:4px;border:0}"
+        + "main{padding:20px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}"
+        + "section{background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 3px #0002}"
+        + "h2{font-size:15px;margin:0 0 8px}pre{font-size:12px;white-space:pre-wrap;margin:0;max-height:320px;overflow:auto}"
+        + ".ok{color:#0a7d32}.falha{color:#b42318}</style></head><body>"
+        + "<header><b>EMP</b><span>linha de produção</span>"
+        + "<input id=tk placeholder='token' type=password></header><main>"
+        + "<section><h2>Módulos</h2><div id=mods></div></section>"
+        + "<section><h2>Ordens de produção</h2><pre id=ops></pre></section>"
+        + "<section><h2>Saldos de estoque</h2><pre id=sal></pre></section>"
+        + "<section><h2>Indicadores</h2><pre id=ind></pre></section>"
+        + "</main><script>"
+        + "const tk=document.getElementById('tk');tk.value=localStorage.getItem('tk')||'';"
+        + "tk.onchange=()=>{localStorage.setItem('tk',tk.value);carregar()};"
+        + "async function api(p){const r=await fetch(p,{headers:{Authorization:'Bearer '+tk.value}});return r.json()}"
+        + "const fmt=o=>JSON.stringify(o,null,1);"
+        + "async function carregar(){try{"
+        + "const m=await api('/api/sistema/modulos');"
+        + "document.getElementById('mods').innerHTML=Array.isArray(m)?m.map(x=>'<div class='+(x.estado=='ativo'?'ok':'falha')+'>'+x.id+' v'+x.versao+' — '+x.estado+'</div>').join(''):fmt(m);"
+        + "document.getElementById('ops').textContent=fmt(await api('/api/producao/ordens'));"
+        + "document.getElementById('sal').textContent=fmt(await api('/api/estoque/saldos'));"
+        + "document.getElementById('ind').textContent=fmt(await api('/api/producao/indicadores'));"
+        + "}catch(e){document.getElementById('mods').textContent=String(e)}}"
+        + "carregar();setInterval(carregar,5000);"
+        + "</script></body></html>";
+}

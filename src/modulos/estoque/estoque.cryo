@@ -1,0 +1,151 @@
+// ============================================================
+//  estoque.cryo — Módulo de Estoque
+//
+//  Não conhece o módulo de produção: reage a EVENTOS.
+//    producao.apontada -> entrada do produto bom
+//                       + baixa por estrutura (backflush) dos
+//                         componentes de (boa + refugo)
+//    op.liberada       -> confere disponibilidade dos componentes e
+//                         publica estoque.falta se faltar material
+//
+//  Rotas (prefixo /api/estoque):
+//    GET  /saldos[?produto=X]
+//    GET  /movimentos
+//    POST /entrada     produto=&quantidade=&origem=
+//    POST /ajuste      produto=&saldo=&motivo=
+//
+//  Eventos publicados: estoque.movimentado, estoque.falta,
+//                      estoque.negativo
+// ============================================================
+
+import "../../nucleo/contrato.cryo" as k;
+import "../../nucleo/persist.cryo"  as db;
+import "../../nucleo/eventos.cryo"  as ev;
+import "../../nucleo/form.cryo"     as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+
+string _dir = "";
+map<string,string> _saldos = {};       // produto -> saldo (texto)
+map<string,string> _movimentos = {};   // id -> json
+int _proximo = 1;
+
+pub fn saldo(string produto) -> number ={
+    if (!has(_saldos, produto)) { return 0.0; }
+    return to_number(_saldos[produto]);
+}
+
+// Um movimento grava as DUAS coleções. Não há transação na
+// linguagem (L-02): se a segunda gravação falhar, saldo e histórico
+// divergem até a próxima reconciliação.
+fn _movimentar(string produto, number qtd, string tipo, string origem) -> bool ={
+    number novo = saldo(produto) + qtd;
+    _saldos[produto] = to_string(novo);
+    string id = to_string(_proximo);
+    _proximo = _proximo + 1;
+    _movimentos[id] = "{\"id\":" + id
+        + ",\"produto\":" + json_encode(produto)
+        + ",\"tipo\":" + json_encode(tipo)
+        + ",\"quantidade\":" + to_string(qtd)
+        + ",\"saldo\":" + to_string(novo)
+        + ",\"origem\":" + json_encode(origem)
+        + ",\"ts\":" + to_string(now_ms()) + "}";
+    bool ok = db::salvar(_dir, "saldos", _saldos) && db::salvar(_dir, "movimentos", _movimentos);
+    ev::publicar("estoque.movimentado", "estoque",
+        "produto=" + url_encode(produto) + "&quantidade=" + to_string(qtd) + "&saldo=" + to_string(novo));
+    if (novo < 0.0) {
+        ev::publicar("estoque.negativo", "estoque",
+            "produto=" + url_encode(produto) + "&saldo=" + to_string(novo));
+    }
+    return ok;
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _saldos = db::carregar(dir, "saldos");
+    _movimentos = db::carregar(dir, "movimentos");
+    _proximo = db::maior_id(_movimentos) + 1;
+    return true;
+}
+
+fn _backflush(map<string,string> d) ={
+    string produto = form::campo(d, "produto");
+    number boa = form::numero(d, "boa", 0.0);
+    number consumida = boa + form::numero(d, "refugo", 0.0);
+    string origem = "OP " + form::campo(d, "op");
+    if (boa > 0.0) {
+        _movimentar(produto, boa, "ENTRADA_PRODUCAO", origem);
+    }
+    for (cadastros::ItemEstrutura it in cadastros::estrutura(produto)) {
+        _movimentar(it.componente, 0.0 - it.quantidade * consumida, "CONSUMO", origem);
+    }
+}
+
+fn _conferir(map<string,string> d) ={
+    string produto = form::campo(d, "produto");
+    number qtd = form::numero(d, "quantidade", 0.0);
+    for (cadastros::ItemEstrutura it in cadastros::estrutura(produto)) {
+        number precisa = it.quantidade * qtd;
+        if (saldo(it.componente) < precisa) {
+            ev::publicar("estoque.falta", "estoque", "op=" + form::campo(d, "op")
+                + "&componente=" + url_encode(it.componente)
+                + "&necessario=" + to_string(precisa)
+                + "&disponivel=" + to_string(saldo(it.componente)));
+        }
+    }
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    map<string,string> d = form::ler(e.dados);
+    if (e.tipo == "producao.apontada") { _backflush(d); }
+    if (e.tipo == "op.liberada") { _conferir(d); }
+    return true;
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/saldos" && r.metodo == "GET") {
+        string p = upper(k::param(r, "produto"));
+        if (len(p) > 0) {
+            return k::ok("{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p)) + "}");
+        }
+        return k::ok(json_encode(_saldos));
+    }
+    if (r.rota == "/movimentos" && r.metodo == "GET") {
+        string[] itens = [];
+        for (string id in keys(_movimentos)) { itens = concat(itens, [_movimentos[id]]); }
+        return k::ok("[" + join(itens, ",") + "]");
+    }
+    if (r.rota == "/entrada" && r.metodo == "POST") {
+        map<string,string> f = form::ler(r.corpo);
+        string p = upper(form::campo(f, "produto"));
+        number q = form::numero(f, "quantidade", 0.0);
+        if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
+        if (q <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
+        _movimentar(p, q, "ENTRADA", form::campo_ou(f, "origem", "manual:" + r.usuario));
+        return k::criado("{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p)) + "}");
+    }
+    if (r.rota == "/ajuste" && r.metodo == "POST") {
+        map<string,string> f = form::ler(r.corpo);
+        string p = upper(form::campo(f, "produto"));
+        if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
+        number alvo = form::numero(f, "saldo", saldo(p));
+        _movimentar(p, alvo - saldo(p), "AJUSTE", "ajuste:" + r.usuario + ":" + form::campo(f, "motivo"));
+        return k::ok("{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p)) + "}");
+    }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "estoque",
+        nome: "Estoque e Backflush",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/estoque",
+        depende: ["cadastros"],
+        assina: ["producao.apontada", "op.liberada"],
+        perfis_escrita: ["admin", "almoxarife"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

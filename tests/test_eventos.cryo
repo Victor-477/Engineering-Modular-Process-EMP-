@@ -1,0 +1,25 @@
+// Testes do barramento de eventos com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_eventos.cryo --backend pyro
+//
+// Prova de que `cryoc test` resolve imports com alias (ESCOPO.md, L-13).
+
+import "../src/nucleo/eventos.cryo"  as ev;
+import "../src/nucleo/contrato.cryo" as k;
+
+test fn assinatura_por_padrao() ={
+    assert(ev::casa("op.liberada", "op.liberada"), "exato casa");
+    assert(!ev::casa("op.liberada", "op.concluida"), "exato diferente");
+    assert(ev::casa("op.*", "op.concluida"), "prefixo casa");
+    assert(!ev::casa("op.*", "estoque.falta"), "prefixo diferente");
+    assert(ev::casa("*", "qualquer.coisa"), "curinga");
+}
+
+test fn fila_enfileira_e_retira() ={
+    ev::publicar("a.b", "teste", "x=1");
+    ev::publicar("a.c", "teste", "x=2");
+    assert(ev::pendentes() == 2, "duas pendentes");
+    k::Evento[] lote = ev::retirar();
+    assert(len(lote) == 2, "lote com dois");
+    assert(ev::pendentes() == 0, "fila vazia");
+    assert(lote[1].id > lote[0].id, "ids crescentes");
+}

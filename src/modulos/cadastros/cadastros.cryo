@@ -1,0 +1,178 @@
+// ============================================================
+//  cadastros.cryo — Módulo de Cadastros (dados mestres)
+//
+//  Produtos (matéria-prima MP, semiacabado SA, produto acabado PA),
+//  estrutura de produto (BOM) e postos de trabalho.
+//
+//  Rotas (prefixo /api/cadastros):
+//    GET  /produtos                 lista
+//    GET  /produtos?codigo=X        um produto
+//    POST /produtos                 codigo=&descricao=&unidade=&tipo=
+//    GET  /estrutura?produto=X      componentes do produto
+//    POST /estrutura                produto=&componente=&quantidade=
+//    GET  /postos                   lista
+//    POST /postos                   codigo=&descricao=&capacidade_h=
+//
+//  Corpos são form-urlencoded, NÃO JSON: json_decode aborta a VM em
+//  JSON inválido e o try/catch não captura (ESCOPO.md, L-05).
+//
+//  Eventos publicados: produto.salvo, estrutura.alterada
+// ============================================================
+
+import "../../nucleo/contrato.cryo" as k;
+import "../../nucleo/persist.cryo"  as db;
+import "../../nucleo/eventos.cryo"  as ev;
+import "../../nucleo/form.cryo"     as form;
+
+pub struct Produto {
+    string codigo;
+    string descricao;
+    string unidade;
+    string tipo;
+}
+
+pub struct ItemEstrutura {
+    string componente;
+    number quantidade;      // por 1 unidade do pai
+}
+
+string _dir = "";
+map<string,string> _produtos = {};   // codigo -> json(Produto)
+map<string,string> _estrutura = {};  // codigo pai -> json(ItemEstrutura[])
+map<string,string> _postos = {};     // codigo -> json
+
+// ── API pública para outros módulos (dependência declarada) ──
+
+pub fn existe(string codigo) -> bool ={
+    return has(_produtos, codigo);
+}
+
+pub fn produto(string codigo) -> Produto ={
+    return json_decode(_produtos[codigo]) as Produto;
+}
+
+pub fn estrutura(string codigo) -> ItemEstrutura[] ={
+    if (!has(_estrutura, codigo)) {
+        ItemEstrutura[] vazia = [];
+        return vazia;
+    }
+    return json_decode(_estrutura[codigo]) as ItemEstrutura[];
+}
+
+// ── ciclo de vida ─────────────────────────────────────────
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _produtos  = db::carregar(dir, "produtos");
+    _estrutura = db::carregar(dir, "estrutura");
+    _postos    = db::carregar(dir, "postos");
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    return true;            // cadastros não assina eventos
+}
+
+// ── handlers ──────────────────────────────────────────────
+
+fn _lista(map<string,string> m) -> string ={
+    string[] itens = [];
+    for (string c in sort(keys(m))) {
+        itens = concat(itens, [m[c]]);
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _salvar_produto(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string codigo = upper(trim(form::campo(f, "codigo")));
+    string tipo = upper(form::campo(f, "tipo"));
+    if (len(codigo) == 0) { return k::erro(400, "codigo é obrigatório"); }
+    if (tipo != "MP" && tipo != "SA" && tipo != "PA") {
+        return k::erro(400, "tipo deve ser MP, SA ou PA");
+    }
+    Produto p = Produto {
+        codigo: codigo,
+        descricao: form::campo(f, "descricao"),
+        unidade: form::campo_ou(f, "unidade", "UN"),
+        tipo: tipo
+    };
+    _produtos[codigo] = json_encode(p);
+    if (!db::salvar(_dir, "produtos", _produtos)) {
+        return k::erro(500, "falha ao gravar produtos");
+    }
+    ev::publicar("produto.salvo", "cadastros", "codigo=" + url_encode(codigo));
+    return k::criado(_produtos[codigo]);
+}
+
+fn _salvar_componente(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string pai = upper(form::campo(f, "produto"));
+    string comp = upper(form::campo(f, "componente"));
+    number qtd = form::numero(f, "quantidade", 0.0);
+    if (!existe(pai) || !existe(comp)) {
+        return k::erro(422, "produto e componente precisam estar cadastrados");
+    }
+    if (pai == comp) { return k::erro(422, "um produto não pode conter a si mesmo"); }
+    if (qtd <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
+
+    ItemEstrutura[] atual = estrutura(pai);
+    ItemEstrutura[] nova = [];
+    for (ItemEstrutura it in atual) {
+        if (it.componente != comp) { nova = concat(nova, [it]); }
+    }
+    nova = concat(nova, [ItemEstrutura { componente: comp, quantidade: qtd }]);
+    _estrutura[pai] = json_encode(nova);
+    if (!db::salvar(_dir, "estrutura", _estrutura)) {
+        return k::erro(500, "falha ao gravar estrutura");
+    }
+    ev::publicar("estrutura.alterada", "cadastros", "produto=" + url_encode(pai));
+    return k::criado(_estrutura[pai]);
+}
+
+fn _salvar_posto(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string codigo = upper(form::campo(f, "codigo"));
+    if (len(codigo) == 0) { return k::erro(400, "codigo é obrigatório"); }
+    _postos[codigo] = "{\"codigo\":" + json_encode(codigo)
+        + ",\"descricao\":" + json_encode(form::campo(f, "descricao"))
+        + ",\"capacidade_h\":" + to_string(form::numero(f, "capacidade_h", 8.0)) + "}";
+    db::salvar(_dir, "postos", _postos);
+    return k::criado(_postos[codigo]);
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/produtos" && r.metodo == "GET") {
+        string c = upper(k::param(r, "codigo"));
+        if (len(c) == 0) { return k::ok(_lista(_produtos)); }
+        if (!existe(c)) { return k::erro(404, "produto " + c + " não encontrado"); }
+        return k::ok(_produtos[c]);
+    }
+    if (r.rota == "/produtos" && r.metodo == "POST") { return _salvar_produto(r); }
+    if (r.rota == "/estrutura" && r.metodo == "GET") {
+        string p = upper(k::param(r, "produto"));
+        return k::ok(json_encode(estrutura(p)));
+    }
+    if (r.rota == "/estrutura" && r.metodo == "POST") { return _salvar_componente(r); }
+    if (r.rota == "/postos" && r.metodo == "GET") { return k::ok(_lista(_postos)); }
+    if (r.rota == "/postos" && r.metodo == "POST") { return _salvar_posto(r); }
+    return k::nao_encontrado();
+}
+
+// ── descritor ─────────────────────────────────────────────
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "cadastros",
+        nome: "Cadastros (produtos, estrutura, postos)",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/cadastros",
+        depende: [],
+        assina: [],
+        perfis_escrita: ["admin", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

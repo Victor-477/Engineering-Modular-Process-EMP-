@@ -1,0 +1,37 @@
+// ============================================================
+//  auditoria.cryo — trilha de auditoria (quem fez o quê, quando)
+//
+//  A linguagem não tem "append" em arquivo (L-03). Regravar um log
+//  inteiro a cada linha seria O(n²), então as linhas ficam num
+//  buffer e cada descarga cria um ARQUIVO NOVO e imutável
+//  `auditoria/<ms>-<seq>.log`. Nenhum arquivo é reescrito, o que
+//  também é a propriedade que se quer de uma trilha de auditoria.
+//  Custo: uma queda perde no máximo as linhas ainda no buffer.
+// ============================================================
+
+string _dir = "";
+string[] _buffer = [];
+int _seq = 0;
+int _limite = 50;
+
+pub fn abrir(string dir, int limite_buffer) ={
+    _dir = dir;
+    _limite = limite_buffer;
+    if (!is_dir(dir)) { make_dir(dir); }
+}
+
+pub fn registrar(string usuario, string acao, string detalhe) ={
+    _buffer = concat(_buffer, [to_string(now_ms()) + "\t" + usuario + "\t" + acao + "\t" + detalhe]);
+    if (len(_buffer) >= _limite) {
+        descarregar();
+    }
+}
+
+pub fn descarregar() -> bool ={
+    if (len(_buffer) == 0 || len(_dir) == 0) { return true; }
+    _seq = _seq + 1;
+    string arq = _dir + "/" + to_string(now_ms()) + "-" + to_string(_seq) + ".log";
+    bool ok = write_file_atomic(arq, join(_buffer, "\n") + "\n");
+    if (ok) { _buffer = []; }
+    return ok;
+}

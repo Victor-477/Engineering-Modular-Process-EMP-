@@ -1,0 +1,154 @@
+// ============================================================
+//  registro.cryo — registro de módulos, roteamento e entrega de
+//  eventos
+//
+//  O registro guarda descritores (`k::Modulo`) e chama as funções
+//  que eles carregam. As chamadas passam sempre por um PARÂMETRO
+//  (_chamar_*), nunca por uma variável local do tipo função: o
+//  otimizador AST atual apaga uma local `fn(...)->T h = ...` cujo
+//  único uso é `h(x)` (ver ESCOPO.md, lacuna L-01).
+// ============================================================
+
+import "contrato.cryo" as k;
+import "eventos.cryo"  as ev;
+
+k::Modulo[] _mods = [];
+map<string,string> _estado = {};     // id -> "registrado" | "ativo" | "falhou: ..."
+
+fn _chamar_iniciar(fn(string)->bool f, string dir) -> bool ={
+    return f(dir);
+}
+
+fn _chamar_rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={
+    return f(r);
+}
+
+fn _chamar_evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={
+    return f(e);
+}
+
+// ── registro ──────────────────────────────────────────────
+
+// Devolve "" em caso de sucesso, ou o motivo da recusa.
+pub fn registrar(k::Modulo m) -> string ={
+    if (has(_estado, m.id)) {
+        return "módulo duplicado: " + m.id;
+    }
+    if (m.contrato > k::VERSAO_CONTRATO) {
+        return "módulo " + m.id + " exige contrato v" + to_string(m.contrato)
+             + ", núcleo oferece v" + to_string(k::VERSAO_CONTRATO);
+    }
+    for (k::Modulo o in _mods) {
+        if (o.prefixo == m.prefixo) {
+            return "prefixo " + m.prefixo + " já usado por " + o.id;
+        }
+    }
+    _mods = concat(_mods, [m]);
+    _estado[m.id] = "registrado";
+    return "";
+}
+
+fn _ativo(string id) -> bool ={
+    return has(_estado, id) && _estado[id] == "ativo";
+}
+
+// Inicia na ordem de dependência. Um módulo cuja dependência não
+// subiu fica desativado — o resto do sistema continua no ar.
+pub fn iniciar_todos(string dir_dados) -> int ={
+    int ativos = 0;
+    bool progresso = true;
+    while (progresso) {
+        progresso = false;
+        for (k::Modulo m in _mods) {
+            if (_estado[m.id] != "registrado") { continue; }
+            bool pronto = true;
+            for (string d in m.depende) {
+                if (!_ativo(d)) { pronto = false; }
+            }
+            if (!pronto) { continue; }
+            string dir = dir_dados + "/" + m.id;
+            if (!is_dir(dir)) { make_dir(dir); }
+            if (_chamar_iniciar(m.iniciar, dir)) {
+                _estado[m.id] = "ativo";
+                ativos = ativos + 1;
+            } else {
+                _estado[m.id] = "falhou: iniciar() retornou false";
+            }
+            progresso = true;
+        }
+    }
+    for (k::Modulo m in _mods) {
+        if (_estado[m.id] == "registrado") {
+            _estado[m.id] = "falhou: dependência ausente (" + join(m.depende, ",") + ")";
+        }
+    }
+    return ativos;
+}
+
+// ── roteamento ────────────────────────────────────────────
+
+pub fn despachar(string path, k::Requisicao base) -> k::Resposta ={
+    for (k::Modulo m in _mods) {
+        if (path == m.prefixo || starts_with(path, m.prefixo + "/")) {
+            if (!_ativo(m.id)) {
+                return k::erro(503, "módulo " + m.id + " indisponível: " + _estado[m.id]);
+            }
+            if (!k::eh_leitura(base) && index_of(m.perfis_escrita, base.perfil) < 0) {
+                return k::erro(403, "perfil '" + base.perfil + "' não pode alterar " + m.id);
+            }
+            // Structs não têm atribuição de campo (L-07): reconstrói.
+            string rota = path[len(m.prefixo)..];
+            if (len(rota) == 0) { rota = "/"; }
+            k::Requisicao r = k::Requisicao {
+                metodo: base.metodo, rota: rota, query: base.query,
+                corpo: base.corpo, usuario: base.usuario, perfil: base.perfil
+            };
+            return _chamar_rotear(m.rotear, r);
+        }
+    }
+    return k::nao_encontrado();
+}
+
+// ── eventos ───────────────────────────────────────────────
+
+// Entrega tudo o que está na fila, inclusive o que for publicado
+// durante a entrega. `limite` evita laço infinito entre módulos que
+// se respondem eternamente (A publica X, B reage publicando Y, A
+// reage a Y publicando X...).
+pub fn drenar_eventos(int limite) -> int ={
+    int entregues = 0;
+    while (ev::pendentes() > 0 && entregues < limite) {
+        for (k::Evento e in ev::retirar()) {
+            for (k::Modulo m in _mods) {
+                if (!_ativo(m.id) || m.id == e.origem) { continue; }
+                for (string padrao in m.assina) {
+                    if (ev::casa(padrao, e.tipo)) {
+                        _chamar_evento(m.ao_evento, e);
+                        entregues = entregues + 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return entregues;
+}
+
+// ── introspecção ──────────────────────────────────────────
+
+pub fn total() -> int ={
+    return len(_mods);
+}
+
+pub fn listar_json() -> string ={
+    string[] itens = [];
+    for (k::Modulo m in _mods) {
+        itens = concat(itens, ["{\"id\":" + json_encode(m.id)
+            + ",\"nome\":" + json_encode(m.nome)
+            + ",\"versao\":" + json_encode(m.versao)
+            + ",\"prefixo\":" + json_encode(m.prefixo)
+            + ",\"assina\":" + json_encode(m.assina)
+            + ",\"estado\":" + json_encode(_estado[m.id]) + "}"]);
+    }
+    return "[" + join(itens, ",") + "]";
+}

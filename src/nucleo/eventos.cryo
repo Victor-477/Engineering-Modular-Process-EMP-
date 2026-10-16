@@ -1,0 +1,51 @@
+// ============================================================
+//  eventos.cryo — barramento de eventos do núcleo
+//
+//  Módulos NÃO chamam uns aos outros para reagir a fatos: eles
+//  publicam um evento ("op.concluida") e quem se interessa assina.
+//  Assim um módulo novo (ex.: manutenção ouvindo "maquina.parada")
+//  entra no sistema sem que nenhum módulo existente seja alterado.
+//
+//  Entrega: a publicação só ENFILEIRA. O núcleo drena a fila depois
+//  de responder cada requisição (registro::drenar_eventos), então um
+//  handler nunca roda dentro de outro e não há recursão. Eventos
+//  publicados durante a drenagem entram no fim da mesma fila.
+// ============================================================
+
+import "contrato.cryo" as k;
+
+k::Evento[] _fila = [];
+int _seq = 0;
+int _publicados = 0;
+
+pub fn publicar(string tipo, string origem, string dados) -> int ={
+    _seq = _seq + 1;
+    _publicados = _publicados + 1;
+    _fila = concat(_fila, [k::Evento { id: _seq, tipo: tipo, origem: origem,
+                                       dados: dados, ts: now_ms() }]);
+    return _seq;
+}
+
+pub fn pendentes() -> int ={
+    return len(_fila);
+}
+
+pub fn total_publicados() -> int ={
+    return _publicados;
+}
+
+// Retira e devolve a fila inteira de uma vez.
+pub fn retirar() -> k::Evento[] ={
+    k::Evento[] lote = _fila;
+    _fila = [];
+    return lote;
+}
+
+// "*" casa tudo; "op.*" casa por prefixo; o resto é exato.
+pub fn casa(string padrao, string tipo) -> bool ={
+    if (padrao == "*") { return true; }
+    if (ends_with(padrao, ".*")) {
+        return starts_with(tipo, padrao[0..len(padrao) - 1]);
+    }
+    return padrao == tipo;
+}

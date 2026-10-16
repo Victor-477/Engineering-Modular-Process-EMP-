@@ -1,0 +1,119 @@
+// ============================================================
+//  main.cryo — EMP: servidor de gestão de linha de produção
+//
+//  Inicialização:
+//    1. lê a configuração (variáveis de ambiente)
+//    2. registra os módulos internos (modulos/catalogo.cryo)
+//    3. descobre os módulos externos (plugins/*.json)
+//    4. inicia tudo em ordem de dependência
+//    5. laço: aceita -> autentica -> despacha -> responde -> drena eventos
+//
+//  Configuração:
+//    ERP_PORTA      (8080)
+//    ERP_DADOS      (dados)       diretório de dados
+//    ERP_PLUGINS    (plugins)     diretório de manifestos de plugins
+//    ERP_TOKENS     ("")          "token:usuario:perfil,..." — vazio = modo dev
+//
+//  Build Windows (executável único, sem VM nem Python em runtime):
+//    python Burnout/pyro.py build src/main.cryo -o build/emp.exe
+// ============================================================
+
+import "nucleo/contrato.cryo"  as k;
+import "nucleo/registro.cryo"  as reg;
+import "nucleo/eventos.cryo"   as ev;
+import "nucleo/seguranca.cryo" as seg;
+import "nucleo/auditoria.cryo" as audit;
+import "nucleo/plugins.cryo"   as plugins;
+import "nucleo/painel.cryo"    as painel;
+import "modulos/catalogo.cryo" as catalogo;
+
+const string VERSAO = "0.1.0";
+
+fn cfg(string nome, string padrao) -> string ={
+    string v = env(nome);
+    if (len(v) == 0) { return padrao; }
+    return v;
+}
+
+// ── rotas do próprio núcleo (/api/sistema) ────────────────
+
+fn sistema(string path, k::Requisicao r) -> k::Resposta ={
+    if (path == "/api/sistema/saude") {
+        return k::ok("{\"status\":\"ok\",\"versao\":" + json_encode(VERSAO)
+            + ",\"modulos\":" + to_string(reg::total())
+            + ",\"eventos_publicados\":" + to_string(ev::total_publicados()) + "}");
+    }
+    if (path == "/api/sistema/modulos") {
+        return k::ok(reg::listar_json());
+    }
+    return k::nao_encontrado();
+}
+
+fn pagina_inicial() -> k::Resposta ={
+    return k::Resposta { status: 200, tipo: "text/html; charset=utf-8", corpo: painel::pagina() };
+}
+
+fn atender(map<string,string> req) -> k::Resposta ={
+    string path = req["path"];
+    if (path == "/" && req["method"] == "GET") {
+        return pagina_inicial();
+    }
+    string quem = seg::identificar(req);
+    if (len(quem) == 0) {
+        return k::erro(401, "não autenticado");
+    }
+    string[] up = split(quem, ":");
+    k::Requisicao r = k::Requisicao {
+        metodo: req["method"], rota: "", query: req["query"],
+        corpo: req["body"], usuario: up[0], perfil: up[1]
+    };
+    if (starts_with(path, "/api/sistema/")) {
+        return sistema(path, r);
+    }
+    k::Resposta resp = reg::despachar(path, r);
+    if (!k::eh_leitura(r) && resp.status < 300) {
+        audit::registrar(r.usuario, r.metodo + " " + path, r.query);
+    }
+    return resp;
+}
+
+// ── inicialização ─────────────────────────────────────────
+
+int porta = to_int(cfg("ERP_PORTA", "8080"));
+string dir_dados = cfg("ERP_DADOS", "dados");
+string dir_plugins = cfg("ERP_PLUGINS", "plugins");
+
+if (!is_dir(dir_dados)) { make_dir(dir_dados); }
+audit::abrir(dir_dados + "/auditoria", 20);
+int n_tokens = seg::configurar(env("ERP_TOKENS"));
+
+print("EMP " + VERSAO);
+for (k::Modulo m in catalogo::todos()) {
+    string falha = reg::registrar(m);
+    if (len(falha) > 0) { print("  [recusado] " + falha); }
+}
+for (k::Modulo m in plugins::descobrir(dir_plugins)) {
+    string falha = reg::registrar(m);
+    if (len(falha) > 0) { print("  [plugin recusado] " + falha); }
+}
+int ativos = reg::iniciar_todos(dir_dados);
+print("  módulos ativos: " + to_string(ativos) + " de " + to_string(reg::total()));
+if (seg::modo_aberto()) {
+    print("  ATENÇÃO: ERP_TOKENS vazio — modo desenvolvimento, sem autenticação");
+} else {
+    print("  usuários configurados: " + to_string(n_tokens));
+}
+
+if (!http_listen(porta)) {
+    print("não foi possível abrir a porta " + to_string(porta));
+} else {
+    print("  ouvindo em http://localhost:" + to_string(porta));
+    while (true) {
+        map<string,string> req = http_accept();
+        if (len(req["method"]) > 0) {
+            k::Resposta resp = atender(req);
+            http_respond(resp.status, resp.tipo, resp.corpo);
+            reg::drenar_eventos(1000);
+        }
+    }
+}

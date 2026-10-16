@@ -1,0 +1,147 @@
+// ============================================================
+//  plugins.cryo — módulos EXTERNOS, carregados em tempo de execução
+//
+//  A linguagem não carrega código dinamicamente (não há dlopen nem
+//  "load .pyro" — L-06). Um plugin é, portanto, OUTRO PROCESSO: um
+//  executável Cryo que fala HTTP em localhost. Para instalá-lo basta
+//  copiar o .exe e um manifesto `plugins/<id>.plugin`; o núcleo não
+//  é recompilado.
+//
+//  O manifesto é chave=valor por linha (não JSON: um manifesto
+//  malformado não pode derrubar o servidor — L-05):
+//
+//      id=qualidade
+//      nome=Qualidade e Não Conformidades
+//      versao=1.0.0
+//      prefixo=/api/qualidade
+//      url=http://127.0.0.1:8091
+//      assina=producao.apontada,op.concluida
+//      perfis_escrita=admin,qualidade
+//
+//  Protocolo (o plugin implementa três rotas):
+//    GET  <url>/saude   -> "ok"
+//    POST <url>/req     corpo: metodo=&rota=&query=&corpo=&usuario=&perfil=
+//                       resposta: "<status>|<content-type>\n<corpo>"
+//    POST <url>/evento  corpo: id=&tipo=&origem=&dados=&ts=
+//
+//  O descritor do plugin é um k::Modulo comum cujas funções são
+//  CLOSURES que capturam a URL — para o registro, um plugin é
+//  indistinguível de um módulo interno.
+// ============================================================
+
+import "contrato.cryo" as k;
+import "form.cryo"     as form;
+
+fn _lista(string s) -> string[] ={
+    string[] out = [];
+    for (string p in split(s, ",")) {
+        if (len(trim(p)) > 0) { out = concat(out, [trim(p)]); }
+    }
+    return out;
+}
+
+fn _ler_manifesto(string texto) -> map<string,string> ={
+    map<string,string> m = {};
+    for (string linha in split(replace(texto, "\r", ""), "\n")) {
+        string l = trim(linha);
+        int eq = find(l, "=");
+        if (eq > 0 && !starts_with(l, "#")) {
+            m[trim(l[0..eq])] = trim(l[eq + 1..]);
+        }
+    }
+    return m;
+}
+
+// ── disjuntor (circuit breaker) ───────────────────────────
+// O servidor atende uma requisição por vez (L-09): um plugin fora do
+// ar custa ~2 s POR CHAMADA a todo o ERP. Após 3 falhas seguidas o
+// plugin fica "aberto" por 30 s e as chamadas falham na hora.
+map<string,int> _falhas = {};
+map<string,int> _aberto_ate = {};
+
+fn _disponivel(string url) -> bool ={
+    if (has(_aberto_ate, url) && now_ms() < _aberto_ate[url]) { return false; }
+    return true;
+}
+
+fn _resultado(string url, bool ok) ={
+    if (ok) {
+        _falhas[url] = 0;
+        return;
+    }
+    int n = 1;
+    if (has(_falhas, url)) { n = _falhas[url] + 1; }
+    _falhas[url] = n;
+    if (n >= 3) {
+        _aberto_ate[url] = now_ms() + 30000;
+        _falhas[url] = 0;
+    }
+}
+
+fn _saude(string url) -> bool ={
+    return trim(http_get(url + "/saude")) == "ok";
+}
+
+fn _proxy(string url, k::Requisicao r) -> k::Resposta ={
+    string env = "metodo=" + url_encode(r.metodo)
+        + "&rota=" + url_encode(r.rota)
+        + "&query=" + url_encode(r.query)
+        + "&corpo=" + url_encode(r.corpo)
+        + "&usuario=" + url_encode(r.usuario)
+        + "&perfil=" + url_encode(r.perfil);
+    string bruto = http_post(url + "/req", env);
+    int nl = find(bruto, "\n");
+    if (nl <= 0) {
+        return k::erro(502, "plugin em " + url + " não respondeu");
+    }
+    string cab = bruto[0..nl];
+    int bar = find(cab, "|");
+    if (bar <= 0) { return k::erro(502, "resposta de plugin malformada"); }
+    return k::Resposta { status: to_int(cab[0..bar]), tipo: cab[bar + 1..], corpo: bruto[nl + 1..] };
+}
+
+fn _evento(string url, k::Evento e) -> bool ={
+    string corpo = "id=" + to_string(e.id) + "&tipo=" + url_encode(e.tipo)
+        + "&origem=" + url_encode(e.origem) + "&dados=" + url_encode(e.dados)
+        + "&ts=" + to_string(e.ts);
+    if (!_disponivel(url)) { return false; }    // evento perdido: ver L-10
+    bool ok = len(http_post(url + "/evento", corpo)) > 0;
+    _resultado(url, ok);
+    return ok;
+}
+
+fn _fabricar(map<string,string> m) -> k::Modulo ={
+    string url = m["url"];
+    return k::Modulo {
+        id: m["id"],
+        nome: form::campo_ou(m, "nome", m["id"]),
+        versao: form::campo_ou(m, "versao", "0.0.0"),
+        contrato: to_int(form::campo_ou(m, "contrato", "1")),
+        prefixo: m["prefixo"],
+        depende: _lista(form::campo(m, "depende")),
+        assina: _lista(form::campo(m, "assina")),
+        perfis_escrita: _lista(form::campo_ou(m, "perfis_escrita", "admin")),
+        iniciar: (string dir) => _saude(url),
+        rotear: (k::Requisicao r) => _proxy(url, r),
+        ao_evento: (k::Evento e) => _evento(url, e)
+    };
+}
+
+pub fn descobrir(string dir) -> k::Modulo[] ={
+    k::Modulo[] achados = [];
+    if (!is_dir(dir)) { return achados; }
+    for (string nome in list_dir(dir)) {
+        if (!ends_with(nome, ".plugin")) { continue; }
+        map<string,string> m = _ler_manifesto(read_file(dir + "/" + nome));
+        if (!has(m, "id") || !has(m, "prefixo") || !has(m, "url")) {
+            print("  [plugin ignorado] " + nome + ": precisa de id, prefixo e url");
+            continue;
+        }
+        if (!starts_with(m["prefixo"], "/api/")) {
+            print("  [plugin ignorado] " + nome + ": prefixo deve começar com /api/");
+            continue;
+        }
+        achados = concat(achados, [_fabricar(m)]);
+    }
+    return achados;
+}

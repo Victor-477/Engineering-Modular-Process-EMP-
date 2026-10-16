@@ -1,0 +1,54 @@
+// ============================================================
+//  seguranca.cryo — autenticação por token e perfis (RBAC)
+//
+//  Tokens vêm de ERP_TOKENS no formato "token:usuario:perfil,..."
+//  Perfis previstos: admin, pcp, operador, almoxarife, qualidade,
+//  consulta. O módulo declara quais perfis podem ESCREVER nele
+//  (Modulo.perfis_escrita); leitura exige só estar autenticado.
+//
+//  Limite (ESCOPO.md, L-04): a linguagem não tem hash criptográfico
+//  nem comparação em tempo constante, então tokens ficam em texto
+//  puro na configuração e a comparação vaza tempo. Não há TLS no
+//  servidor nativo: em produção, colocar atrás de um proxy HTTPS.
+// ============================================================
+
+map<string,string> _usuarios = {};   // token -> "usuario:perfil"
+bool _aberto = false;                // sem tokens configurados = modo desenvolvimento
+
+pub fn configurar(string spec) -> int ={
+    _usuarios = {};
+    for (string item in split(spec, ",")) {
+        string[] partes = split(trim(item), ":");
+        if (len(partes) == 3) {
+            _usuarios[partes[0]] = partes[1] + ":" + partes[2];
+        }
+    }
+    _aberto = len(keys(_usuarios)) == 0;
+    return len(keys(_usuarios));
+}
+
+pub fn modo_aberto() -> bool ={
+    return _aberto;
+}
+
+fn _token(map<string,string> req) -> string ={
+    if (has(req, "header:authorization")) {
+        string h = trim(req["header:authorization"]);
+        if (starts_with(lower(h), "bearer ")) {
+            return trim(h[7..]);
+        }
+    }
+    return "";
+}
+
+// Devolve "usuario:perfil", ou "" se não autenticado.
+pub fn identificar(map<string,string> req) -> string ={
+    if (_aberto) {
+        return "dev:admin";
+    }
+    string t = _token(req);
+    if (len(t) > 0 && has(_usuarios, t)) {
+        return _usuarios[t];
+    }
+    return "";
+}

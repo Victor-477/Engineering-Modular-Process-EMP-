@@ -1,0 +1,8 @@
+# artefatos de build
+build/
+*.pyro
+.cryocache/
+
+# dados de execução local
+dados/
+pyro_tmp_post_*

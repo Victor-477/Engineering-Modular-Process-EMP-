@@ -1,0 +1,46 @@
+// ============================================================
+//  persist.cryo — repositório de coleções em JSON
+//
+//  Cada coleção é UM arquivo `<dir>/<colecao>.json` contendo um
+//  objeto id -> registro (o registro é JSON serializado como
+//  string). Toda gravação é atômica (write_file_atomic): uma queda
+//  de energia no meio da escrita deixa o arquivo anterior intacto.
+//
+//  Limites honestos (ver ESCOPO.md, L-02): não há banco de dados na
+//  linguagem. Cada `salvar` regrava a coleção inteira — O(n) por
+//  escrita — e não há transação entre duas coleções. Adequado para
+//  milhares de registros por coleção, não para milhões.
+// ============================================================
+
+pub fn caminho(string dir, string colecao) -> string ={
+    return dir + "/" + colecao + ".json";
+}
+
+pub fn carregar(string dir, string colecao) -> map<string,string> ={
+    string arq = caminho(dir, colecao);
+    if (!file_exists(arq)) {
+        map<string,string> vazio = {};
+        return vazio;
+    }
+    string bruto = trim(read_file(arq));
+    if (len(bruto) == 0) {
+        map<string,string> vazio = {};
+        return vazio;
+    }
+    return json_decode(bruto) as map<string,string>;
+}
+
+pub fn salvar(string dir, string colecao, map<string,string> dados) -> bool ={
+    return write_file_atomic(caminho(dir, colecao), json_encode(dados));
+}
+
+// Maior id numérico já usado, para que ids continuem subindo após
+// um reinício em vez de colidir com registros existentes.
+pub fn maior_id(map<string,string> dados) -> int ={
+    int topo = 0;
+    for (string chave in keys(dados)) {
+        int n = to_int(chave);
+        if (n > topo) { topo = n; }
+    }
+    return topo;
+}

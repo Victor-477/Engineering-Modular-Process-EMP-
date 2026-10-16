@@ -1,0 +1,80 @@
+// Testes do núcleo — rodar com:
+//   python ../Burnout/cryoc.py tests/test_nucleo.cryo --backend pyro --run
+//
+// Programa comum com um mini-harness. Foi escrito assim quando
+// `cryoc test` ainda não resolvia imports (ESCOPO.md, L-13 — já
+// corrigido; testes novos podem usar `test fn`, ver test_eventos.cryo).
+
+import "../src/nucleo/eventos.cryo"   as ev;
+import "../src/nucleo/form.cryo"      as form;
+import "../src/nucleo/contrato.cryo"  as k;
+import "../src/nucleo/seguranca.cryo" as seg;
+
+fn caso_assinatura() -> bool ={
+    return ev::casa("op.liberada", "op.liberada")
+        && !ev::casa("op.liberada", "op.concluida")
+        && ev::casa("op.*", "op.concluida")
+        && !ev::casa("op.*", "estoque.falta")
+        && ev::casa("*", "qualquer.coisa");
+}
+
+fn caso_fila() -> bool ={
+    ev::publicar("a.b", "teste", "x=1");
+    ev::publicar("a.c", "teste", "x=2");
+    bool duas = ev::pendentes() == 2;
+    k::Evento[] lote = ev::retirar();
+    return duas && len(lote) == 2 && ev::pendentes() == 0 && lote[1].id > lote[0].id;
+}
+
+fn caso_form() -> bool ={
+    map<string,string> f = form::ler("codigo=a%C3%A7o&descricao=Chapa+fina&vazio=");
+    map<string,string> lixo = form::ler("{\"isto\": nao e form");
+    return form::campo(f, "codigo") == "aço"
+        && form::campo(f, "descricao") == "Chapa fina"
+        && form::campo(f, "inexistente") == ""
+        && form::campo(lixo, "codigo") == "";
+}
+
+fn caso_numeros() -> bool ={
+    map<string,string> f = form::ler("q=1,5&r=xx");
+    return form::eh_numero("12") && form::eh_numero("-1.5") && form::eh_numero("1,5")
+        && !form::eh_numero("abc") && !form::eh_numero("1.2.3") && !form::eh_numero("")
+        && form::numero(f, "q", 0.0) == 1.5
+        && form::numero(f, "r", 7.0) == 7.0;
+}
+
+fn caso_tokens() -> bool ={
+    bool dois = seg::configurar("t1:ana:admin, t2:joao:operador") == 2;
+    map<string,string> req = {};
+    req["header:authorization"] = " Bearer t2";
+    map<string,string> anon = {};
+    return dois && !seg::modo_aberto()
+        && seg::identificar(req) == "joao:operador"
+        && seg::identificar(anon) == "";
+}
+
+fn caso_respostas() -> bool ={
+    k::Resposta r = k::erro(422, "campo \"x\" inválido");
+    return r.status == 422 && starts_with(r.corpo, "{\"erro\":")
+        && k::ok("[]").status == 200;
+}
+
+// ── harness ───────────────────────────────────────────────
+int falhas = 0;
+int total = 0;
+
+fn relatar(string nome, bool ok) ={
+    if (ok) { print("  ok    " + nome); } else { print("  FALHA " + nome); }
+}
+
+string[] nomes = ["assinatura de eventos", "fila de eventos", "form-urlencoded",
+                  "números", "tokens e perfis", "respostas JSON"];
+bool[] resultados = [caso_assinatura(), caso_fila(), caso_form(),
+                     caso_numeros(), caso_tokens(), caso_respostas()];
+for (int i in 0..len(nomes)) {
+    total = total + 1;
+    if (!resultados[i]) { falhas = falhas + 1; }
+    relatar(nomes[i], resultados[i]);
+}
+print(to_string(total - falhas) + "/" + to_string(total) + " casos passaram");
+assert(falhas == 0, "testes falharam");
