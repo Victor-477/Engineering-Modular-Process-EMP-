@@ -3,20 +3,23 @@
 ## Não lançado
 
 ### Alterado
-- **Painel web no padrão visual do MES4/FactoryViews** (`src/nucleo/painel.cryo`):
-  barra superior branca com ☰, nome do app, usuário, alertas, idioma e marca;
-  trilho de ícones à esquerda com as ações da tela (novo, atualizar) e
-  ajuda/módulos embaixo; menu lateral deslizante com as aplicações; faixa de
-  navegação (breadcrumb) cinza; título grande; cartões brancos arredondados;
-  estados com ícone (✓ azul, anel cinza, ✕ vermelho) e texto em minúsculas;
-  legenda "Ordens por estado"; rodapé centralizado. A marca exibida é a do EMP.
-- **Nova tela inicial** (`/#inicio`) em blocos, um por módulo, como a tela
-  "Sistema" do MES4. Blocos de módulos inativos ficam ocultos.
-- **Sino de alertas** na barra superior: paradas abertas + NCs abertas.
-- O token de acesso passou para o menu do usuário (ícone de pessoa); ele abre
-  sozinho quando falta acesso.
-- Tabelas largas rolam dentro do cartão no celular; no celular o trilho de
-  ações fica no rodapé da tela.
+- **Novo sistema de design próprio: "Forja"** ([docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md)),
+  aplicado em todo o painel (`src/nucleo/painel.cryo`). Substitui o visual
+  inspirado no MES4/FactoryViews.
+  - Fundo de papel técnico com grade de pontos; navegação num console grafite
+    flutuante; laranja-forja como única cor de marca.
+  - Postos com **medidor circular** de disponibilidade; posto parado com
+    **faixa de perigo**; progresso das OPs em **barra de LED** segmentada;
+    estado "em produção" com ponto pulsando; eventos numa **linha do tempo**.
+  - Tela inicial com um destaque escuro que **resume a linha em uma frase**
+    ("1 posto parado e 3 ordens em produção agora") e blocos por módulo.
+  - Contadores de paradas e NCs abertas no próprio menu; relógio "ao vivo";
+    botão "+ Novo" que leva ao formulário da tela.
+  - Tipografia: Space Grotesk (títulos e números), Inter (texto) e
+    JetBrains Mono (rótulos e códigos), com fontes do sistema como
+    alternativa sem internet.
+  - **Modo escuro** automático (segue o sistema) e `prefers-reduced-motion`.
+  - Contraste AA medido nos pares de texto; texto grafite sobre o laranja.
 - Rotas, IDs dos formulários e chamadas à API continuam os mesmos.
 - As capturas em `docs/screenshots/` ainda mostram o visual anterior.
 
