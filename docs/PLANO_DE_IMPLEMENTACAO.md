@@ -2,6 +2,11 @@
 ## Plano de implementação de um ERP escrito em Cryo
 
 > Versão 0.1 — 16/10/2026. Documento vivo: atualizar a cada fase concluída.
+>
+> **Decisões tomadas após a v0.1** (o plano será revisado com base nelas):
+> foco industrial · SaaS multiempresa · NF-e no MVP · SQLite · Windows primeiro
+> (Linux também). Os recursos que a linguagem precisa ganhar estão em
+> [`REQUISITOS_DA_LINGUAGEM.md`](REQUISITOS_DA_LINGUAGEM.md).
 
 ---
 
