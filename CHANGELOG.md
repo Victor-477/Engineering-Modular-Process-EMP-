@@ -1,5 +1,18 @@
 # Histórico de versões
 
+## Não lançado
+
+### Alterado
+- **Novo visual do painel web** (`src/nucleo/painel.cryo`), na linha das
+  interfaces industriais da Festo: barra superior branca com a marca EMP em
+  azul (`#0091dc`), menu lateral claro com indicador azul no item ativo, cantos
+  retos, cartões com cabeçalho separado, indicadores com faixa de status à
+  esquerda, etiquetas de status com ponto colorido e botões retangulares. Só
+  CSS e estrutura mudaram: rotas, IDs e o JavaScript do painel continuam os
+  mesmos.
+- Tabelas largas rolam dentro do cartão no celular, em vez de alargar a página.
+- As capturas em `docs/screenshots/` ainda mostram o visual anterior.
+
 ## 0.2.0 — 2026-10-16
 
 ### Novo
