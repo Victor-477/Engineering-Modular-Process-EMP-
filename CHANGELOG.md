@@ -3,14 +3,21 @@
 ## Não lançado
 
 ### Alterado
-- **Novo visual do painel web** (`src/nucleo/painel.cryo`), na linha das
-  interfaces industriais da Festo: barra superior branca com a marca EMP em
-  azul (`#0091dc`), menu lateral claro com indicador azul no item ativo, cantos
-  retos, cartões com cabeçalho separado, indicadores com faixa de status à
-  esquerda, etiquetas de status com ponto colorido e botões retangulares. Só
-  CSS e estrutura mudaram: rotas, IDs e o JavaScript do painel continuam os
-  mesmos.
-- Tabelas largas rolam dentro do cartão no celular, em vez de alargar a página.
+- **Painel web no padrão visual do MES4/FactoryViews** (`src/nucleo/painel.cryo`):
+  barra superior branca com ☰, nome do app, usuário, alertas, idioma e marca;
+  trilho de ícones à esquerda com as ações da tela (novo, atualizar) e
+  ajuda/módulos embaixo; menu lateral deslizante com as aplicações; faixa de
+  navegação (breadcrumb) cinza; título grande; cartões brancos arredondados;
+  estados com ícone (✓ azul, anel cinza, ✕ vermelho) e texto em minúsculas;
+  legenda "Ordens por estado"; rodapé centralizado. A marca exibida é a do EMP.
+- **Nova tela inicial** (`/#inicio`) em blocos, um por módulo, como a tela
+  "Sistema" do MES4. Blocos de módulos inativos ficam ocultos.
+- **Sino de alertas** na barra superior: paradas abertas + NCs abertas.
+- O token de acesso passou para o menu do usuário (ícone de pessoa); ele abre
+  sozinho quando falta acesso.
+- Tabelas largas rolam dentro do cartão no celular; no celular o trilho de
+  ações fica no rodapé da tela.
+- Rotas, IDs dos formulários e chamadas à API continuam os mesmos.
 - As capturas em `docs/screenshots/` ainda mostram o visual anterior.
 
 ## 0.2.0 — 2026-10-16
