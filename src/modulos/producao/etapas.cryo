@@ -1,0 +1,278 @@
+// ============================================================
+//  etapas.cryo — máquina de estados das etapas de uma OP
+//
+//  Funções PURAS: recebem a etapa e o instante, devolvem a etapa
+//  nova ou o erro. Quem grava, publica eventos e confere posto
+//  parado é o módulo de produção; aqui só a regra, para poder ser
+//  testada sem servidor (tests/test_etapas.cryo).
+//
+//    AGUARDANDO --iniciar--> EM_EXECUCAO --apontar (boas+refugo >= entrada)--> CONCLUIDA
+//        |                       |  \--concluir------------------------------> CONCLUIDA
+//        |                       +--erro--> FALHA --reiniciar--> AGUARDANDO
+//        +--erro--> FALHA        +--reiniciar--> AGUARDANDO
+//    (qualquer estado não final, sem apontamentos) --pular--> PULADA
+//
+//  Concorrência: toda mudança soma 1 à `versao` da etapa. Quem pede
+//  uma ação manda a versão que viu; se mudou, 409 (CONFLITO).
+// ============================================================
+
+import "../roteiros/roteiros.cryo" as roteiros;
+
+pub const string CONFLITO = "a tarefa foi alterada por outra pessoa";
+
+pub struct Medicao {
+    string nome;
+    string unidade;
+    number valor;
+    number min;
+    number max;
+    bool dentro;
+    string operador;
+    int ts;
+}
+
+pub struct EtapaOP {
+    int numero;
+    string operacao;
+    string descricao;
+    string posto;
+    string instrucao;
+    number tempo_min;           // minutos por unidade
+    string status;              // AGUARDANDO|EM_EXECUCAO|CONCLUIDA|FALHA|PULADA
+    number entrada;
+    number boas;
+    number refugo;
+    int inicio_planejado;
+    int fim_planejado;
+    int inicio;
+    int fim;
+    string operador;
+    string erro;
+    int versao;
+    Medicao[] medicoes;
+}
+
+// Etapas de uma OP e o refugo das etapas intermediárias que ainda não
+// foi publicado em `producao.apontada` (ver producao.cryo).
+pub struct Execucao {
+    EtapaOP[] etapas;
+    number refugo_pendente;
+}
+
+// `status` 200 = ok; senão o código HTTP e a mensagem em `erro`.
+pub struct Resultado {
+    int status;
+    string erro;
+    EtapaOP etapa;
+    bool concluiu;
+}
+
+pub struct LeituraMedicoes {
+    Medicao[] itens;
+    string erro;
+}
+
+// ── construção ────────────────────────────────────────────
+
+pub fn nova(int numero, string operacao, string descricao, string posto, string instrucao,
+            number tempo_min, number entrada, int inicio_planejado) -> EtapaOP ={
+    Medicao[] nenhuma = [];
+    int duracao = to_int(round(tempo_min * entrada * 60000.0));
+    return EtapaOP {
+        numero: numero, operacao: operacao, descricao: descricao, posto: posto,
+        instrucao: instrucao, tempo_min: tempo_min, status: "AGUARDANDO",
+        entrada: entrada, boas: 0.0, refugo: 0.0,
+        inicio_planejado: inicio_planejado, fim_planejado: inicio_planejado + duracao,
+        inicio: 0, fim: 0, operador: "", erro: "", versao: 1, medicoes: nenhuma
+    };
+}
+
+// Structs não têm atribuição de campo (L-07): toda mudança passa por
+// aqui, que reconstrói a etapa e soma 1 à versão.
+fn _com(EtapaOP e, string status, number entrada, number boas, number refugo,
+        int inicio, int fim, string operador, string erro, Medicao[] medicoes) -> EtapaOP ={
+    return EtapaOP {
+        numero: e.numero, operacao: e.operacao, descricao: e.descricao, posto: e.posto,
+        instrucao: e.instrucao, tempo_min: e.tempo_min, status: status,
+        entrada: entrada, boas: boas, refugo: refugo,
+        inicio_planejado: e.inicio_planejado, fim_planejado: e.fim_planejado,
+        inicio: inicio, fim: fim, operador: operador, erro: erro,
+        versao: e.versao + 1, medicoes: medicoes
+    };
+}
+
+// A etapa seguinte recebe as boas da anterior como entrada.
+pub fn com_entrada(EtapaOP e, number entrada) -> EtapaOP ={
+    return _com(e, e.status, entrada, e.boas, e.refugo, e.inicio, e.fim, e.operador, e.erro, e.medicoes);
+}
+
+fn _ok(EtapaOP e, bool concluiu) -> Resultado ={
+    return Resultado { status: 200, erro: "", etapa: e, concluiu: concluiu };
+}
+
+fn _falha(EtapaOP e, int status, string erro) -> Resultado ={
+    return Resultado { status: status, erro: erro, etapa: e, concluiu: false };
+}
+
+fn _rotulo(EtapaOP e) -> string ={
+    return "etapa " + to_string(e.numero) + " está " + e.status;
+}
+
+pub fn finalizada(EtapaOP e) -> bool ={
+    return e.status == "CONCLUIDA" || e.status == "PULADA";
+}
+
+// ── transições ────────────────────────────────────────────
+
+pub fn iniciar(EtapaOP e, int versao, string operador, int agora) -> Resultado ={
+    if (versao != e.versao) { return _falha(e, 409, CONFLITO); }
+    if (e.status != "AGUARDANDO") { return _falha(e, 409, _rotulo(e) + ", não pode ser iniciada"); }
+    return _ok(_com(e, "EM_EXECUCAO", e.entrada, e.boas, e.refugo, agora, 0, operador, "", e.medicoes), false);
+}
+
+// Acumula boas/refugo e medições; conclui sozinha quando
+// boas + refugo >= entrada. `excesso` permite apontar além da entrada
+// (só a primeira etapa: a matéria-prima pode render mais peças; nas
+// seguintes não sai mais peça do que entrou).
+pub fn apontar(EtapaOP e, int versao, number boas, number refugo, Medicao[] medicoes,
+               string operador, int agora, bool excesso) -> Resultado ={
+    if (versao != e.versao) { return _falha(e, 409, CONFLITO); }
+    if (e.status != "EM_EXECUCAO") {
+        return _falha(e, 409, _rotulo(e) + ": inicie a etapa antes de apontar");
+    }
+    if (boas < 0.0 || refugo < 0.0) { return _falha(e, 422, "boas e refugo não podem ser negativos"); }
+    if (boas + refugo <= 0.0 && len(medicoes) == 0) {
+        return _falha(e, 422, "informe boas, refugo ou medições");
+    }
+    number total = e.boas + boas + e.refugo + refugo;
+    if (!excesso && total > e.entrada) {
+        return _falha(e, 422, "apontamento excede a entrada da etapa (restam "
+            + to_string(e.entrada - e.boas - e.refugo) + ")");
+    }
+    bool concluiu = total >= e.entrada;
+    string status = "EM_EXECUCAO";
+    int fim = 0;
+    if (concluiu) { status = "CONCLUIDA"; fim = agora; }
+    return _ok(_com(e, status, e.entrada, e.boas + boas, e.refugo + refugo, e.inicio, fim,
+                    operador, "", concat(e.medicoes, medicoes)), concluiu);
+}
+
+pub fn concluir(EtapaOP e, int versao, string operador, int agora) -> Resultado ={
+    if (versao != e.versao) { return _falha(e, 409, CONFLITO); }
+    if (e.status != "EM_EXECUCAO") { return _falha(e, 409, _rotulo(e) + ", não pode ser concluída"); }
+    if (e.boas + e.refugo <= 0.0 && e.entrada > 0.0) {
+        return _falha(e, 422, "nada apontado na etapa: aponte, registre erro ou peça para pular");
+    }
+    return _ok(_com(e, "CONCLUIDA", e.entrada, e.boas, e.refugo, e.inicio, agora, operador, "", e.medicoes), true);
+}
+
+pub fn falhar(EtapaOP e, int versao, string motivo, string operador, int agora) -> Resultado ={
+    if (versao != e.versao) { return _falha(e, 409, CONFLITO); }
+    if (e.status != "AGUARDANDO" && e.status != "EM_EXECUCAO") {
+        return _falha(e, 409, _rotulo(e) + ", não pode falhar");
+    }
+    if (len(trim(motivo)) == 0) { return _falha(e, 422, "informe o motivo do erro"); }
+    return _ok(_com(e, "FALHA", e.entrada, e.boas, e.refugo, e.inicio, 0, operador, trim(motivo), e.medicoes), false);
+}
+
+// Volta a etapa para AGUARDANDO. O que já foi apontado continua
+// valendo (as peças existem); só o início real é zerado.
+pub fn reiniciar(EtapaOP e, int versao, int agora) -> Resultado ={
+    if (versao != e.versao) { return _falha(e, 409, CONFLITO); }
+    if (e.status != "FALHA" && e.status != "EM_EXECUCAO") {
+        return _falha(e, 409, _rotulo(e) + ", não pode ser reiniciada");
+    }
+    return _ok(_com(e, "AGUARDANDO", e.entrada, e.boas, e.refugo, 0, 0, e.operador, "", e.medicoes), false);
+}
+
+// Pular passa a entrada inteira adiante; por isso só sem apontamentos.
+pub fn pular(EtapaOP e, int versao, string motivo, string operador, int agora) -> Resultado ={
+    if (versao != e.versao) { return _falha(e, 409, CONFLITO); }
+    if (finalizada(e)) { return _falha(e, 409, _rotulo(e) + ", não pode ser pulada"); }
+    if (e.boas + e.refugo > 0.0) {
+        return _falha(e, 409, "etapa " + to_string(e.numero) + " já tem apontamentos: conclua em vez de pular");
+    }
+    if (len(trim(motivo)) == 0) { return _falha(e, 422, "informe o motivo para pular a etapa"); }
+    return _ok(_com(e, "PULADA", e.entrada, e.boas, e.refugo, e.inicio, agora, operador, trim(motivo), e.medicoes), true);
+}
+
+// ── medições ──────────────────────────────────────────────
+
+// "diametro=10,02;peso=48" contra os parâmetros da operação. Nome
+// desconhecido ou valor não numérico = erro (nada é gravado).
+pub fn ler_medicoes(string texto, roteiros::Parametro[] defs, string operador, int agora) -> LeituraMedicoes ={
+    Medicao[] itens = [];
+    for (string bruto in split(trim(texto), ";")) {
+        string item = trim(bruto);
+        if (len(item) == 0) { continue; }
+        int eq = find(item, "=");
+        if (eq <= 0) {
+            return LeituraMedicoes { itens: itens, erro: "medição '" + item + "' deve ser nome=valor" };
+        }
+        string nome = trim(item[0..eq]);
+        string valor = item[eq + 1..];
+        if (!roteiros::eh_num(valor)) {
+            return LeituraMedicoes { itens: itens, erro: "valor de '" + nome + "' não é número" };
+        }
+        bool achou = false;
+        for (roteiros::Parametro p in defs) {
+            if (lower(p.nome) == lower(nome)) {
+                number v = roteiros::num(valor);
+                itens = concat(itens, [Medicao {
+                    nome: p.nome, unidade: p.unidade, valor: v, min: p.min, max: p.max,
+                    dentro: v >= p.min && v <= p.max, operador: operador, ts: agora
+                }]);
+                achou = true;
+            }
+        }
+        if (!achou) {
+            return LeituraMedicoes { itens: itens, erro: "a operação não mede '" + nome + "'" };
+        }
+    }
+    return LeituraMedicoes { itens: itens, erro: "" };
+}
+
+pub fn fora_dos_limites(Medicao[] ms) -> int ={
+    int n = 0;
+    for (Medicao m in ms) {
+        if (!m.dentro) { n = n + 1; }
+    }
+    return n;
+}
+
+// ── sequência ─────────────────────────────────────────────
+
+// Índice da etapa atual (a primeira não finalizada); -1 se todas acabaram.
+pub fn indice_atual(EtapaOP[] etapas) -> int ={
+    for (int i in 0..len(etapas)) {
+        if (!finalizada(etapas[i])) { return i; }
+    }
+    return -1;
+}
+
+pub fn indice_de(EtapaOP[] etapas, int numero) -> int ={
+    for (int i in 0..len(etapas)) {
+        if (etapas[i].numero == numero) { return i; }
+    }
+    return -1;
+}
+
+pub fn substituir(EtapaOP[] etapas, int i, EtapaOP e) -> EtapaOP[] ={
+    // Cópia nova, não `saida[i] = e`: arrays são referências e quem
+    // chamou pode ainda estar olhando a lista antiga.
+    EtapaOP[] saida = [];
+    for (int j in 0..len(etapas)) {
+        if (j == i) { saida = concat(saida, [e]); } else { saida = concat(saida, [etapas[j]]); }
+    }
+    return saida;
+}
+
+// Depois que a etapa `i` termina, a próxima recebe as peças boas
+// (ou, se `i` foi pulada, a entrada dela inteira).
+pub fn propagar(EtapaOP[] etapas, int i) -> EtapaOP[] ={
+    if (i + 1 >= len(etapas)) { return etapas; }
+    EtapaOP feita = etapas[i];
+    number passa = feita.boas;
+    if (feita.status == "PULADA") { passa = feita.entrada; }
+    return substituir(etapas, i + 1, com_entrada(etapas[i + 1], passa));
+}

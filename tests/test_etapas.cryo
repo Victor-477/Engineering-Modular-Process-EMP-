@@ -1,0 +1,181 @@
+// Testes das etapas de OP e dos roteiros com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_etapas.cryo --backend pyro
+//
+// Só funções puras: a máquina de estados (producao/etapas.cryo), a
+// versão/409, a leitura de medições e de parâmetros (roteiros.cryo).
+
+import "../src/modulos/producao/etapas.cryo"   as etp;
+import "../src/modulos/roteiros/roteiros.cryo" as roteiros;
+
+fn _etapa(int numero, number entrada) -> etp::EtapaOP ={
+    return etp::nova(numero, "ESTAMPAR", "Estampar base", "PRENSA-01", "", 0.05, entrada, 1000);
+}
+
+fn _defs() -> roteiros::Parametro[] ={
+    return roteiros::ler_parametros("diametro:mm:9.9:10.1;peso:g:40:50").itens;
+}
+
+fn _nenhuma() -> etp::Medicao[] ={
+    etp::Medicao[] v = [];
+    return v;
+}
+
+// ── roteiros ──────────────────────────────────────────────
+
+test fn parametros_validos() ={
+    roteiros::LeituraParametros lp = roteiros::ler_parametros("diametro:mm:9,9:10.1; peso:g:40:50;");
+    assert(lp.erro == "", "sem erro");
+    assert(len(lp.itens) == 2, "dois parâmetros");
+    assert(lp.itens[0].nome == "diametro" && lp.itens[0].unidade == "mm", "nome e unidade");
+    assert(lp.itens[0].min == 9.9 && lp.itens[0].max == 10.1, "vírgula decimal aceita");
+    assert(len(roteiros::ler_parametros("").itens) == 0, "vazio = nenhum");
+}
+
+test fn parametros_invalidos() ={
+    assert(roteiros::ler_parametros("diametro:mm:9.9").erro != "", "faltam campos");
+    assert(roteiros::ler_parametros("diametro:mm:abc:10").erro != "", "limite não numérico");
+    assert(roteiros::ler_parametros("diametro:mm:11:10").erro != "", "mínimo > máximo");
+    assert(roteiros::ler_parametros(":mm:1:2").erro != "", "sem nome");
+    assert(roteiros::ler_parametros("a:mm:1:2;a:mm:1:2").erro != "", "repetido");
+}
+
+test fn roteiro_ordena_e_substitui() ={
+    roteiros::Etapa[] r = [];
+    r = roteiros::com_etapa(r, roteiros::Etapa { numero: 30, operacao: "PINTAR", posto: "P", tempo_min: 0.0, instrucao: "" });
+    r = roteiros::com_etapa(r, roteiros::Etapa { numero: 10, operacao: "ESTAMPAR", posto: "P", tempo_min: 0.0, instrucao: "" });
+    r = roteiros::com_etapa(r, roteiros::Etapa { numero: 20, operacao: "SOLDAR", posto: "P", tempo_min: 0.0, instrucao: "" });
+    assert(len(r) == 3 && r[0].numero == 10 && r[1].numero == 20 && r[2].numero == 30, "ordem por número");
+    r = roteiros::com_etapa(r, roteiros::Etapa { numero: 20, operacao: "MONTAR", posto: "P", tempo_min: 1.0, instrucao: "" });
+    assert(len(r) == 3 && r[1].operacao == "MONTAR", "substitui a etapa 20");
+    r = roteiros::sem_etapa(r, 10);
+    assert(len(r) == 2 && r[0].numero == 20, "remove a etapa 10");
+}
+
+// ── máquina de estados ────────────────────────────────────
+
+test fn nova_etapa_planejada() ={
+    etp::EtapaOP e = _etapa(10, 400.0);
+    assert(e.status == "AGUARDANDO" && e.versao == 1, "aguardando, versão 1");
+    // 0,05 min/un × 400 un = 20 min
+    assert(e.fim_planejado - e.inicio_planejado == 1200000, "20 minutos planejados");
+}
+
+test fn fluxo_iniciar_apontar_concluir_sozinha() ={
+    etp::EtapaOP e = _etapa(10, 100.0);
+    etp::Resultado r = etp::iniciar(e, 1, "joao", 5000);
+    assert(r.status == 200 && r.etapa.status == "EM_EXECUCAO", "iniciou");
+    assert(r.etapa.inicio == 5000 && r.etapa.versao == 2 && r.etapa.operador == "joao", "início real e versão");
+    r = etp::apontar(r.etapa, 2, 60.0, 2.0, _nenhuma(), "joao", 6000, true);
+    assert(r.status == 200 && !r.concluiu && r.etapa.boas == 60.0 && r.etapa.refugo == 2.0, "acumula");
+    r = etp::apontar(r.etapa, 3, 37.0, 1.0, _nenhuma(), "joao", 7000, true);
+    assert(r.status == 200 && r.concluiu, "boas+refugo >= entrada conclui");
+    assert(r.etapa.status == "CONCLUIDA" && r.etapa.fim == 7000 && r.etapa.boas == 97.0, "concluída");
+}
+
+test fn concluir_com_o_apontado() ={
+    etp::EtapaOP e = etp::iniciar(_etapa(10, 100.0), 1, "ana", 1).etapa;
+    etp::Resultado vazio = etp::concluir(e, e.versao, "ana", 2);
+    assert(vazio.status == 422, "nada apontado não conclui");
+    e = etp::apontar(e, e.versao, 50.0, 0.0, _nenhuma(), "ana", 3, true).etapa;
+    etp::Resultado r = etp::concluir(e, e.versao, "ana", 4);
+    assert(r.status == 200 && r.concluiu && r.etapa.status == "CONCLUIDA" && r.etapa.boas == 50.0, "concluiu com 50");
+}
+
+test fn versao_diferente_da_409() ={
+    etp::EtapaOP e = _etapa(10, 100.0);
+    etp::Resultado r = etp::iniciar(e, 7, "joao", 1);
+    assert(r.status == 409 && r.erro == etp::CONFLITO, "versão errada = conflito");
+    assert(r.etapa.versao == 1 && r.etapa.status == "AGUARDANDO", "etapa intacta");
+    etp::EtapaOP em = etp::iniciar(e, 1, "joao", 1).etapa;
+    // Duas pessoas viram a versão 2; a primeira aponta, a segunda chega atrasada.
+    etp::EtapaOP depois = etp::apontar(em, 2, 10.0, 0.0, _nenhuma(), "joao", 2, true).etapa;
+    etp::Resultado tarde = etp::apontar(depois, 2, 10.0, 0.0, _nenhuma(), "rui", 3, true);
+    assert(tarde.status == 409 && tarde.erro == etp::CONFLITO, "segunda pessoa recebe 409");
+    assert(tarde.etapa.boas == 10.0, "o apontamento da segunda não entrou");
+}
+
+test fn transicoes_invalidas() ={
+    etp::EtapaOP e = _etapa(10, 100.0);
+    assert(etp::apontar(e, 1, 5.0, 0.0, _nenhuma(), "x", 1, true).status == 409, "apontar sem iniciar");
+    assert(etp::concluir(e, 1, "x", 1).status == 409, "concluir sem iniciar");
+    assert(etp::reiniciar(e, 1, 1).status == 409, "reiniciar aguardando");
+    etp::EtapaOP em = etp::iniciar(e, 1, "x", 1).etapa;
+    assert(etp::iniciar(em, em.versao, "x", 1).status == 409, "iniciar duas vezes");
+    assert(etp::apontar(em, em.versao, -1.0, 0.0, _nenhuma(), "x", 1, true).status == 422, "negativo");
+    assert(etp::apontar(em, em.versao, 0.0, 0.0, _nenhuma(), "x", 1, true).status == 422, "nada a apontar");
+}
+
+test fn erro_e_reiniciar() ={
+    etp::EtapaOP em = etp::iniciar(_etapa(10, 100.0), 1, "joao", 1).etapa;
+    em = etp::apontar(em, em.versao, 20.0, 1.0, _nenhuma(), "joao", 2, true).etapa;
+    assert(etp::falhar(em, em.versao, "  ", "joao", 3).status == 422, "erro exige motivo");
+    etp::Resultado f = etp::falhar(em, em.versao, "matriz trincada", "joao", 3);
+    assert(f.status == 200 && f.etapa.status == "FALHA" && f.etapa.erro == "matriz trincada", "falhou");
+    assert(etp::apontar(f.etapa, f.etapa.versao, 1.0, 0.0, _nenhuma(), "x", 4, true).status == 409, "não aponta em falha");
+    etp::Resultado r = etp::reiniciar(f.etapa, f.etapa.versao, 5);
+    assert(r.status == 200 && r.etapa.status == "AGUARDANDO" && r.etapa.erro == "", "reiniciou");
+    assert(r.etapa.boas == 20.0 && r.etapa.refugo == 1.0 && r.etapa.inicio == 0, "mantém o apontado, zera o início");
+    assert(etp::iniciar(r.etapa, r.etapa.versao, "joao", 6).status == 200, "pode iniciar de novo");
+}
+
+test fn pular() ={
+    etp::EtapaOP e = _etapa(20, 100.0);
+    assert(etp::pular(e, 1, "", "pcp", 1).status == 422, "pular exige motivo");
+    etp::Resultado p = etp::pular(e, 1, "posto em reforma", "pcp", 1);
+    assert(p.status == 200 && p.concluiu && p.etapa.status == "PULADA", "pulada");
+    assert(etp::pular(p.etapa, p.etapa.versao, "de novo", "pcp", 2).status == 409, "não pula duas vezes");
+    etp::EtapaOP em = etp::iniciar(e, 1, "x", 1).etapa;
+    em = etp::apontar(em, em.versao, 5.0, 0.0, _nenhuma(), "x", 2, true).etapa;
+    assert(etp::pular(em, em.versao, "motivo", "pcp", 3).status == 409, "com apontamentos não pula");
+}
+
+test fn excesso_so_na_primeira_etapa() ={
+    etp::EtapaOP em = etp::iniciar(_etapa(20, 100.0), 1, "x", 1).etapa;
+    assert(etp::apontar(em, em.versao, 101.0, 0.0, _nenhuma(), "x", 2, false).status == 422, "etapa seguinte não excede");
+    assert(etp::apontar(em, em.versao, 101.0, 0.0, _nenhuma(), "x", 2, true).status == 200, "primeira etapa pode exceder");
+}
+
+// ── sequência ─────────────────────────────────────────────
+
+test fn sequencia_e_propagacao() ={
+    etp::EtapaOP[] lista = [_etapa(10, 100.0), _etapa(20, 100.0), _etapa(30, 100.0)];
+    assert(etp::indice_atual(lista) == 0 && etp::indice_de(lista, 30) == 2 && etp::indice_de(lista, 99) == -1, "índices");
+    etp::EtapaOP a = etp::iniciar(lista[0], 1, "x", 1).etapa;
+    etp::Resultado r = etp::apontar(a, a.versao, 90.0, 10.0, _nenhuma(), "x", 2, true);
+    lista = etp::propagar(etp::substituir(lista, 0, r.etapa), 0);
+    assert(etp::indice_atual(lista) == 1, "a 20 é a atual");
+    assert(lista[1].entrada == 90.0 && lista[1].versao == 2, "a 20 recebe as 90 boas (e muda de versão)");
+    etp::Resultado p = etp::pular(lista[1], lista[1].versao, "sem solda", "pcp", 3);
+    lista = etp::propagar(etp::substituir(lista, 1, p.etapa), 1);
+    assert(lista[2].entrada == 90.0, "etapa pulada passa a entrada inteira");
+    etp::EtapaOP c = etp::iniciar(lista[2], lista[2].versao, "x", 4).etapa;
+    lista = etp::substituir(lista, 2, etp::apontar(c, c.versao, 90.0, 0.0, _nenhuma(), "x", 5, false).etapa);
+    assert(etp::indice_atual(lista) == -1, "todas finalizadas");
+}
+
+// ── medições ──────────────────────────────────────────────
+
+test fn medicoes_dentro_e_fora() ={
+    etp::LeituraMedicoes lm = etp::ler_medicoes("diametro=10,02; PESO=52", _defs(), "joao", 9);
+    assert(lm.erro == "", "sem erro");
+    assert(len(lm.itens) == 2, "duas medições");
+    assert(lm.itens[0].nome == "diametro" && lm.itens[0].valor == 10.02 && lm.itens[0].dentro, "diâmetro dentro");
+    assert(lm.itens[1].nome == "peso" && !lm.itens[1].dentro && lm.itens[1].max == 50.0, "peso fora (nome sem caixa)");
+    assert(etp::fora_dos_limites(lm.itens) == 1, "uma fora");
+    assert(lm.itens[0].operador == "joao" && lm.itens[0].ts == 9, "quem e quando");
+    assert(len(etp::ler_medicoes("", _defs(), "x", 1).itens) == 0, "vazio = nenhuma");
+}
+
+test fn medicoes_invalidas() ={
+    assert(etp::ler_medicoes("diametro=abc", _defs(), "x", 1).erro != "", "valor não numérico");
+    assert(etp::ler_medicoes("altura=3", _defs(), "x", 1).erro != "", "parâmetro desconhecido");
+    assert(etp::ler_medicoes("diametro", _defs(), "x", 1).erro != "", "sem =");
+    assert(etp::ler_medicoes("=3", _defs(), "x", 1).erro != "", "sem nome");
+}
+
+test fn medicoes_entram_no_apontamento() ={
+    etp::EtapaOP em = etp::iniciar(_etapa(10, 100.0), 1, "x", 1).etapa;
+    etp::LeituraMedicoes lm = etp::ler_medicoes("diametro=10", _defs(), "x", 2);
+    etp::Resultado r = etp::apontar(em, em.versao, 0.0, 0.0, lm.itens, "x", 2, true);
+    assert(r.status == 200 && len(r.etapa.medicoes) == 1 && r.etapa.boas == 0.0, "só medição é um apontamento válido");
+}

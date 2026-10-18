@@ -3,8 +3,9 @@
 //
 //  Popula um EMP em execução com uma linha de suportes metálicos:
 //  matérias-primas, semiacabado, acabados, estrutura (BOM), postos,
-//  entradas de estoque, ordens em vários estados, apontamentos,
-//  paradas de máquina e — se o plugin estiver no ar — NCs.
+//  operações e roteiros, entradas de estoque, ordens em vários
+//  estados executadas etapa por etapa, apontamentos, paradas de
+//  máquina e — se o plugin estiver no ar — NCs.
 //
 //  Exige o EMP em MODO DEV (ERP_TOKENS vazio): http_post não envia
 //  cabeçalhos, então não há como mandar o token (ESCOPO.md, L-09).
@@ -57,6 +58,48 @@ fn op(string produto, string qtd, string posto) -> string ={
 
 fn liberar(string id) ={ post("/api/producao/liberar?id=" + id, ""); }
 
+fn operacao(string codigo, string descricao, string tipo, string instrucao, string parametros) ={
+    post("/api/roteiros/operacoes", "codigo=" + codigo + "&descricao=" + url_encode(descricao)
+        + "&tipo=" + tipo + "&instrucao=" + url_encode(instrucao)
+        + "&parametros=" + url_encode(parametros));
+}
+
+fn etapa_roteiro(string produto, string numero, string oper, string posto, string tempo) ={
+    post("/api/roteiros/etapa", "produto=" + produto + "&numero=" + numero + "&operacao=" + oper
+        + "&posto=" + posto + "&tempo_min=" + tempo);
+}
+
+fn capacidade(string posto, string oper, string tempo) ={
+    post("/api/roteiros/capacidade", "posto=" + posto + "&operacao=" + oper + "&tempo_min=" + tempo);
+}
+
+// Só os campos de que a carga precisa; o resto do JSON é ignorado.
+// json_decode aqui é seguro: o texto vem do próprio EMP (L-05).
+struct EtapaVista {
+    int numero;
+    int versao;
+    string status;
+}
+
+struct OpVista {
+    EtapaVista[] etapas;
+    int etapa_atual;
+}
+
+fn versao(string op, string numero) -> string ={
+    OpVista v = json_decode(http_get(_url + "/api/producao/ordem?id=" + op)) as OpVista;
+    for (EtapaVista e in v.etapas) {
+        if (to_string(e.numero) == numero) { return to_string(e.versao); }
+    }
+    return "0";
+}
+
+// Uma ação de etapa com a versão atual: iniciar, apontar, concluir, erro, reiniciar, pular.
+fn etapa(string op, string numero, string acao, string corpo) ={
+    post("/api/producao/etapa/" + acao + "?op=" + op + "&etapa=" + numero,
+        "versao=" + versao(op, numero) + "&" + corpo);
+}
+
 fn apontar(string id, string boa, string refugo, string operador) ={
     post("/api/producao/apontar?id=" + id, "boa=" + boa + "&refugo=" + refugo + "&operador=" + operador);
 }
@@ -95,13 +138,34 @@ if (!contains(saude, "\"status\":\"ok\"")) {
     posto("PINTURA-01", "Cabine de pintura a pó", "8");
     posto("MONT-01",    "Bancada de montagem", "8");
 
+    print("- operações e roteiros");
+    operacao("ESTAMPAR", "Estampar base", "AUTOMATICA", "Conferir a matriz e o lote da chapa antes de iniciar",
+        "espessura:mm:1.9:2.1");
+    operacao("SOLDAR", "Soldar reforço", "AUTOMATICA", "Programa 12 do robô; conferir o arame",
+        "corrente:A:180:220");
+    operacao("PINTAR", "Pintura a pó", "MANUAL", "Pendurar as peças com 10 cm de folga; cura 20 min a 200 °C",
+        "camada:um:60:90");
+    operacao("MONTAR", "Montar e embalar", "MANUAL", "4 parafusos M6 e 4 buchas por suporte; torque 10 N.m",
+        "torque:N.m:8:12");
+    capacidade("PRENSA-01", "ESTAMPAR", "0.05");
+    capacidade("PRENSA-02", "ESTAMPAR", "0.04");
+    capacidade("SOLDA-01", "SOLDAR", "0.5");
+    capacidade("PINTURA-01", "PINTAR", "0.3");
+    capacidade("MONT-01", "MONTAR", "0.4");
+    etapa_roteiro("BASE-SUP", "10", "ESTAMPAR", "PRENSA-01", "0");    // tempo da capacidade
+    etapa_roteiro("SUP-02", "10", "ESTAMPAR", "PRENSA-02", "0.08");
+    etapa_roteiro("SUP-02", "20", "SOLDAR", "SOLDA-01", "0");
+    etapa_roteiro("SUP-02", "30", "PINTAR", "PINTURA-01", "0");
+    etapa_roteiro("SUP-02", "40", "MONTAR", "MONT-01", "0");
+    // SUP-01 fica sem roteiro: a OP recebe a etapa única APONTAMENTO.
+
     print("- estoque inicial");
     post("/api/estoque/entrada", "produto=ACO-CH2&quantidade=900&origem=NF+48213+Usiminas");
     post("/api/estoque/entrada", "produto=PARAF-M6&quantidade=6000&origem=NF+10377+Ciser");
     post("/api/estoque/entrada", "produto=TINTA-PO&quantidade=60&origem=NF+2201+WEG+Tintas");
     post("/api/estoque/entrada", "produto=BUCHA-08&quantidade=1500&origem=NF+10377+Ciser");
 
-    print("- ordens de produção e apontamentos");
+    print("- ordens de produção, etapas e apontamentos");
     string op1 = op("BASE-SUP", "400", "PRENSA-01");
     liberar(op1);
     apontar(op1, "180", "4", "joao");
@@ -112,13 +176,35 @@ if (!contains(saude, "\"status\":\"ok\"")) {
     apontar(op2, "150", "2", "ana");
     apontar(op2, "100", "1", "ana");          // conclui a OP
 
+    // SUP-02 passa por 4 postos. A OP 3 fica na solda; a OP 4 vai até o fim.
     string op3 = op("SUP-02", "200", "PRENSA-02");
     liberar(op3);
-    apontar(op3, "70", "11", "joao");         // refugo alto -> NC automática (plugin)
+    etapa(op3, "10", "iniciar", "operador=joao");
+    etapa(op3, "10", "apontar", "boas=192&refugo=8&operador=joao&medicoes=espessura%3D2.02");  // conclui
+    etapa(op3, "20", "iniciar", "operador=rui");
+    etapa(op3, "20", "apontar", "boas=120&refugo=2&operador=rui&medicoes=corrente%3D204");
 
-    string op4 = op("SUP-02", "120", "SOLDA-01");
+    string op4 = op("SUP-02", "120", "PRENSA-02");
     liberar(op4);
-    apontar(op4, "35", "1", "rui");
+    etapa(op4, "10", "iniciar", "operador=joao");
+    etapa(op4, "10", "apontar", "boas=118&refugo=2&operador=joao&medicoes=espessura%3D1.98");
+    etapa(op4, "20", "iniciar", "operador=rui");
+    etapa(op4, "20", "apontar", "boas=118&operador=rui");
+    etapa(op4, "30", "iniciar", "operador=bia");
+    etapa(op4, "30", "apontar", "boas=50&operador=bia&medicoes=camada%3D72");
+    etapa(op4, "30", "erro", "operador=bia&motivo=" + url_encode("Pistola entupida"));
+    etapa(op4, "30", "reiniciar", "");
+    etapa(op4, "30", "iniciar", "operador=bia");
+    etapa(op4, "30", "apontar", "boas=60&refugo=8&operador=bia&medicoes=camada%3D95");  // fora do limite
+    etapa(op4, "40", "iniciar", "operador=ana");
+    // Última etapa: soma em produzido e publica producao.apontada com o
+    // refugo das etapas anteriores (10 de 120 -> NC automática no plugin).
+    etapa(op4, "40", "apontar", "boas=110&operador=ana&medicoes=torque%3D10");
+
+    // Versão velha: alguém viu a etapa antes da última ação.
+    string velha = http_post(_url + "/api/producao/etapa/apontar?op=" + op3 + "&etapa=20",
+        "versao=1&boas=1&operador=rui");
+    print("  apontar com versão velha -> " + velha[0..min(len(velha), 60)]);
 
     string op5 = op("SUP-01", "300", "PINTURA-01");
     string op6 = op("BASE-SUP", "600", "PRENSA-01");
@@ -131,8 +217,9 @@ if (!contains(saude, "\"status\":\"ok\"")) {
     post("/api/manutencao/encerrar?id=" + p2, "solucao=" + url_encode("Corrente da esteira substituída"));
     parada("SOLDA-01", "ELETRICA", "Disjuntor do robô desarmou", "42");
 
-    // A produção recusa apontar num posto parado (evento maquina.parada).
-    string bloqueado = http_post(_url + "/api/producao/apontar?id=" + op4, "boa=5");
+    // A produção recusa apontar num posto parado (evento maquina.parada):
+    // a OP 3 está na etapa 20, na SOLDA-01.
+    string bloqueado = http_post(_url + "/api/producao/apontar?id=" + op3, "boa=5");
     print("  apontar na SOLDA-01 parada -> " + bloqueado);
 
     if (contains(http_get(_url + "/api/sistema/modulos"), "\"id\":\"qualidade\"")) {

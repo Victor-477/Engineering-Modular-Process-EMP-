@@ -12,7 +12,8 @@ linguagem: **[ESCOPO.md](ESCOPO.md)** · Histórico: **[CHANGELOG.md](CHANGELOG.
 | Módulo | Tipo | Faz |
 |---|---|---|
 | **Cadastros** | interno | Produtos (MP/SA/PA), estrutura de produto (BOM), postos de trabalho |
-| **Produção** | interno | Ordens de produção, liberação, apontamento de boas/refugo, indicadores; recusa apontar em posto parado |
+| **Roteiros** | interno | Operações (com parâmetros medidos e limites), roteiro de etapas por produto, capacidades posto × operação |
+| **Produção** | interno | Ordens de produção executadas **etapa por etapa** (copiadas do roteiro na liberação), fila por posto, medições, concorrência por versão, indicadores; recusa trabalhar em posto parado |
 | **Estoque** | interno | Saldos, entradas, ajuste de inventário, **baixa automática por estrutura** (backflush), alerta de falta |
 | **Manutenção** | interno | Paradas de posto por categoria, registro retroativo, disponibilidade na janela de 8 h, MTTR |
 | **Qualidade** | **plugin externo** | Não conformidades manuais e automáticas (refugo acima do limite) — processo próprio, sem recompilar o núcleo |
@@ -86,8 +87,9 @@ python ../Burnout/cryoc.py tools/demo.cryo --backend pyro --run
 ```
 
 Cria uma linha de suportes metálicos: 7 produtos com estrutura, 5 postos,
-entradas de estoque, 6 OPs em estados diferentes, apontamentos, 3 paradas e
-uma NC manual.
+4 operações com roteiros e capacidades, entradas de estoque, 6 OPs em estados
+diferentes (uma passa pelas 4 etapas do SUP-02, com erro e reinício),
+apontamentos, 3 paradas e NCs (uma automática, uma manual).
 
 ## API (corpos em form-urlencoded)
 
@@ -101,6 +103,12 @@ curl -H "Authorization: Bearer tk-rui" -X POST $U/api/estoque/entrada -d "produt
 curl -H "$T" -X POST $U/api/producao/ordens -d "produto=sup01&quantidade=50&posto=PRENSA1"
 curl -H "$T" -X POST "$U/api/producao/liberar?id=1"
 curl -H "Authorization: Bearer tk-joao" -X POST "$U/api/producao/apontar?id=1" -d "boa=30&refugo=2"
+# roteiro e execução por etapa (a versão vem de GET /ordem ou GET /fila)
+curl -H "$T" -X POST $U/api/roteiros/operacoes -d "codigo=ESTAMPAR&tipo=AUTOMATICA&parametros=espessura:mm:1.9:2.1"
+curl -H "$T" -X POST $U/api/roteiros/etapa -d "produto=sup01&numero=10&operacao=ESTAMPAR&posto=PRENSA1&tempo_min=0.05"
+curl -H "$T" "$U/api/producao/fila?posto=PRENSA1"
+curl -H "Authorization: Bearer tk-joao" -X POST "$U/api/producao/etapa/iniciar?op=2&etapa=10" -d "versao=1"
+curl -H "Authorization: Bearer tk-joao" -X POST "$U/api/producao/etapa/apontar?op=2&etapa=10" -d "versao=2&boas=40&refugo=1&medicoes=espessura%3D2.01"
 curl -H "Authorization: Bearer tk-lia" -X POST $U/api/manutencao/paradas -d "posto=PRENSA1&categoria=ELETRICA&motivo=Disjuntor&ha_minutos=10"
 curl -H "$T" $U/api/manutencao/postos
 ```
@@ -109,7 +117,8 @@ curl -H "$T" $U/api/manutencao/postos
 |---|---|
 | `/api/sistema` | `GET /saude`, `GET /modulos`, `GET /eventos[?n=]`, `GET /sessao` |
 | `/api/cadastros` | `GET/POST /produtos`, `GET/POST /estrutura`, `GET/POST /postos` |
-| `/api/producao` | `GET/POST /ordens`, `GET /ordem?id=`, `POST /liberar?id=`, `POST /apontar?id=`, `POST /cancelar?id=`, `GET /indicadores` |
+| `/api/roteiros` | `GET/POST /operacoes`, `GET /roteiro?produto=`, `POST /etapa`, `POST /remover_etapa?produto=&numero=`, `GET /capacidades`, `POST /capacidade` |
+| `/api/producao` | `GET/POST /ordens`, `GET /ordem?id=`, `POST /liberar?id=`, `POST /apontar?id=`, `POST /cancelar?id=`, `GET /fila?posto=`, `POST /etapa/iniciar\|apontar\|concluir\|erro\|reiniciar\|pular?op=&etapa=`, `GET /indicadores` |
 | `/api/estoque` | `GET /saldos[?produto=]`, `GET /movimentos`, `POST /entrada`, `POST /ajuste` |
 | `/api/manutencao` | `GET/POST /paradas`, `POST /encerrar?id=`, `GET /postos`, `GET /indicadores` |
 | `/api/qualidade` (plugin) | `GET/POST /ncs` |
@@ -119,4 +128,5 @@ curl -H "$T" $U/api/manutencao/postos
 ```bash
 python ../Burnout/cryoc.py tests/test_nucleo.cryo --backend pyro --run
 python ../Burnout/cryoc.py test tests/test_eventos.cryo --backend pyro
+python ../Burnout/cryoc.py test tests/test_etapas.cryo --backend pyro
 ```

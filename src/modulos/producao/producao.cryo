@@ -3,27 +3,55 @@
 //
 //  Ciclo de vida de uma OP:
 //
-//    PLANEJADA --liberar--> LIBERADA --apontar--> EM_PRODUCAO
-//        |                     |                      |
-//        +------cancelar-------+------cancelar--------+--(produzido >= qtd)--> CONCLUIDA
+//    PLANEJADA --liberar--> LIBERADA --iniciar/apontar--> EM_PRODUCAO
+//        |                     |                              |
+//        +------cancelar-------+--cancelar                    +--(última etapa termina)--> CONCLUIDA
+//
+//  Execução por ETAPAS (inspirada no MES4): na liberação a OP copia o
+//  roteiro do produto (módulo roteiros). Sem roteiro, recebe uma etapa
+//  única APONTAMENTO no posto da OP — o comportamento de antes. As
+//  regras de cada etapa estão em etapas.cryo; aqui ficam a gravação,
+//  os eventos e o posto parado.
+//
+//    - só a etapa ATUAL (a primeira não concluída/pulada) aceita ações;
+//    - a etapa seguinte recebe como entrada as boas da anterior;
+//    - todo apontamento soma o refugo da etapa ao refugo da OP;
+//    - a ÚLTIMA etapa soma as boas em `produzido` e publica
+//      producao.apontada. O refugo das etapas anteriores vai junto no
+//      primeiro producao.apontada seguinte (Execucao.refugo_pendente),
+//      para que o backflush consuma o material das peças perdidas.
 //
 //  Rotas (prefixo /api/producao):
-//    GET  /ordens[?status=X]          lista
-//    GET  /ordem?id=N                 uma OP
+//    GET  /ordens[?status=X]          lista (cada OP com etapas e etapa_atual)
+//    GET  /ordem?id=N                 uma OP, com etapas e etapa_atual
 //    POST /ordens                     produto=&quantidade=&posto=
-//    POST /liberar?id=N
-//    POST /apontar?id=N               boa=&refugo=&operador=
+//    POST /liberar?id=N               copia o roteiro para a OP
+//    POST /apontar?id=N               boa=&refugo=&operador=  (na etapa atual;
+//                                     inicia a etapa se estiver aguardando)
 //    POST /cancelar?id=N
+//    GET  /fila?posto=X               etapa atual das OPs nesse posto
+//    POST /etapa/iniciar?op=&etapa=   versao=&operador=
+//    POST /etapa/apontar?op=&etapa=   versao=&boas=&refugo=&operador=&medicoes=nome=valor;...
+//    POST /etapa/concluir?op=&etapa=  versao=&operador=
+//    POST /etapa/erro?op=&etapa=      versao=&motivo=&operador=
+//    POST /etapa/reiniciar?op=&etapa= versao=              (pcp/admin)
+//    POST /etapa/pular?op=&etapa=     versao=&motivo=      (pcp/admin)
 //    GET  /indicadores                OPs por status, produzido, % refugo
+//
+//  Respostas das ações de etapa: a OP inteira (como GET /ordem). Versão
+//  diferente da atual: 409 {"erro":"a tarefa foi alterada por outra
+//  pessoa","etapa":{...}} — a etapa atualizada vai junto.
 //
 //  Eventos publicados:
 //    op.criada, op.liberada, op.cancelada, op.concluida,
-//    producao.apontada (op, produto, boa, refugo, posto, operador)
+//    producao.apontada (op, produto, boa, refugo, posto, operador),
+//    producao.etapa_iniciada, producao.etapa_concluida, producao.etapa_falhou
+//      (op, etapa, posto, operacao, boas, refugo, operador, motivo, status)
 //
 //  Eventos assinados:
-//    maquina.parada / maquina.liberada — um posto parado recusa
-//    apontamento (409). A produção não conhece o módulo de manutenção:
-//    só o evento.
+//    maquina.parada / maquina.liberada — um posto parado recusa iniciar,
+//    apontar e concluir (409). A produção não conhece o módulo de
+//    manutenção: só o evento.
 // ============================================================
 
 import "../../nucleo/contrato.cryo" as k;
@@ -31,6 +59,8 @@ import "../../nucleo/persist.cryo"  as db;
 import "../../nucleo/eventos.cryo"  as ev;
 import "../../nucleo/form.cryo"     as form;
 import "../cadastros/cadastros.cryo" as cadastros;
+import "../roteiros/roteiros.cryo"   as roteiros;
+import "etapas.cryo"                 as etp;
 
 pub struct OrdemProducao {
     int id;
@@ -46,6 +76,7 @@ pub struct OrdemProducao {
 
 string _dir = "";
 map<string,string> _ordens = {};    // id -> json(OrdemProducao)
+map<string,string> _execucoes = {}; // id -> json(etp::Execucao)
 map<string,string> _parados = {};   // posto -> id da parada aberta
 int _proximo = 1;
 
@@ -68,15 +99,83 @@ fn _gravar(OrdemProducao op) -> bool ={
     return db::salvar(_dir, "ordens", _ordens);
 }
 
+// Etapas e OP ficam em coleções separadas (sem transação, L-02):
+// grava primeiro as etapas, depois a OP.
+fn _gravar_execucao(int id, etp::Execucao ex) -> bool ={
+    _execucoes[to_string(id)] = json_encode(ex);
+    return db::salvar(_dir, "etapas", _execucoes);
+}
+
 fn _evento_op(string tipo, OrdemProducao op) ={
     ev::publicar(tipo, "producao", "op=" + to_string(op.id)
         + "&produto=" + url_encode(op.produto)
         + "&quantidade=" + to_string(op.quantidade));
 }
 
+fn _evento_etapa(string tipo, OrdemProducao op, etp::EtapaOP e, string operador, string motivo) ={
+    ev::publicar(tipo, "producao", "op=" + to_string(op.id)
+        + "&etapa=" + to_string(e.numero)
+        + "&posto=" + url_encode(e.posto)
+        + "&operacao=" + url_encode(e.operacao)
+        + "&boas=" + to_string(e.boas) + "&refugo=" + to_string(e.refugo)
+        + "&operador=" + url_encode(operador)
+        + "&motivo=" + url_encode(motivo)
+        + "&status=" + e.status);
+}
+
+fn _evento_apontada(OrdemProducao op, number boa, number refugo, string posto, string operador) ={
+    ev::publicar("producao.apontada", "producao", "op=" + to_string(op.id)
+        + "&produto=" + url_encode(op.produto)
+        + "&boa=" + to_string(boa) + "&refugo=" + to_string(refugo)
+        + "&posto=" + url_encode(posto)
+        + "&operador=" + url_encode(operador));
+}
+
+// As etapas de uma OP. Uma OP liberada antes das etapas existirem
+// (dados da v0.2) ganha na leitura uma etapa única APONTAMENTO com o
+// que ela já tinha produzido; só é gravada na próxima ação.
+fn _execucao(OrdemProducao op) -> etp::Execucao ={
+    string id = to_string(op.id);
+    if (has(_execucoes, id)) { return json_decode(_execucoes[id]) as etp::Execucao; }
+    etp::EtapaOP[] nenhuma = [];
+    if (op.status != "LIBERADA" && op.status != "EM_PRODUCAO" && op.status != "CONCLUIDA") {
+        return etp::Execucao { etapas: nenhuma, refugo_pendente: 0.0 };
+    }
+    etp::EtapaOP base = etp::nova(10, "APONTAMENTO", "Apontamento de produção", op.posto, "",
+                                  0.0, op.quantidade, op.criada_em);
+    string status = "AGUARDANDO";
+    if (op.produzido + op.refugo > 0.0) { status = "EM_EXECUCAO"; }
+    if (op.status == "CONCLUIDA") { status = "CONCLUIDA"; }
+    etp::EtapaOP legado = etp::EtapaOP {
+        numero: base.numero, operacao: base.operacao, descricao: base.descricao, posto: base.posto,
+        instrucao: "", tempo_min: 0.0, status: status, entrada: op.quantidade,
+        boas: op.produzido, refugo: op.refugo,
+        inicio_planejado: base.inicio_planejado, fim_planejado: base.fim_planejado,
+        inicio: 0, fim: 0, operador: "", erro: "", versao: 1, medicoes: base.medicoes
+    };
+    return etp::Execucao { etapas: [legado], refugo_pendente: 0.0 };
+}
+
+fn _numero_atual(etp::EtapaOP[] etapas) -> int ={
+    int i = etp::indice_atual(etapas);
+    if (i < 0) { return 0; }
+    return etapas[i].numero;
+}
+
+// A OP como o painel e o terminal a veem: os campos da OP mais
+// "etapas" e "etapa_atual" (0 quando não há etapa pendente).
+fn _op_json(OrdemProducao op) -> string ={
+    string base = json_encode(op);
+    etp::Execucao ex = _execucao(op);
+    return base[0..len(base) - 1]
+        + ",\"etapas\":" + json_encode(ex.etapas)
+        + ",\"etapa_atual\":" + to_string(_numero_atual(ex.etapas)) + "}";
+}
+
 fn iniciar(string dir) -> bool ={
     _dir = dir;
     _ordens = db::carregar(dir, "ordens");
+    _execucoes = db::carregar(dir, "etapas");
     _proximo = db::maior_id(_ordens) + 1;
     return true;
 }
@@ -87,6 +186,15 @@ fn ao_evento(k::Evento e) -> bool ={
     if (e.tipo == "maquina.parada") { _parados[posto] = form::campo(d, "parada"); }
     if (e.tipo == "maquina.liberada" && has(_parados, posto)) { remove(_parados, posto); }
     return true;
+}
+
+fn _parado(string posto) -> bool ={
+    return len(posto) > 0 && has(_parados, posto);
+}
+
+fn _erro_parado(string posto) -> k::Resposta ={
+    return k::erro(409, "posto " + posto + " está parado (parada #"
+        + _parados[posto] + "): encerre a parada antes de apontar");
 }
 
 // ── handlers ──────────────────────────────────────────────
@@ -109,7 +217,7 @@ fn _criar(k::Requisicao r) -> k::Resposta ={
     _proximo = _proximo + 1;
     if (!_gravar(op)) { return k::erro(500, "falha ao gravar a OP"); }
     _evento_op("op.criada", op);
-    return k::criado(_ordens[to_string(op.id)]);
+    return k::criado(_op_json(op));
 }
 
 fn _transicao(k::Requisicao r, string de1, string de2, string para, string evento) -> k::Resposta ={
@@ -123,9 +231,170 @@ fn _transicao(k::Requisicao r, string de1, string de2, string para, string event
     OrdemProducao nova = _com(op, para, op.produzido, op.refugo);
     _gravar(nova);
     _evento_op(evento, nova);
-    return k::ok(_ordens[to_string(id)]);
+    return k::ok(_op_json(nova));
 }
 
+// Copia o roteiro do produto para a OP. Datas planejadas em sequência
+// a partir da liberação; tempo da etapa = tempo/unidade × quantidade
+// (tempo 0 no roteiro = tempo da capacidade posto × operação).
+fn _etapas_planejadas(OrdemProducao op, int agora) -> etp::EtapaOP[] ={
+    etp::EtapaOP[] lista = [];
+    int inicio = agora;
+    for (roteiros::Etapa d in roteiros::etapas(op.produto)) {
+        roteiros::Operacao o = roteiros::operacao(d.operacao);
+        string instrucao = d.instrucao;
+        if (len(instrucao) == 0) { instrucao = o.instrucao; }
+        number tempo = d.tempo_min;
+        if (tempo <= 0.0) { tempo = roteiros::tempo_capacidade(d.posto, d.operacao); }
+        etp::EtapaOP e = etp::nova(d.numero, d.operacao, o.descricao, d.posto, instrucao,
+                                   tempo, op.quantidade, inicio);
+        lista = concat(lista, [e]);
+        inicio = e.fim_planejado;
+    }
+    if (len(lista) == 0) {
+        lista = [etp::nova(10, "APONTAMENTO", "Apontamento de produção", op.posto, "",
+                           0.0, op.quantidade, agora)];
+    }
+    return lista;
+}
+
+fn _liberar(k::Requisicao r) -> k::Resposta ={
+    int id = parse_int(k::param(r, "id")) ?? 0;
+    if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
+    OrdemProducao op = _ler(id);
+    if (op.status != "PLANEJADA") {
+        return k::erro(409, "OP " + to_string(id) + " está " + op.status + ", não pode ir para LIBERADA");
+    }
+    etp::Execucao ex = etp::Execucao { etapas: _etapas_planejadas(op, now_ms()), refugo_pendente: 0.0 };
+    if (!_gravar_execucao(id, ex)) { return k::erro(500, "falha ao gravar as etapas"); }
+    OrdemProducao nova = _com(op, "LIBERADA", op.produzido, op.refugo);
+    if (!_gravar(nova)) { return k::erro(500, "falha ao gravar a OP"); }
+    _evento_op("op.liberada", nova);
+    return k::ok(_op_json(nova));
+}
+
+// Grava o resultado de uma ação bem-sucedida na etapa `i` e publica os
+// eventos. `boas`/`refugo` são o que ESTA ação apontou (0 se nenhuma).
+fn _aplicar(OrdemProducao op, etp::Execucao ex, int i, etp::Resultado res, string acao,
+            number boas, number refugo, string operador, string motivo) -> OrdemProducao ={
+    etp::EtapaOP e = res.etapa;
+    etp::EtapaOP[] lista = etp::substituir(ex.etapas, i, e);
+    if (res.concluiu) { lista = etp::propagar(lista, i); }
+    bool ultima = i == len(lista) - 1;
+    number pendente = ex.refugo_pendente;
+    number produzido = op.produzido;
+    number refugo_op = op.refugo + refugo;
+    number boa_pub = 0.0;
+    number refugo_pub = 0.0;
+    bool publica = false;
+    if (acao == "apontar") {
+        if (ultima) {
+            produzido = produzido + boas;
+            boa_pub = boas;
+            refugo_pub = refugo + pendente;
+            pendente = 0.0;
+            publica = true;
+        } else {
+            pendente = pendente + refugo;
+        }
+    }
+    if (ultima && res.concluiu && acao != "apontar") {
+        // Pular a última etapa entrega a entrada dela como pronta.
+        if (acao == "pular") { boa_pub = e.entrada; produzido = produzido + e.entrada; }
+        refugo_pub = pendente;
+        pendente = 0.0;
+        publica = boa_pub + refugo_pub > 0.0;
+    }
+    string status = op.status;
+    if (status == "LIBERADA" && (acao == "iniciar" || acao == "apontar")) { status = "EM_PRODUCAO"; }
+    bool terminou = etp::indice_atual(lista) < 0;
+    if (terminou) { status = "CONCLUIDA"; }
+
+    _gravar_execucao(op.id, etp::Execucao { etapas: lista, refugo_pendente: pendente });
+    OrdemProducao nova = _com(op, status, produzido, refugo_op);
+    _gravar(nova);
+
+    if (acao == "iniciar") { _evento_etapa("producao.etapa_iniciada", nova, e, operador, ""); }
+    if (acao == "erro") { _evento_etapa("producao.etapa_falhou", nova, e, operador, motivo); }
+    if (publica) { _evento_apontada(nova, boa_pub, refugo_pub, e.posto, operador); }
+    if (res.concluiu) { _evento_etapa("producao.etapa_concluida", nova, e, operador, motivo); }
+    if (terminou && op.status != "CONCLUIDA") { _evento_op("op.concluida", nova); }
+    return nova;
+}
+
+fn _resposta_falha(etp::Resultado res) -> k::Resposta ={
+    if (res.status == 409 && res.erro == etp::CONFLITO) {
+        return k::json(409, "{\"erro\":" + json_encode(res.erro)
+            + ",\"etapa\":" + json_encode(res.etapa) + "}");
+    }
+    return k::erro(res.status, res.erro);
+}
+
+// POST /etapa/<acao>?op=&etapa=
+fn _acao_etapa(k::Requisicao r, string acao) -> k::Resposta ={
+    int id = parse_int(k::param(r, "op")) ?? 0;
+    if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
+    if ((acao == "reiniciar" || acao == "pular") && r.perfil != "pcp" && r.perfil != "admin") {
+        return k::erro(403, "só pcp ou admin podem " + acao + " uma etapa");
+    }
+    OrdemProducao op = _ler(id);
+    if (op.status != "LIBERADA" && op.status != "EM_PRODUCAO") {
+        return k::erro(409, "OP " + to_string(id) + " está " + op.status + ": etapas só em OP liberada ou em produção");
+    }
+    etp::Execucao ex = _execucao(op);
+    int numero = parse_int(k::param(r, "etapa")) ?? 0;
+    int i = etp::indice_de(ex.etapas, numero);
+    if (i < 0) { return k::erro(404, "OP " + to_string(id) + " não tem etapa " + to_string(numero)); }
+    int atual = etp::indice_atual(ex.etapas);
+    if (i != atual) {
+        return k::erro(409, "etapa " + to_string(numero) + " não é a atual (atual: "
+            + to_string(_numero_atual(ex.etapas)) + ")");
+    }
+    map<string,string> f = form::ler(r.corpo);
+    int versao = form::inteiro(f, "versao", -1);
+    if (versao < 0) { return k::erro(422, "informe a versao da etapa"); }
+    etp::EtapaOP e = ex.etapas[i];
+    // Versão antes do posto parado: quem viu uma tela velha precisa
+    // recarregar antes de qualquer outra mensagem fazer sentido.
+    if (versao != e.versao) {
+        return _resposta_falha(etp::Resultado { status: 409, erro: etp::CONFLITO, etapa: e, concluiu: false });
+    }
+    if ((acao == "iniciar" || acao == "apontar" || acao == "concluir") && _parado(e.posto)) {
+        return _erro_parado(e.posto);
+    }
+    string operador = form::campo_ou(f, "operador", r.usuario);
+    string motivo = form::campo(f, "motivo");
+    int agora = now_ms();
+    number boas = 0.0;
+    number refugo = 0.0;
+    etp::Resultado res = etp::Resultado { status: 400, erro: "ação desconhecida", etapa: e, concluiu: false };
+    if (acao == "iniciar")   { res = etp::iniciar(e, versao, operador, agora); }
+    if (acao == "concluir")  { res = etp::concluir(e, versao, operador, agora); }
+    if (acao == "erro")      { res = etp::falhar(e, versao, motivo, operador, agora); }
+    if (acao == "reiniciar") { res = etp::reiniciar(e, versao, agora); }
+    if (acao == "pular")     { res = etp::pular(e, versao, motivo, r.usuario, agora); }
+    if (acao == "apontar") {
+        // Números de fora: só via form::numero (parse_number), nunca to_number.
+        if (len(form::campo(f, "boas")) > 0 && !roteiros::eh_num(form::campo(f, "boas"))) {
+            return k::erro(422, "boas deve ser um número");
+        }
+        if (len(form::campo(f, "refugo")) > 0 && !roteiros::eh_num(form::campo(f, "refugo"))) {
+            return k::erro(422, "refugo deve ser um número");
+        }
+        boas = form::numero(f, "boas", 0.0);
+        refugo = form::numero(f, "refugo", 0.0);
+        etp::LeituraMedicoes lm = etp::ler_medicoes(form::campo(f, "medicoes"),
+            roteiros::operacao(e.operacao).parametros, operador, agora);
+        if (len(lm.erro) > 0) { return k::erro(422, lm.erro); }
+        res = etp::apontar(e, versao, boas, refugo, lm.itens, operador, agora, i == 0);
+    }
+    if (res.status != 200) { return _resposta_falha(res); }
+    OrdemProducao nova = _aplicar(op, ex, i, res, acao, boas, refugo, operador, motivo);
+    return k::ok(_op_json(nova));
+}
+
+// POST /apontar?id=N — a rota de antes das etapas. Aponta na etapa
+// atual, iniciando-a se ainda estiver aguardando; não pede versão.
 fn _apontar(k::Requisicao r) -> k::Resposta ={
     int id = parse_int(k::param(r, "id")) ?? 0;
     if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
@@ -133,38 +402,80 @@ fn _apontar(k::Requisicao r) -> k::Resposta ={
     if (op.status != "LIBERADA" && op.status != "EM_PRODUCAO") {
         return k::erro(409, "só se aponta OP liberada ou em produção (atual: " + op.status + ")");
     }
-    if (len(op.posto) > 0 && has(_parados, op.posto)) {
-        return k::erro(409, "posto " + op.posto + " está parado (parada #"
-            + _parados[op.posto] + "): encerre a parada antes de apontar");
-    }
+    etp::Execucao ex = _execucao(op);
+    int i = etp::indice_atual(ex.etapas);
+    if (i < 0) { return k::erro(409, "OP " + to_string(id) + " não tem etapa pendente"); }
+    etp::EtapaOP e = ex.etapas[i];
+    if (_parado(e.posto)) { return _erro_parado(e.posto); }
     map<string,string> f = form::ler(r.corpo);
     number boa = form::numero(f, "boa", 0.0);
     number refugo = form::numero(f, "refugo", 0.0);
     if (boa < 0.0 || refugo < 0.0 || boa + refugo <= 0.0) {
         return k::erro(422, "informe boa e/ou refugo positivos");
     }
-    number produzido = op.produzido + boa;
-    bool concluiu = produzido >= op.quantidade;
-    string status = "EM_PRODUCAO";
-    if (concluiu) { status = "CONCLUIDA"; }
-    OrdemProducao nova = _com(op, status, produzido, op.refugo + refugo);
-    if (!_gravar(nova)) { return k::erro(500, "falha ao gravar apontamento"); }
+    string operador = form::campo_ou(f, "operador", r.usuario);
+    int agora = now_ms();
+    etp::LeituraMedicoes lm = etp::ler_medicoes(form::campo(f, "medicoes"),
+        roteiros::operacao(e.operacao).parametros, operador, agora);
+    if (len(lm.erro) > 0) { return k::erro(422, lm.erro); }
+    if (e.status == "AGUARDANDO") {
+        etp::Resultado ini = etp::iniciar(e, e.versao, operador, agora);
+        if (ini.status != 200) { return _resposta_falha(ini); }
+        op = _aplicar(op, ex, i, ini, "iniciar", 0.0, 0.0, operador, "");
+        ex = _execucao(op);
+        e = ex.etapas[i];
+    }
+    etp::Resultado res = etp::apontar(e, e.versao, boa, refugo, lm.itens, operador, agora, i == 0);
+    if (res.status != 200) { return _resposta_falha(res); }
+    OrdemProducao nova = _aplicar(op, ex, i, res, "apontar", boa, refugo, operador, "");
+    return k::ok(_op_json(nova));
+}
 
-    ev::publicar("producao.apontada", "producao", "op=" + to_string(op.id)
-        + "&produto=" + url_encode(op.produto)
-        + "&boa=" + to_string(boa) + "&refugo=" + to_string(refugo)
-        + "&posto=" + url_encode(op.posto)
-        + "&operador=" + url_encode(form::campo_ou(f, "operador", r.usuario)));
-    if (concluiu) { _evento_op("op.concluida", nova); }
-    return k::ok(_ordens[to_string(op.id)]);
+// Ids em ordem crescente = ordem de criação (mais antigas primeiro).
+fn _ids() -> int[] ={
+    int[] ids = [];
+    for (int n in 1.._proximo) {
+        if (has(_ordens, to_string(n))) { ids = concat(ids, [n]); }
+    }
+    return ids;
 }
 
 fn _listar(string status) -> string ={
     string[] itens = [];
-    for (string id in keys(_ordens)) {
-        if (len(status) == 0 || contains(_ordens[id], "\"" + status + "\"")) {
-            itens = concat(itens, [_ordens[id]]);
+    for (int n in _ids()) {
+        OrdemProducao op = _ler(n);
+        if (len(status) == 0 || op.status == status) {
+            itens = concat(itens, [_op_json(op)]);
         }
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+// GET /fila?posto=X — a etapa atual de cada OP liberada/em produção
+// que está nesse posto, mais antigas primeiro. Cada item tem os campos
+// da etapa (os mesmos de "etapas" em /ordem) mais op, produto,
+// descricao_produto, quantidade, etapa (= numero), tipo e parametros
+// da operação.
+fn _fila(string posto) -> string ={
+    string[] itens = [];
+    for (int n in _ids()) {
+        OrdemProducao op = _ler(n);
+        if (op.status != "LIBERADA" && op.status != "EM_PRODUCAO") { continue; }
+        etp::Execucao ex = _execucao(op);
+        int i = etp::indice_atual(ex.etapas);
+        if (i < 0) { continue; }
+        etp::EtapaOP e = ex.etapas[i];
+        if (e.posto != posto) { continue; }
+        roteiros::Operacao o = roteiros::operacao(e.operacao);
+        string corpo = json_encode(e);
+        itens = concat(itens, ["{\"op\":" + to_string(op.id)
+            + ",\"produto\":" + json_encode(op.produto)
+            + ",\"descricao_produto\":" + json_encode(cadastros::produto(op.produto).descricao)
+            + ",\"quantidade\":" + to_string(op.quantidade)
+            + ",\"etapa\":" + to_string(e.numero)
+            + ",\"tipo\":" + json_encode(o.tipo)
+            + ",\"parametros\":" + json_encode(o.parametros)
+            + "," + corpo[1..]]);
     }
     return "[" + join(itens, ",") + "]";
 }
@@ -194,14 +505,23 @@ fn _indicadores() -> string ={
 fn rotear(k::Requisicao r) -> k::Resposta ={
     if (r.rota == "/ordens" && r.metodo == "GET") { return k::ok(_listar(upper(k::param(r, "status")))); }
     if (r.rota == "/ordem" && r.metodo == "GET") {
-        string id = k::param(r, "id");
-        if (!has(_ordens, id)) { return k::erro(404, "OP inexistente"); }
-        return k::ok(_ordens[id]);
+        int id = parse_int(k::param(r, "id")) ?? 0;
+        if (!has(_ordens, to_string(id))) { return k::erro(404, "OP inexistente"); }
+        return k::ok(_op_json(_ler(id)));
     }
+    if (r.rota == "/fila" && r.metodo == "GET") { return k::ok(_fila(upper(k::param(r, "posto")))); }
     if (r.rota == "/ordens" && r.metodo == "POST")   { return _criar(r); }
-    if (r.rota == "/liberar" && r.metodo == "POST")  { return _transicao(r, "PLANEJADA", "PLANEJADA", "LIBERADA", "op.liberada"); }
+    if (r.rota == "/liberar" && r.metodo == "POST")  { return _liberar(r); }
     if (r.rota == "/cancelar" && r.metodo == "POST") { return _transicao(r, "PLANEJADA", "LIBERADA", "CANCELADA", "op.cancelada"); }
     if (r.rota == "/apontar" && r.metodo == "POST")  { return _apontar(r); }
+    if (starts_with(r.rota, "/etapa/") && r.metodo == "POST") {
+        string rota = r.rota;
+        string acao = rota[7..];
+        if (acao == "iniciar" || acao == "apontar" || acao == "concluir"
+            || acao == "erro" || acao == "reiniciar" || acao == "pular") {
+            return _acao_etapa(r, acao);
+        }
+    }
     if (r.rota == "/indicadores" && r.metodo == "GET") { return k::ok(_indicadores()); }
     return k::nao_encontrado();
 }
@@ -209,11 +529,11 @@ fn rotear(k::Requisicao r) -> k::Resposta ={
 pub fn descritor() -> k::Modulo ={
     return k::Modulo {
         id: "producao",
-        nome: "Ordens de Produção e Apontamento",
-        versao: "1.0.0",
+        nome: "Ordens de Produção, Etapas e Apontamento",
+        versao: "1.1.0",
         contrato: 1,
         prefixo: "/api/producao",
-        depende: ["cadastros"],
+        depende: ["cadastros", "roteiros"],
         assina: ["maquina.*"],
         perfis_escrita: ["admin", "pcp", "operador"],
         iniciar: iniciar,

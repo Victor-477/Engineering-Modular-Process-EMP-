@@ -33,7 +33,8 @@ Requisitos que orientaram a arquitetura:
 | Módulo | Tipo | Responsabilidade | Eventos publicados | Assina |
 |---|---|---|---|---|
 | **Cadastros** | interno | Produtos (MP/SA/PA), estrutura de produto (BOM), postos de trabalho | `produto.salvo`, `estrutura.alterada` | — |
-| **Produção** | interno | Ordens de produção (OP), máquina de estados, apontamento de produção boa/refugo, indicadores; recusa apontar em posto parado | `op.criada`, `op.liberada`, `op.cancelada`, `op.concluida`, `producao.apontada` | `maquina.*` |
+| **Roteiros** | interno | Operações (tipo, instrução, parâmetros medidos com limites), roteiro de etapas por produto, capacidades posto × operação | `operacao.salva`, `roteiro.alterado`, `capacidade.salva` | — |
+| **Produção** | interno | Ordens de produção (OP) executadas por **etapa** (cópia do roteiro na liberação), fila por posto, medições, concorrência por `versao`, apontamento boa/refugo, indicadores; recusa trabalhar em posto parado | `op.criada`, `op.liberada`, `op.cancelada`, `op.concluida`, `producao.apontada`, `producao.etapa_iniciada`, `producao.etapa_concluida`, `producao.etapa_falhou` | `maquina.*` |
 | **Estoque** | interno | Saldos, movimentos, entrada manual, ajuste de inventário, **backflush** (baixa automática por estrutura ao apontar), alerta de falta na liberação | `estoque.movimentado`, `estoque.falta`, `estoque.negativo` | `producao.apontada`, `op.liberada` |
 | **Manutenção** | interno | Paradas de posto por categoria, registro retroativo, encerramento com solução, disponibilidade na janela de 8 h, MTTR | `maquina.parada`, `maquina.liberada` | — |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
@@ -42,10 +43,32 @@ Requisitos que orientaram a arquitetura:
 Máquina de estados da OP:
 
 ```
-PLANEJADA --liberar--> LIBERADA --apontar--> EM_PRODUCAO --(produzido >= qtd)--> CONCLUIDA
-    |                     |                       
+PLANEJADA --liberar--> LIBERADA --iniciar/apontar--> EM_PRODUCAO --(última etapa termina)--> CONCLUIDA
+    |                     |
     +------cancelar-------+------cancelar------> CANCELADA
 ```
+
+Máquina de estados de cada **etapa** da OP (`producao/etapas.cryo`). Só a
+etapa atual — a primeira não concluída nem pulada — aceita ações; toda mudança
+soma 1 à `versao`, e uma ação com versão diferente recebe 409 ("a tarefa foi
+alterada por outra pessoa").
+
+```
+AGUARDANDO  --iniciar-->  EM_EXECUCAO
+EM_EXECUCAO --apontar (boas+refugo >= entrada)--> CONCLUIDA
+EM_EXECUCAO --concluir (com o que já foi apontado)--> CONCLUIDA
+AGUARDANDO | EM_EXECUCAO --erro (motivo)--> FALHA
+FALHA | EM_EXECUCAO --reiniciar (pcp/admin)--> AGUARDANDO
+não final e sem apontamentos --pular (pcp/admin, motivo)--> PULADA
+```
+
+Quantidades: a 1ª etapa recebe a quantidade da OP; cada etapa seguinte recebe
+as boas da anterior (ou a entrada inteira, se a anterior foi pulada). Todo
+refugo apontado entra no `refugo` da OP; só a **última** etapa soma em
+`produzido` e publica `producao.apontada`, levando junto o refugo das etapas
+anteriores ainda não publicado — o backflush consome o material de boas + todo
+o refugo. Peças que "somem" num `concluir` com menos que a entrada não são
+baixadas do estoque.
 
 ### 2.2 Planejado (próximas fases, cada um como módulo)
 
@@ -150,6 +173,10 @@ Catálogo de eventos v1:
 | `estrutura.alterada` | cadastros | `produto` |
 | `op.criada` / `op.liberada` / `op.cancelada` / `op.concluida` | produção | `op`, `produto`, `quantidade` |
 | `producao.apontada` | produção | `op`, `produto`, `boa`, `refugo`, `posto`, `operador` |
+| `producao.etapa_iniciada` / `producao.etapa_concluida` / `producao.etapa_falhou` | produção | `op`, `etapa`, `posto`, `operacao`, `boas`, `refugo`, `operador`, `motivo`, `status` |
+| `operacao.salva` | roteiros | `codigo` |
+| `roteiro.alterado` | roteiros | `produto`, `etapas` |
+| `capacidade.salva` | roteiros | `posto`, `operacao` |
 | `estoque.movimentado` | estoque | `produto`, `quantidade`, `saldo` |
 | `estoque.falta` | estoque | `op`, `componente`, `necessario`, `disponivel` |
 | `estoque.negativo` | estoque | `produto`, `saldo` |
@@ -206,7 +233,9 @@ Engineering-Modular-Process-EMP-/
 │   └── modulos/
 │       ├── catalogo.cryo      ÚNICO arquivo editado para incluir módulo interno
 │       ├── cadastros/cadastros.cryo
+│       ├── roteiros/roteiros.cryo   operações, roteiros, capacidades
 │       ├── producao/producao.cryo
+│       ├── producao/etapas.cryo     máquina de estados das etapas (funções puras)
 │       ├── estoque/estoque.cryo
 │       └── manutencao/manutencao.cryo
 ├── plugins/                   manifestos lidos em tempo de execução
@@ -215,7 +244,8 @@ Engineering-Modular-Process-EMP-/
 │   └── qualidade/qualidade.cryo
 ├── tests/
 │   ├── test_nucleo.cryo       harness em programa comum
-│   └── test_eventos.cryo      `test fn` rodado por `cryoc test`
+│   ├── test_eventos.cryo      `test fn` rodado por `cryoc test`
+│   └── test_etapas.cryo       `test fn`: etapas, versão/409, medições, roteiros
 ├── tools/
 │   └── demo.cryo              carga de demonstração (via HTTP, modo dev)
 ├── docs/screenshots/          capturas do painel
@@ -231,7 +261,8 @@ C:\EMP\
 ├── plugins\qualidade.plugin
 └── dados\                     criado na primeira execução
     ├── cadastros\produtos.json  estrutura.json  postos.json
-    ├── producao\ordens.json
+    ├── roteiros\operacoes.json  roteiros.json  capacidades.json
+    ├── producao\ordens.json  etapas.json
     ├── estoque\saldos.json  movimentos.json
     ├── qualidade\ncs.json
     └── auditoria\<ms>-<seq>.log
