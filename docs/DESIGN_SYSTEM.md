@@ -1,6 +1,8 @@
 # Forja — sistema de design do EMP
 
-> Versão 1.0 · implementado em [`src/nucleo/painel.cryo`](../src/nucleo/painel.cryo)
+> Versão 1.1 · implementado em [`src/nucleo/painel.cryo`](../src/nucleo/painel.cryo)
+> e [`src/nucleo/terminal.cryo`](../src/nucleo/terminal.cryo) (terminal do operador).
+> Os tokens ficam em `painel::tokens_css()` e as duas páginas os usam.
 
 ## Conceito
 
@@ -31,7 +33,8 @@ Três regras guiam as decisões:
 
 ## Tokens
 
-Todos ficam em `:root`. O modo escuro redefine os mesmos nomes em
+Todos ficam em `:root`, numa única função (`painel::tokens_css()`) que o
+painel e o terminal incluem. O modo escuro redefine os mesmos nomes em
 `@media (prefers-color-scheme: dark)`, então nenhum componente precisa saber
 em qual tema está.
 
@@ -168,17 +171,81 @@ anel `--forja-soft` de 4 px e fundo branco. O rótulo fica acima, em 12 px/600.
 
 Variantes: `bom`, `alerta` (o valor também fica vermelho) e neutro.
 
-### Etiqueta de estado
+### Estado: ícone + cor
 
-Pílula de 26 px com um ponto na cor do texto, em minúsculas.
+**O estado nunca aparece só como cor.** Cada classe de estado tem uma cor
+*e* um ícone, sempre juntos, nas etiquetas, nos nós do fluxo de etapas e no
+terminal:
 
-| Classe | Estados | Visual |
-|---|---|---|
-| `st-ok` | operando, concluída, encerrada, ativo | Verde |
-| `st-wait` | liberada | Azul |
-| `st-act` | em produção | Laranja, **ponto pulsando** |
-| `st-bad` | parado, cancelada, aberta, falhou | Vermelho sobre **listras diagonais** |
-| *(neutro)* | planejada | Cinza |
+| Classe | Ícone | Estados | Cor |
+|---|---|---|---|
+| `plan` | calendário | planejada | Neutro (`--neutral-soft` / `--ink-2`) |
+| `wait` | pausa | liberada, aguardando | Azul (`--info`) |
+| `act` | play, **pulsando** | em produção, em execução | Laranja (`--forja`) |
+| `ok` | check | concluída, operando, encerrada, ativo | Verde (`--ok`) |
+| `bad` | alerta, sobre **listras diagonais** | falha, parado, aberta, falhou | Vermelho (`--bad`) |
+| `skip` | avançar | pulada | Neutro |
+
+Exceção: **cancelada** usa a cor `bad` com o ícone ✕ (`ICONE_DE`), porque
+cancelar não é uma falha de máquina.
+
+A **etiqueta** (`tag(estado)`) é uma pílula de 26 px com o ícone de 14 px e o
+texto em minúsculas. Os ícones ficam em `ICONE_ST` (por classe); o mapa
+estado → classe é `ESTADO`.
+
+### Faixa de estado
+
+Cartões e linhas que representam algo com estado (OP, etapa, posto, parada,
+NC, tarefa do terminal) ganham uma **borda esquerda** na cor do estado: 4 px
+nas linhas de tabela (classe `e-<classe>` no `<tr>`), 5 px nos cartões de
+posto e de etapa e de 6 a 8 px no terminal. A cor vem da variável `--eb`,
+definida por `.e-plan` … `.e-skip`.
+
+Uma **falha pisca uma vez** (fundo `--bad-soft` por 1,2 s) na primeira vez em
+que aparece. A atualização automática não repete a animação, porque
+`pisca()` lembra o que já piscou. Com movimento reduzido, não pisca.
+
+### Fluxo de etapas (detalhe da OP)
+
+`/#ordens/N` abre a OP como um **fluxo vertical**: um trilho de 2 px à
+esquerda (como a linha do tempo), com um **nó redondo de 36 px** por etapa
+que mostra o ícone do estado. Cada etapa é um cartão interno com faixa de
+estado:
+
+| Parte | Conteúdo |
+|---|---|
+| Topo | Número (`.id`), operação, descrição, posto (`.id`) + link `TERMINAL →`, etiqueta |
+| Instrução | A frase da etapa, em `--ink-2` |
+| Dados | Planejado (início → fim) · Real (início → fim, com **`+N min`** em `--bad-ink` quando atrasa) · Entrada · Boas · refugo · Operador, com rótulos mono em caixa alta |
+| Erro | Caixa `--bad-soft` com o motivo do erro ou do pulo |
+| Ações | Botões `.mini`: Iniciar, Concluir (`.ok`), Concluir com erro, Reiniciar e Pular (estes dois só para `pcp`/`admin`), e um campo de motivo |
+
+A etapa atual (`etapa_atual`) ganha fundo `--surface` e anel `--forja-soft`.
+Acima do fluxo fica o cabeçalho da OP: "← TODAS AS ORDENS", produto,
+etiqueta, números (quantidade, boas, refugo, criada) e a barra de LED. No
+celular, o trilho e os nós somem e as etapas viram uma pilha de cartões.
+
+### Moldura de lista
+
+Toda lista longa (ordens, saldos, paradas, NCs, produtos, postos, operações,
+capacidades) fica numa moldura, `moldura(id, colunas, itens, opções)`:
+
+| Parte | Descrição |
+|---|---|
+| Barra | Campo **Filtrar…** (texto em qualquer coluna), seletor de estado ou tipo quando faz sentido, a contagem em mono (`6 itens`) e **Exportar CSV** (`.mini.sec`) |
+| Aviso | Com filtro ativo: faixa `--info-soft` "**lista filtrada · 2 de 6 · limpar**" |
+| Corpo | A tabela; se o filtro não encontra nada, "Nada corresponde ao filtro." |
+
+O filtro vive no navegador e **sobrevive à atualização automática**. O CSV é
+gerado no cliente: separador `;`, vírgula decimal e BOM UTF-8 (abre direto no
+Excel em português), só com as linhas visíveis.
+
+### Abas internas
+
+Um seletor de pílulas dentro de uma tela (`.abas`), com o item ativo em
+grafite (`--console`), porque o laranja continua reservado para a ação
+principal. Cada aba tem endereço próprio: `/#cadastros` e
+`/#cadastros/roteiros`. A aba de um módulo desligado some (`data-mod`).
 
 ### Medidor (posto)
 
@@ -227,6 +294,38 @@ Cartão com ícone num quadrado arredondado `--forja-soft`, título, descrição
 Pílula grafite centralizada no rodapé, com um ponto verde (sucesso) ou vermelho
 (erro). Fica `role="status"` e `aria-live="polite"`.
 
+### Terminal do operador (`/terminal`)
+
+Uma página própria para o tablet ao lado da máquina, inspirada nos
+terminais manuais do MES4 e desenhada no visual Forja. Mostra **uma instrução
+por vez**, legível a dois metros e operável com luva.
+
+| Parte | Descrição |
+|---|---|
+| Barra do posto | Console grafite no topo: marca, **posto em 30 px**, etiqueta do estado do posto, selo **"atualizado às HH:MM:SS"** (o ponto verde pulsa a cada atualização; fica vermelho, com "sem conexão · última às …", quando a conexão cai), operador e engrenagem (operador, token, trocar de posto) |
+| Seleção de posto | Sem `#POSTO`, mostra uma grade de cartões grandes com o estado de cada posto. O endereço `/terminal#PRENSA-01` vira o favorito do tablet |
+| Instrução | Cartão com faixa de estado de 8 px: OP · produto · "etapa 10 · 1 de 3" · etiqueta; **título da operação em 60 px**; a instrução em 26 px; quatro números de 44 px (entrada, boas, refugo, falta) e uma barra de LED de 16 segmentos |
+| Ações | Botões de **84 px** de altura, texto de 24 px e ícone: *Iniciar* (laranja, largura total) → *Apontar* (laranja) / *Concluir* (grafite) / *Concluir com erro* (contorno vermelho) / *Reiniciar* (secundário). Numa etapa em falha, só *Reiniciar etapa* |
+| Apontar | Campos numéricos de 84 px com botões − e + de 72 px, e um campo por parâmetro medido da operação, que fica verde (**dentro**) ou vermelho (**fora do limite**) enquanto se digita |
+| Concluir com erro | Motivos prontos em botões (um toque) e um campo livre |
+| Fila | Coluna à direita (embaixo, no tablet em pé) com as tarefas do posto e a faixa de estado de cada uma. Tocar numa tarefa escolhe a instrução que aparece |
+| Nenhuma tarefa | Ícone de check de 96 px e "Nenhuma tarefa" em 52 px |
+| Posto parado | Faixa de perigo de 12 px sobre um bloco grafite, com a categoria (40 px), o horário e o motivo. **Todas as ações ficam desligadas** |
+| Mensagem | Pílula grafite com texto de 20 px no rodapé e um ponto verde, âmbar (aviso) ou vermelho |
+
+Comportamento:
+
+- Atualiza a cada **1 s**; depois de uma mensagem, a próxima atualização
+  espera **2 s**.
+- Um toque **desliga os botões na hora**, então não existe toque duplo.
+- Toda ação manda a `versao` da etapa que está na tela. Um **409 de versão**
+  vira o aviso "A tarefa foi alterada por outra pessoa. Recarregando…" e a
+  tela recarrega, sem sobrescrever nada.
+- A instrução só é redesenhada quando algo muda, então o que o operador está
+  digitando não some com a atualização.
+- Todo alvo de toque tem **pelo menos 48 px**. A grade passa para uma coluna
+  abaixo de 1100 px (tablet em pé) e os números para duas colunas no celular.
+
 ---
 
 ## Acessibilidade
@@ -249,8 +348,11 @@ Pílula grafite centralizada no rodapé, com um ponto verde (sucesso) ou vermelh
   texto**: ficam só em gráficos, pontos e bordas. Texto branco sobre laranja
   também não, porque dá 3,1:1 e reprova; por isso o botão principal tem
   texto grafite.
-- **O estado nunca depende só da cor**: toda etiqueta tem texto, o posto
-  parado tem listras, e os KPIs têm ícone de sinal.
+- **O estado nunca depende só da cor**: toda etiqueta tem ícone e texto, os
+  nós do fluxo têm ícone, o posto parado e a falha têm listras, e os KPIs têm
+  ícone de sinal.
+- No terminal, todo alvo de toque tem pelo menos 48 px (os botões de ação,
+  84 px), e as ações bloqueadas por uma parada dizem por quê.
 - Os botões só com ícone têm `aria-label`; o token tem `aria-label`.
 - O foco por teclado é sempre visível (`:focus-visible`, laranja de 3 px).
 - `prefers-reduced-motion` desliga pulsos, entradas e transições.
@@ -263,7 +365,9 @@ Pílula grafite centralizada no rodapé, com um ponto verde (sucesso) ou vermelh
 | Texto colorido com os tokens `-ink` | Texto com `--forja`, `--ok` ou `--bad` (cores de gráfico) |
 | Uma só ação principal (laranja) por cartão | Pôr dois botões laranja lado a lado |
 | Mostrar identificadores com `.id` | Usar `#7` solto para identificar uma OP |
-| Estados com `tag()` | Criar etiquetas de estado com cores próprias |
+| Estados com `tag()` (ícone + cor) | Criar etiquetas de estado com cores próprias ou sem ícone |
+| Listas longas dentro de `moldura()` | Tabelas grandes sem filtro nem exportação |
+| Abrir detalhes no próprio painel (`/#ordens/7`) | Abrir detalhes numa nova aba |
 | Rótulos curtos em mono caixa alta | Caixa alta em frases ou parágrafos |
 | Números grandes com `--f-display` e algarismos tabulares | Números de KPI na fonte de corpo |
 
@@ -272,6 +376,10 @@ Pílula grafite centralizada no rodapé, com um ponto verde (sucesso) ou vermelh
 1. Uma tela nova é uma `<section class="secao grid" id="s-NOME">` com cartões.
    Registre o título em `TITULOS`, a função em `telas` e o item em `nav`.
    Para um módulo que pode estar desligado, use `data-mod="id-do-modulo"`.
-2. Um estado novo entra em `ESTADO` (para `st-ok`, `st-wait`, `st-act` ou
-   `st-bad`) e, se precisar de texto especial, em `ROT`.
-3. Uma cor nova primeiro vira token em `:root` **e** no bloco escuro.
+2. Um estado novo entra em `ESTADO` (para `plan`, `wait`, `act`, `ok`, `bad`
+   ou `skip`) e, se precisar de texto especial, em `ROT`. O terminal tem a
+   sua própria cópia de `ESTADO` e `ROT`: mantenha as duas iguais.
+3. Uma sub-tela usa o hash com barra (`/#tela/sub`). `sub()` devolve o que
+   vem depois da barra, e `mostrar()` ajusta o título e a trilha.
+4. Uma cor nova primeiro vira token em `tokens_css()`, em `:root` **e** no
+   bloco escuro.

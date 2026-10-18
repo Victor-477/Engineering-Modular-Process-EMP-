@@ -25,6 +25,7 @@ import "nucleo/seguranca.cryo" as seg;
 import "nucleo/auditoria.cryo" as audit;
 import "nucleo/plugins.cryo"   as plugins;
 import "nucleo/painel.cryo"    as painel;
+import "nucleo/terminal.cryo"  as terminal;
 import "modulos/catalogo.cryo" as catalogo;
 
 const string VERSAO = "0.2.0";
@@ -58,14 +59,18 @@ fn sistema(string path, k::Requisicao r) -> k::Resposta ={
     return k::nao_encontrado();
 }
 
-fn pagina_inicial() -> k::Resposta ={
-    return k::Resposta { status: 200, tipo: "text/html; charset=utf-8", corpo: painel::pagina() };
+fn html(string corpo) -> k::Resposta ={
+    return k::Resposta { status: 200, tipo: "text/html; charset=utf-8", corpo: corpo };
 }
 
 fn atender(map<string,string> req) -> k::Resposta ={
     string path = req["path"];
+    // As páginas não exigem token; a API que elas chamam, sim.
     if (path == "/" && req["method"] == "GET") {
-        return pagina_inicial();
+        return html(painel::pagina());
+    }
+    if (path == "/terminal" && req["method"] == "GET") {
+        return html(terminal::pagina());
     }
     string quem = seg::identificar(req);
     if (len(quem) == 0) {
@@ -121,7 +126,7 @@ if (!http_listen(porta)) {
 } else {
     // 127.0.0.1, não "localhost": o servidor nativo só escuta IPv4 e o
     // Windows tenta ::1 primeiro — ~200 ms a mais por conexão (L-22).
-    print("  ouvindo em http://127.0.0.1:" + to_string(porta) + "  (painel em /)");
+    print("  ouvindo em http://127.0.0.1:" + to_string(porta) + "  (painel em /, terminal em /terminal)");
     while (true) {
         map<string,string> req = http_accept();
         if (len(req["method"]) > 0) {

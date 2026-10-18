@@ -2,6 +2,44 @@
 
 ## Não lançado
 
+### Novo
+- **Terminal do operador** (`GET /terminal`, `src/nucleo/terminal.cryo`):
+  uma página por posto (`/terminal#PRENSA-01`) para o tablet ao lado da
+  máquina, com **uma instrução por vez** (padrão dos terminais manuais do
+  MES4, no visual Forja). Título da operação, instrução, OP, produto,
+  "etapa n de m", entrada, boas, refugo e o que falta; botões de 84 px:
+  *Iniciar* → *Apontar* (boas/refugo com − e +, e os parâmetros medidos com
+  "dentro/fora do limite") / *Concluir* / *Concluir com erro* (motivos
+  prontos) / *Reiniciar*. Lista de tarefas do posto, "Nenhuma tarefa" quando
+  vazia, posto parado em destaque com as ações bloqueadas.
+  - Atualiza a cada 1 s (2 s depois de uma mensagem), com o selo
+    "atualizado às HH:MM:SS"; um toque desliga os botões na hora.
+  - Envia a `versao` da etapa; um 409 de versão vira "a tarefa foi alterada
+    por outra pessoa" e a tela recarrega.
+  - A página é aberta sem token; a API continua exigindo, com o token do
+    painel (`localStorage`). O operador fica salvo no tablet.
+- **Painel**:
+  - **Estado = ícone + cor** em todas as etiquetas (planejada, aguardando,
+    ativa, concluída, falha, pulada) e **faixa de estado** na borda esquerda
+    de linhas e cartões; uma falha pisca uma vez.
+  - **Detalhe da OP com o fluxo de etapas** (`/#ordens/7`): planejado ×
+    real (com atraso), entrada, boas, refugo, operador, erro e as ações
+    iniciar / concluir / concluir com erro / reiniciar / pular (as duas
+    últimas só para pcp e admin). A lista de ordens ganhou a coluna
+    "Etapa atual" e o código da OP abre o detalhe.
+  - **Aba Roteiros em Cadastros** (`/#cadastros/roteiros`, aparece quando o
+    módulo `roteiros` está ativo): operações com parâmetros medidos, editor
+    do roteiro por produto (incluir, editar, remover etapa) e capacidades
+    posto × operação.
+  - **Moldura de lista** em ordens, saldos, paradas, NCs, produtos, postos,
+    operações e capacidades: filtro de texto e de estado, aviso
+    "lista filtrada · limpar" e **Exportar CSV** gerado no navegador.
+  - Link para o terminal em cada posto (cartões, cadastro, etapas), no menu
+    e na tela inicial.
+- Os tokens do Forja ficam em `painel::tokens_css()`, usado pelas duas
+  páginas. [DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md) 1.1 documenta os
+  componentes novos.
+
 ### Alterado
 - **Novo sistema de design próprio: "Forja"** ([docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md)),
   aplicado em todo o painel (`src/nucleo/painel.cryo`). Substitui o visual
