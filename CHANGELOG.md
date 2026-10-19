@@ -68,7 +68,8 @@
     aparece sob o estado e o código da OP abre o detalhe.
   - **Aba Roteiros em Cadastros** (`/#cadastros/roteiros`, aparece quando o
     módulo `roteiros` está ativo): operações com parâmetros medidos, editor
-    do roteiro por produto (incluir, editar, remover etapa) e capacidades
+    do roteiro por produto (incluir, editar, remover etapa; endereço próprio,
+    `/#cadastros/roteiros/SUP-02`, aberto pelo produto no detalhe da OP) e capacidades
     posto × operação.
   - **Moldura de lista** em ordens, saldos, paradas, NCs, produtos, postos,
     operações e capacidades: filtro de texto e de estado, aviso

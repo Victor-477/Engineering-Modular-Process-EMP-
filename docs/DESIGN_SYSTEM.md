@@ -245,7 +245,8 @@ Excel em português), só com as linhas visíveis.
 Um seletor de pílulas dentro de uma tela (`.abas`), com o item ativo em
 grafite (`--console`), porque o laranja continua reservado para a ação
 principal. Cada aba tem endereço próprio: `/#cadastros` e
-`/#cadastros/roteiros`. A aba de um módulo desligado some (`data-mod`).
+`/#cadastros/roteiros`; o roteiro de um produto, também
+(`/#cadastros/roteiros/SUP-02`, aberto pelo nome do produto no detalhe da OP). A aba de um módulo desligado some (`data-mod`).
 
 ### Medidor (posto)
 
