@@ -64,8 +64,8 @@
   - **Detalhe da OP com o fluxo de etapas** (`/#ordens/7`): planejado ×
     real (com atraso), entrada, boas, refugo, operador, erro e as ações
     iniciar / concluir / concluir com erro / reiniciar / pular (as duas
-    últimas só para pcp e admin). A lista de ordens ganhou a coluna
-    "Etapa atual" e o código da OP abre o detalhe.
+    últimas só para pcp e admin). Na lista de ordens, a etapa atual
+    aparece sob o estado e o código da OP abre o detalhe.
   - **Aba Roteiros em Cadastros** (`/#cadastros/roteiros`, aparece quando o
     módulo `roteiros` está ativo): operações com parâmetros medidos, editor
     do roteiro por produto (incluir, editar, remover etapa) e capacidades
