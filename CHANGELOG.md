@@ -2,7 +2,46 @@
 
 ## Não lançado
 
-### Novo
+### Novo — execução por etapas (fase 1 da análise do MES4, [docs/ANALISE_FACTORYVIEWS.md](docs/ANALISE_FACTORYVIEWS.md))
+- **Módulo de Roteiros** (`src/modulos/roteiros/`, prefixo `/api/roteiros`,
+  depende de cadastros, escrita por admin/pcp): **operações** (código,
+  descrição, tipo MANUAL/AUTOMATICA, instrução e parâmetros medidos com
+  limites `nome:unidade:min:max;...`), **roteiro por produto** (etapas
+  numeradas: operação, posto, tempo em min/unidade, instrução; inserir,
+  substituir, remover) e **capacidades** posto × operação (tempo padrão usado
+  quando a etapa tem tempo 0). API Cryo: `roteiros::etapas(produto)`,
+  `roteiros::operacao_json(codigo)`.
+- **Produção executa por etapa** (`producao/etapas.cryo` + `producao.cryo`):
+  na liberação a OP copia o roteiro (sem roteiro: etapa única `APONTAMENTO`
+  no posto da OP, como antes), com início/fim planejados em sequência.
+  `GET /ordem` e `GET /ordens` trazem `etapas` e `etapa_atual`.
+  - Rotas novas: `GET /fila?posto=` e `POST /etapa/iniciar|apontar|concluir|erro|reiniciar|pular?op=&etapa=`.
+  - Concorrência por **`versao`** da etapa: versão diferente → 409
+    "a tarefa foi alterada por outra pessoa", com a etapa atualizada no corpo.
+  - Posto parado recusa iniciar, apontar e concluir (409).
+  - **Medições** por apontamento (`medicoes=nome=valor;...`), conferidas
+    contra os limites da operação (`dentro` verdadeiro/falso).
+  - A etapa seguinte recebe como entrada as boas da anterior; a última soma
+    em `produzido` e publica `producao.apontada` levando junto o refugo das
+    etapas anteriores, para o backflush consumir o material das peças perdidas.
+  - `reiniciar` e `pular` só para pcp/admin.
+  - Eventos novos: `producao.etapa_iniciada`, `producao.etapa_concluida`,
+    `producao.etapa_falhou`.
+- `POST /apontar?id=` continua aceito: aponta na etapa atual (iniciando-a se
+  estiver aguardando), sem pedir versão. OPs liberadas por versões anteriores
+  ganham na leitura uma etapa única com o que já tinham produzido.
+- `tools/demo.cryo` cadastra operações, capacidades e roteiros (SUP-02 passa
+  por prensa → solda → pintura → montagem) e executa OPs etapa por etapa,
+  com erro + reiniciar, medição fora do limite e um 409 por versão velha.
+- Testes: `tests/test_etapas.cryo` (15 casos com `test fn`: máquina de
+  estados, versão/409, pular, medições e parâmetros), rodado pelo `build.ps1`.
+
+### Alterado (comportamento)
+- Uma etapa conclui sozinha quando **boas + refugo** alcançam a entrada (antes
+  a OP concluía quando só as boas alcançavam a quantidade).
+- Etapas depois da primeira não aceitam apontar mais peças do que entraram (422).
+
+### Novo — interface da fase 1 (terminal do operador e painel)
 - **Terminal do operador** (`GET /terminal`, `src/nucleo/terminal.cryo`):
   uma página por posto (`/terminal#PRENSA-01`) para o tablet ao lado da
   máquina, com **uma instrução por vez** (padrão dos terminais manuais do

@@ -1,0 +1,337 @@
+// ============================================================
+//  roteiros.cryo — Módulo de Operações, Roteiros e Capacidades
+//
+//  Inspirado no plano de trabalho do MES4 (tblOperation,
+//  tblWorkPlanDef/tblStepDef, tblResourceOperation): cada produto
+//  tem um ROTEIRO — etapas numeradas, cada uma uma OPERAÇÃO num
+//  POSTO. A produção copia o roteiro para a OP na liberação e passa
+//  a executar etapa por etapa (producao/etapas.cryo).
+//
+//  Tempos em MINUTOS POR UNIDADE (tempo de ciclo). Uma etapa com
+//  tempo 0 usa a capacidade posto × operação, se houver.
+//
+//  Rotas (prefixo /api/roteiros):
+//    GET  /operacoes[?codigo=X]       lista (ou uma operação)
+//    POST /operacoes                  codigo=&descricao=&tipo=MANUAL|AUTOMATICA
+//                                     &instrucao=&parametros=nome:unidade:min:max;...
+//    GET  /roteiro?produto=X          {produto, etapas:[...]}
+//    POST /etapa                      produto=&numero=&operacao=&posto=&tempo_min=&instrucao=
+//                                     (insere ou substitui a etapa `numero`)
+//    POST /remover_etapa?produto=&numero=
+//    GET  /capacidades                [{posto, operacao, tempo_min}]
+//    POST /capacidade                 posto=&operacao=&tempo_min=
+//
+//  Eventos publicados: operacao.salva, roteiro.alterado,
+//                      capacidade.salva
+// ============================================================
+
+import "../../nucleo/contrato.cryo" as k;
+import "../../nucleo/persist.cryo"  as db;
+import "../../nucleo/eventos.cryo"  as ev;
+import "../../nucleo/form.cryo"     as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+
+// Um parâmetro medido na operação, com limites de aceitação.
+pub struct Parametro {
+    string nome;
+    string unidade;
+    number min;
+    number max;
+}
+
+pub struct Operacao {
+    string codigo;
+    string descricao;
+    string tipo;            // MANUAL | AUTOMATICA
+    string instrucao;
+    Parametro[] parametros;
+}
+
+// Uma etapa do roteiro de um produto.
+pub struct Etapa {
+    int numero;
+    string operacao;
+    string posto;
+    number tempo_min;       // minutos por unidade; 0 = usar a capacidade
+    string instrucao;
+}
+
+pub struct Capacidade {
+    string posto;
+    string operacao;
+    number tempo_min;
+}
+
+// Resultado de ler o texto "nome:unidade:min:max;...". `erro` vazio = ok.
+pub struct LeituraParametros {
+    Parametro[] itens;
+    string erro;
+}
+
+string _dir = "";
+map<string,string> _operacoes = {};    // codigo -> json(Operacao)
+map<string,string> _roteiros = {};     // produto -> json(Etapa[])
+map<string,string> _capacidades = {};  // "POSTO|OPERACAO" -> json(Capacidade)
+
+// ── funções puras (testadas em tests/test_etapas.cryo) ────
+
+// Texto numérico ("9,9" ou "9.9")? Nunca to_number em texto de fora.
+pub fn eh_num(string texto) -> bool ={
+    return form::eh_numero(replace(trim(texto), ",", "."));
+}
+
+pub fn num(string texto) -> number ={
+    return parse_number(replace(trim(texto), ",", ".")) ?? 0.0;
+}
+
+// "diametro:mm:9.9:10.1;peso:g:0:50" -> parâmetros. Texto vazio = nenhum.
+pub fn ler_parametros(string texto) -> LeituraParametros ={
+    Parametro[] itens = [];
+    for (string bruto in split(trim(texto), ";")) {
+        string item = trim(bruto);
+        if (len(item) == 0) { continue; }
+        string[] partes = split(item, ":");
+        if (len(partes) != 4) {
+            return LeituraParametros { itens: itens,
+                erro: "parâmetro '" + item + "' deve ser nome:unidade:min:max" };
+        }
+        string nome = trim(partes[0]);
+        if (len(nome) == 0) {
+            return LeituraParametros { itens: itens, erro: "parâmetro sem nome em '" + item + "'" };
+        }
+        if (!eh_num(partes[2]) || !eh_num(partes[3])) {
+            return LeituraParametros { itens: itens,
+                erro: "limites de '" + nome + "' devem ser números" };
+        }
+        number lo = num(partes[2]);
+        number hi = num(partes[3]);
+        if (lo > hi) {
+            return LeituraParametros { itens: itens,
+                erro: "em '" + nome + "' o mínimo é maior que o máximo" };
+        }
+        for (Parametro p in itens) {
+            if (p.nome == nome) {
+                return LeituraParametros { itens: itens, erro: "parâmetro '" + nome + "' repetido" };
+            }
+        }
+        itens = concat(itens, [Parametro { nome: nome, unidade: trim(partes[1]), min: lo, max: hi }]);
+    }
+    return LeituraParametros { itens: itens, erro: "" };
+}
+
+// Insere ou substitui a etapa `nova.numero`, mantendo a ordem por número.
+pub fn com_etapa(Etapa[] atual, Etapa nova) -> Etapa[] ={
+    Etapa[] saida = [];
+    bool posta = false;
+    for (Etapa e in atual) {
+        if (e.numero == nova.numero) { continue; }
+        if (!posta && e.numero > nova.numero) {
+            saida = concat(saida, [nova]);
+            posta = true;
+        }
+        saida = concat(saida, [e]);
+    }
+    if (!posta) { saida = concat(saida, [nova]); }
+    return saida;
+}
+
+pub fn sem_etapa(Etapa[] atual, int numero) -> Etapa[] ={
+    Etapa[] saida = [];
+    for (Etapa e in atual) {
+        if (e.numero != numero) { saida = concat(saida, [e]); }
+    }
+    return saida;
+}
+
+// ── API pública para outros módulos (dependência declarada) ──
+
+pub fn operacao_existe(string codigo) -> bool ={
+    return has(_operacoes, codigo);
+}
+
+// JSON da operação, ou "" se não existir.
+pub fn operacao_json(string codigo) -> string ={
+    if (!has(_operacoes, codigo)) { return ""; }
+    return _operacoes[codigo];
+}
+
+pub fn operacao(string codigo) -> Operacao ={
+    if (!has(_operacoes, codigo)) {
+        Parametro[] nenhum = [];
+        return Operacao { codigo: codigo, descricao: "", tipo: "MANUAL", instrucao: "", parametros: nenhum };
+    }
+    return json_decode(_operacoes[codigo]) as Operacao;
+}
+
+pub fn etapas(string produto) -> Etapa[] ={
+    if (!has(_roteiros, produto)) {
+        Etapa[] vazio = [];
+        return vazio;
+    }
+    return json_decode(_roteiros[produto]) as Etapa[];
+}
+
+// Tempo padrão (min/unidade) do posto para a operação; 0 se não houver.
+pub fn tempo_capacidade(string posto, string operacao) -> number ={
+    string chave = posto + "|" + operacao;
+    if (!has(_capacidades, chave)) { return 0.0; }
+    Capacidade c = json_decode(_capacidades[chave]) as Capacidade;
+    return c.tempo_min;
+}
+
+// ── ciclo de vida ─────────────────────────────────────────
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _operacoes   = db::carregar(dir, "operacoes");
+    _roteiros    = db::carregar(dir, "roteiros");
+    _capacidades = db::carregar(dir, "capacidades");
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    return true;            // roteiros não assina eventos
+}
+
+// ── handlers ──────────────────────────────────────────────
+
+fn _lista(map<string,string> m) -> string ={
+    string[] itens = [];
+    for (string c in sort(keys(m))) {
+        itens = concat(itens, [m[c]]);
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _roteiro_json(string produto) -> string ={
+    return "{\"produto\":" + json_encode(produto)
+        + ",\"etapas\":" + json_encode(etapas(produto)) + "}";
+}
+
+fn _salvar_operacao(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string codigo = upper(form::campo(f, "codigo"));
+    string tipo = upper(form::campo_ou(f, "tipo", "MANUAL"));
+    if (len(codigo) == 0) { return k::erro(400, "codigo é obrigatório"); }
+    if (contains(codigo, "|")) { return k::erro(400, "codigo não pode conter '|'"); }
+    if (tipo != "MANUAL" && tipo != "AUTOMATICA") {
+        return k::erro(400, "tipo deve ser MANUAL ou AUTOMATICA");
+    }
+    LeituraParametros lp = ler_parametros(form::campo(f, "parametros"));
+    if (len(lp.erro) > 0) { return k::erro(422, lp.erro); }
+    Operacao o = Operacao {
+        codigo: codigo,
+        descricao: form::campo(f, "descricao"),
+        tipo: tipo,
+        instrucao: form::campo(f, "instrucao"),
+        parametros: lp.itens
+    };
+    _operacoes[codigo] = json_encode(o);
+    if (!db::salvar(_dir, "operacoes", _operacoes)) {
+        return k::erro(500, "falha ao gravar operações");
+    }
+    ev::publicar("operacao.salva", "roteiros", "codigo=" + url_encode(codigo));
+    return k::criado(_operacoes[codigo]);
+}
+
+fn _gravar_roteiro(string produto, Etapa[] lista) -> bool ={
+    if (len(lista) == 0) {
+        if (has(_roteiros, produto)) { remove(_roteiros, produto); }
+    } else {
+        _roteiros[produto] = json_encode(lista);
+    }
+    bool ok = db::salvar(_dir, "roteiros", _roteiros);
+    ev::publicar("roteiro.alterado", "roteiros", "produto=" + url_encode(produto)
+        + "&etapas=" + to_string(len(lista)));
+    return ok;
+}
+
+fn _salvar_etapa(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string produto = upper(form::campo(f, "produto"));
+    string oper = upper(form::campo(f, "operacao"));
+    string posto = upper(form::campo(f, "posto"));
+    int numero = form::inteiro(f, "numero", 0);
+    number tempo = form::numero(f, "tempo_min", -1.0);
+    if (len(form::campo(f, "tempo_min")) == 0) { tempo = 0.0; }
+    if (!cadastros::existe(produto)) { return k::erro(422, "produto " + produto + " não cadastrado"); }
+    if (cadastros::produto(produto).tipo == "MP") { return k::erro(422, "matéria-prima não tem roteiro"); }
+    if (numero <= 0) { return k::erro(422, "numero da etapa deve ser um inteiro positivo"); }
+    if (!operacao_existe(oper)) { return k::erro(422, "operação " + oper + " não cadastrada"); }
+    if (!cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
+    if (tempo < 0.0) { return k::erro(422, "tempo_min deve ser um número maior ou igual a zero"); }
+    Etapa nova = Etapa {
+        numero: numero, operacao: oper, posto: posto, tempo_min: tempo,
+        instrucao: form::campo(f, "instrucao")
+    };
+    if (!_gravar_roteiro(produto, com_etapa(etapas(produto), nova))) {
+        return k::erro(500, "falha ao gravar roteiros");
+    }
+    return k::criado(_roteiro_json(produto));
+}
+
+fn _remover_etapa(k::Requisicao r) -> k::Resposta ={
+    string produto = upper(k::param(r, "produto"));
+    int numero = parse_int(k::param(r, "numero")) ?? 0;
+    Etapa[] atual = etapas(produto);
+    Etapa[] nova = sem_etapa(atual, numero);
+    if (len(nova) == len(atual)) {
+        return k::erro(404, "etapa " + to_string(numero) + " não existe no roteiro de " + produto);
+    }
+    if (!_gravar_roteiro(produto, nova)) { return k::erro(500, "falha ao gravar roteiros"); }
+    return k::ok(_roteiro_json(produto));
+}
+
+fn _salvar_capacidade(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string posto = upper(form::campo(f, "posto"));
+    string oper = upper(form::campo(f, "operacao"));
+    number tempo = form::numero(f, "tempo_min", 0.0);
+    if (!cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
+    if (!operacao_existe(oper)) { return k::erro(422, "operação " + oper + " não cadastrada"); }
+    if (tempo <= 0.0) { return k::erro(422, "tempo_min deve ser um número positivo"); }
+    string chave = posto + "|" + oper;
+    _capacidades[chave] = json_encode(Capacidade { posto: posto, operacao: oper, tempo_min: tempo });
+    if (!db::salvar(_dir, "capacidades", _capacidades)) {
+        return k::erro(500, "falha ao gravar capacidades");
+    }
+    ev::publicar("capacidade.salva", "roteiros", "posto=" + url_encode(posto)
+        + "&operacao=" + url_encode(oper));
+    return k::criado(_capacidades[chave]);
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/operacoes" && r.metodo == "GET") {
+        string c = upper(k::param(r, "codigo"));
+        if (len(c) == 0) { return k::ok(_lista(_operacoes)); }
+        if (!operacao_existe(c)) { return k::erro(404, "operação " + c + " não encontrada"); }
+        return k::ok(_operacoes[c]);
+    }
+    if (r.rota == "/operacoes" && r.metodo == "POST") { return _salvar_operacao(r); }
+    if (r.rota == "/roteiro" && r.metodo == "GET") {
+        return k::ok(_roteiro_json(upper(k::param(r, "produto"))));
+    }
+    if (r.rota == "/etapa" && r.metodo == "POST") { return _salvar_etapa(r); }
+    if (r.rota == "/remover_etapa" && r.metodo == "POST") { return _remover_etapa(r); }
+    if (r.rota == "/capacidades" && r.metodo == "GET") { return k::ok(_lista(_capacidades)); }
+    if (r.rota == "/capacidade" && r.metodo == "POST") { return _salvar_capacidade(r); }
+    return k::nao_encontrado();
+}
+
+// ── descritor ─────────────────────────────────────────────
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "roteiros",
+        nome: "Roteiros (operações, etapas, capacidades)",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/roteiros",
+        depende: ["cadastros"],
+        assina: [],
+        perfis_escrita: ["admin", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

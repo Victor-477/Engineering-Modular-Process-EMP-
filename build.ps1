@@ -32,6 +32,10 @@ Write-Host "== testes de eventos (cryoc test)"
 python $cryoc test tests/test_eventos.cryo --backend pyro
 if ($LASTEXITCODE -ne 0) { throw "testes de eventos falharam" }
 
+Write-Host "== testes de etapas e roteiros (cryoc test)"
+python $cryoc test tests/test_etapas.cryo --backend pyro
+if ($LASTEXITCODE -ne 0) { throw "testes de etapas falharam" }
+
 Write-Host "== nucleo -> build\emp.exe"
 python $pyro build src/main.cryo -o build/emp.exe
 if ($LASTEXITCODE -ne 0) { throw "build do nucleo falhou" }
