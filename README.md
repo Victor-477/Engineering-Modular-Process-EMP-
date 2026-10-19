@@ -26,14 +26,26 @@ recusar apontamento naquele posto. Nenhum dos dois importa o outro.
 
 | | |
 |---|---|
-| ![Ordens de produção](docs/screenshots/02-ordens.png) **Ordens** — criar, liberar, apontar e cancelar OPs; progresso por ordem | ![Estoque](docs/screenshots/03-estoque.png) **Estoque** — saldos e movimentos; o consumo dos componentes sai sozinho a cada apontamento |
+| ![Ordens de produção](docs/screenshots/02-ordens.png) **Ordens** — criar, liberar, apontar e cancelar OPs; estado com ícone, etapa atual, filtro e exportação CSV | ![Estoque](docs/screenshots/03-estoque.png) **Estoque** — saldos e movimentos; o consumo dos componentes sai sozinho a cada apontamento |
 | ![Manutenção](docs/screenshots/04-manutencao.png) **Manutenção** — estado de cada posto, disponibilidade, MTTR, minutos por categoria | ![Qualidade](docs/screenshots/05-qualidade.png) **Qualidade** (plugin) — NC automática quando o refugo passa de 5% |
-| ![Cadastros](docs/screenshots/06-cadastros.png) **Cadastros** — produtos, estrutura (BOM) e postos | ![Eventos](docs/screenshots/07-eventos.png) **Eventos** — o que cada módulo publicou no barramento |
-| ![Módulos](docs/screenshots/08-modulos.png) **Módulos** — internos e plugins, com o estado de cada um | |
+| ![Cadastros](docs/screenshots/06-cadastros.png) **Cadastros** — produtos, estrutura (BOM) e postos, com link para o terminal de cada posto | ![Eventos](docs/screenshots/07-eventos.png) **Eventos** — o que cada módulo publicou no barramento |
+| ![Módulos](docs/screenshots/08-modulos.png) **Módulos** — internos e plugins, com o estado de cada um | ![Fluxo de etapas](docs/screenshots/09-ordem-etapas.png) **Detalhe da OP** (`/#ordens/3`) — fluxo de etapas: planejado × real, operador, medições e ações por etapa |
+| ![Roteiros](docs/screenshots/10-roteiros.png) **Roteiros** (Cadastros) — operações com parâmetros, roteiro por produto e capacidades | ![Postos do terminal](docs/screenshots/13-terminal-postos.png) **Terminal: escolha do posto** (`/terminal`) |
+
+### Terminal do operador
+
+`/terminal#PRENSA-01` é a tela do tablet ao lado da máquina: uma instrução por
+vez, botões grandes, fila do posto e atualização a cada segundo. A página
+abre sem token; a API usa o mesmo token do painel.
+
+| | |
+|---|---|
+| ![Terminal do operador](docs/screenshots/11-terminal.png) Tablet deitado, etapa em execução | ![Terminal com posto parado](docs/screenshots/12-terminal-parado-escuro.png) Tablet em pé, modo escuro, posto parado: as ações ficam bloqueadas |
 
 As capturas foram feitas com o `emp.exe` real, populado por
-[`tools/demo.cryo`](tools/demo.cryo) e depois operado pelo navegador (parada
-encerrada, apontamento e OP criados pelo painel).
+[`tools/demo.cryo`](tools/demo.cryo) (mais uma etapa concluída com erro pela
+API), com o Edge headless (`--headless=new --screenshot`, 1440 px de largura
+no painel; o tema claro forçado com `--blink-settings=preferredColorScheme`).
 
 ## Compilar
 
@@ -58,7 +70,7 @@ python ../Burnout/cryoc.py src/main.cryo --backend pyro -o build/emp.pyro --run
 $env:ERP_TOKENS="tk-ana:ana:admin,tk-joao:joao:operador,tk-rui:rui:almoxarife,tk-lia:lia:manutencao"
 $env:PYRO_HTTP_TIMEOUT_MS="2000"
 .\qualidade.exe          # opcional: plugin, porta 8091
-.\emp.exe                # painel em http://127.0.0.1:8080
+.\emp.exe                # painel em http://127.0.0.1:8080, terminal em /terminal
 ```
 
 > Use **`http://127.0.0.1:8080`** (ou o IP do servidor), não `localhost`: o
