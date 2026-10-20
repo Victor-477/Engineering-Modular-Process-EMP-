@@ -22,6 +22,10 @@ boas, refugo (acumulados da etapa), delta_boas, delta_refugo (desta ação),
 inicio, fim (ms; 0 se não houver), operador, motivo, status
 ```
 
+E `maquina.parada` / `maquina.liberada` levam `parada, posto, categoria,
+motivo, inicio, fim` (ms; `fim=0` enquanto aberta) e `minutos` — o `inicio`
+é o real, inclusive em parada retroativa (`ha_minutos`).
+
 ## A. Comercial — módulo novo `pedidos` (`/api/pedidos`)
 
 Depende de `cadastros` e `producao`. Escrita: admin, comercial, pcp.
