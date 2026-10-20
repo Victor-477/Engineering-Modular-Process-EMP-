@@ -1,0 +1,247 @@
+// Testes do estoque endereçado e da reposição com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_estoque.cryo --backend pyro
+//
+// Duas partes: as regras puras (estoque/regras.cryo) e o módulo inteiro
+// pelo próprio contrato (descritor: iniciar, rotear, ao_evento), com
+// dados em build/test_estoque/<caso>. O pedido.expedido é simulado: o
+// teste entrega o evento direto, sem o módulo pedidos.
+
+import "../src/nucleo/contrato.cryo"           as k;
+import "../src/nucleo/eventos.cryo"            as ev;
+import "../src/nucleo/persist.cryo"            as db;
+import "../src/modulos/cadastros/cadastros.cryo" as cadastros;
+import "../src/modulos/estoque/estoque.cryo"   as estoque;
+import "../src/modulos/estoque/regras.cryo"    as rg;
+
+// ── regras puras ──────────────────────────────────────────
+
+fn _regra(number minimo, number maximo) -> rg::Regra ={
+    return rg::Regra { produto: "PARAF", minimo: minimo, maximo: maximo, tipo: "COMPRAR", endereco: "" };
+}
+
+test fn itens_do_pedido() ={
+    rg::ItemPedido[] v = rg::ler_itens("sup-01:10; SUP-02:2,5;;LIXO;X:abc;Y:-1;Z:0");
+    assert(len(v) == 2, "só os dois válidos");
+    assert(v[0].produto == "SUP-01" && v[0].quantidade == 10.0, "maiúsculas e inteiro");
+    assert(v[1].produto == "SUP-02" && v[1].quantidade == 2.5, "vírgula decimal");
+    assert(len(rg::ler_itens("")) == 0, "vazio");
+}
+
+test fn repartir_ate_o_saldo() ={
+    assert(rg::repartir(30.0, 100.0) == 30.0, "cabe inteiro");
+    assert(rg::repartir(30.0, 12.0) == 12.0, "só o que tem");
+    assert(rg::repartir(30.0, 0.0) == 0.0, "nada");
+    assert(rg::repartir(30.0, -5.0) == 0.0, "negativo não empresta");
+}
+
+test fn validar_regras() ={
+    assert(rg::validar_regra(_regra(10.0, 50.0)) == "", "válida");
+    assert(rg::validar_regra(_regra(0.0, 1.0)) == "", "mínimo zero vale");
+    assert(rg::validar_regra(_regra(50.0, 50.0)) != "", "máximo = mínimo");
+    assert(rg::validar_regra(_regra(-1.0, 5.0)) != "", "mínimo negativo");
+    rg::Regra t = rg::Regra { produto: "P", minimo: 1.0, maximo: 2.0, tipo: "ROUBAR", endereco: "" };
+    assert(rg::validar_regra(t) != "", "tipo inválido");
+}
+
+test fn cruzar_e_sugerir() ={
+    rg::Regra r = _regra(100.0, 400.0);
+    assert(rg::cruzou_abaixo(r, 120.0, 90.0), "cruzou");
+    assert(!rg::cruzou_abaixo(r, 90.0, 80.0), "já estava abaixo");
+    assert(!rg::cruzou_abaixo(r, 150.0, 100.0), "no mínimo não é abaixo");
+    assert(rg::sugerido(r, 90.0) == 310.0, "repõe até o máximo");
+    assert(rg::sugerido(r, 500.0) == 0.0, "acima do máximo, nada");
+}
+
+test fn validar_enderecos() ={
+    rg::Endereco linha = rg::Endereco { codigo: "LIN-1", descricao: "", tipo: "LINHA", posto: "MONT-01" };
+    assert(rg::validar_endereco(linha, true, "") == "", "linha válida");
+    assert(rg::validar_endereco(linha, true, "LIN-1") == "", "regravar a mesma");
+    assert(rg::validar_endereco(linha, true, "LIN-2") != "", "posto já atendido");
+    assert(rg::validar_endereco(linha, false, "") != "", "posto inexistente");
+    rg::Endereco sem = rg::Endereco { codigo: "LIN-1", descricao: "", tipo: "LINHA", posto: "" };
+    assert(rg::validar_endereco(sem, false, "") != "", "linha sem posto");
+    rg::Endereco g = rg::Endereco { codigo: "GERAL", descricao: "", tipo: "ALMOXARIFADO", posto: "" };
+    assert(rg::validar_endereco(g, false, "") != "", "GERAL é fixo");
+    rg::Endereco bar = rg::Endereco { codigo: "A|B", descricao: "", tipo: "QUARENTENA", posto: "" };
+    assert(rg::validar_endereco(bar, false, "") != "", "barra no código");
+    rg::Endereco t = rg::Endereco { codigo: "X", descricao: "", tipo: "PRATELEIRA", posto: "" };
+    assert(rg::validar_endereco(t, false, "") != "", "tipo inválido");
+    assert(rg::produto_da_chave(rg::chave("GERAL", "A|B")) == "A|B", "produto com barra");
+    assert(rg::endereco_da_chave(rg::chave("GERAL", "A|B")) == "GERAL", "endereço da chave");
+}
+
+// ── o módulo pelo contrato ────────────────────────────────
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _req(string metodo, string rota, string query, string corpo) -> k::Resposta ={
+    k::Requisicao r = k::Requisicao { metodo: metodo, rota: rota, query: query, corpo: corpo,
+                                      usuario: "teste", perfil: "admin" };
+    return _rotear(estoque::descritor().rotear, r);
+}
+
+fn _get(string rota, string query) -> string ={ return _req("GET", rota, query, "").corpo; }
+fn _post(string rota, string corpo) -> int ={ return _req("POST", rota, "", corpo).status; }
+
+fn _entregar(string tipo, string dados) ={
+    k::Evento e = k::Evento { id: 0, tipo: tipo, origem: "teste", dados: dados, ts: now_ms() };
+    _evento(estoque::descritor().ao_evento, e);
+}
+
+fn _produto(map<string,string> m, string codigo, string tipo) ={
+    m[codigo] = json_encode(cadastros::Produto { codigo: codigo, descricao: codigo, unidade: "UN", tipo: tipo });
+}
+
+// Um diretório limpo com produtos, estrutura (SUP = 2 PARAF + 1 BASE) e
+// um posto; cadastros e estoque iniciados nele; fila de eventos vazia.
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_estoque")) { make_dir("build/test_estoque"); }
+    string dir = "build/test_estoque/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+    for (string c in ["saldos", "posicoes", "movimentos", "enderecos", "reposicao", "produtos", "estrutura", "postos"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+    map<string,string> prods = {};
+    _produto(prods, "PARAF", "MP");
+    _produto(prods, "BASE", "SA");
+    _produto(prods, "SUP", "PA");
+    db::salvar(dir, "produtos", prods);
+    map<string,string> est = {};
+    cadastros::ItemEstrutura[] bom = [
+        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 2.0 },
+        cadastros::ItemEstrutura { componente: "BASE", quantidade: 1.0 }
+    ];
+    est["SUP"] = json_encode(bom);
+    db::salvar(dir, "estrutura", est);
+    map<string,string> postos = {};
+    postos["MONT-01"] = "{\"codigo\":\"MONT-01\",\"descricao\":\"Montagem\",\"capacidade_h\":8}";
+    db::salvar(dir, "postos", postos);
+    _iniciar(cadastros::descritor().iniciar, dir);
+    ev::retirar();
+    return dir;
+}
+
+fn _publicados(string tipo) -> int ={
+    int n = 0;
+    for (k::Evento e in ev::retirar()) {
+        if (e.tipo == tipo) { n = n + 1; }
+    }
+    return n;
+}
+
+test fn migra_saldos_da_v02_para_o_geral() ={
+    string dir = _preparar("migracao");
+    map<string,string> velhos = {};
+    velhos["PARAF"] = "500";
+    velhos["BASE"] = "12.5";
+    db::salvar(dir, "saldos", velhos);
+    _iniciar(estoque::descritor().iniciar, dir);
+    assert(_get("/saldos", "") == "{\"BASE\":\"12.5\",\"PARAF\":\"500\"}", "GET /saldos inalterado");
+    assert(_get("/saldos", "produto=paraf") == "{\"produto\":\"PARAF\",\"saldo\":500,\"por_endereco\":{\"GERAL\":500}}",
+        "por endereço: tudo no GERAL");
+    assert(contains(_get("/enderecos", ""), "\"codigo\":\"GERAL\""), "GERAL existe sem cadastro");
+    assert(estoque::saldo_em("GERAL", "BASE") == 12.5, "saldo_em");
+}
+
+test fn enderecos_entrada_e_transferencia() ={
+    string dir = _preparar("transferencia");
+    _iniciar(estoque::descritor().iniciar, dir);
+    assert(_post("/enderecos", "codigo=lin-mont&descricao=Linha&tipo=LINHA&posto=MONT-01") == 201, "linha criada");
+    assert(_post("/enderecos", "codigo=LIN-B&tipo=LINHA&posto=MONT-01") == 409, "segunda linha no posto");
+    assert(_post("/enderecos", "codigo=LIN-C&tipo=LINHA&posto=NAO-EXISTE") == 422, "posto inexistente");
+    assert(_post("/enderecos", "codigo=GERAL&tipo=ALMOXARIFADO") == 409, "GERAL fixo");
+    assert(_post("/enderecos", "codigo=EXP&tipo=EXPEDICAO") == 201, "expedição");
+    assert(_post("/entrada", "produto=PARAF&quantidade=1000&origem=NF1") == 201, "entrada no GERAL");
+    assert(_post("/entrada", "produto=PARAF&quantidade=10&endereco=NADA") == 422, "endereço inexistente");
+    assert(_post("/transferir", "produto=PARAF&de=GERAL&para=LIN-MONT&quantidade=300") == 201, "transferiu");
+    assert(_post("/transferir", "produto=PARAF&de=LIN-MONT&para=EXP&quantidade=301") == 409, "sem saldo na origem");
+    assert(_post("/transferir", "produto=PARAF&de=GERAL&para=GERAL&quantidade=1") == 422, "mesmo endereço");
+    assert(estoque::saldo("PARAF") == 1000.0, "total não muda");
+    assert(estoque::saldo_em("GERAL", "PARAF") == 700.0 && estoque::saldo_em("LIN-MONT", "PARAF") == 300.0, "por endereço");
+    assert(_get("/posicoes", "endereco=lin-mont") == "[{\"endereco\":\"LIN-MONT\",\"produto\":\"PARAF\",\"quantidade\":300}]",
+        "posições do endereço");
+    assert(_post("/ajuste", "produto=PARAF&saldo=250&motivo=inventario&endereco=LIN-MONT") == 200, "ajuste");
+    assert(estoque::saldo_em("LIN-MONT", "PARAF") == 250.0 && estoque::saldo("PARAF") == 950.0, "ajuste no endereço");
+    string movs = _get("/movimentos", "");
+    assert(contains(movs, "\"tipo\":\"TRANSFERENCIA\"") && contains(movs, "\"endereco\":\"LIN-MONT\""), "movimentos com endereço");
+    // Reinício: as posições voltam do disco.
+    _iniciar(estoque::descritor().iniciar, dir);
+    assert(estoque::saldo_em("LIN-MONT", "PARAF") == 250.0 && estoque::saldo("PARAF") == 950.0, "persistiu");
+    assert(contains(_get("/enderecos", ""), "\"codigo\":\"LIN-MONT\""), "endereço persistiu");
+}
+
+test fn backflush_sai_da_linha_do_posto() ={
+    string dir = _preparar("backflush");
+    _iniciar(estoque::descritor().iniciar, dir);
+    _post("/enderecos", "codigo=LIN-MONT&tipo=LINHA&posto=MONT-01");
+    _post("/entrada", "produto=PARAF&quantidade=100");
+    _post("/entrada", "produto=BASE&quantidade=50");
+    _post("/transferir", "produto=PARAF&de=GERAL&para=LIN-MONT&quantidade=30");
+    // 20 SUP no MONT-01 (18 boas + 2 refugo): 40 PARAF, 20 BASE.
+    _entregar("producao.apontada", "op=7&produto=SUP&boa=18&refugo=2&posto=MONT-01&operador=ana");
+    assert(estoque::saldo_em("GERAL", "SUP") == 18.0, "produto bom no GERAL");
+    assert(estoque::saldo_em("LIN-MONT", "PARAF") == 0.0, "linha esvaziada primeiro");
+    assert(estoque::saldo_em("GERAL", "PARAF") == 60.0, "resto (10) do GERAL");
+    assert(estoque::saldo("PARAF") == 60.0, "total: 100 - 40");
+    assert(estoque::saldo_em("GERAL", "BASE") == 30.0, "BASE não estava na linha: GERAL");
+    // Posto sem endereço LINHA: tudo do GERAL, como na v0.2.
+    _entregar("producao.apontada", "op=8&produto=SUP&boa=5&refugo=0&posto=OUTRO&operador=ana");
+    assert(estoque::saldo_em("GERAL", "PARAF") == 50.0 && estoque::saldo("SUP") == 23.0, "sem linha");
+    // Negativo continua permitido e avisa.
+    ev::retirar();
+    _entregar("producao.apontada", "op=9&produto=SUP&boa=40&refugo=0&posto=MONT-01&operador=ana");
+    assert(estoque::saldo_em("GERAL", "PARAF") == -30.0, "GERAL negativo");
+    assert(_publicados("estoque.negativo") >= 1, "estoque.negativo publicado");
+}
+
+test fn reposicao_sugere_e_avisa_ao_cruzar() ={
+    string dir = _preparar("reposicao");
+    _iniciar(estoque::descritor().iniciar, dir);
+    _post("/entrada", "produto=PARAF&quantidade=100");
+    _post("/entrada", "produto=BASE&quantidade=100");
+    assert(_post("/reposicao", "produto=PARAF&minimo=80&maximo=60") == 422, "máximo < mínimo");
+    assert(_post("/reposicao", "produto=PARAF&maximo=60") == 422, "sem mínimo");
+    assert(_post("/reposicao", "produto=PARAF&minimo=80&maximo=300") == 201, "regra criada");
+    assert(contains(_get("/reposicao", ""), "\"tipo\":\"COMPRAR\""), "MP sem tipo: COMPRAR");
+    assert(_get("/sugestoes", "") == "[]", "acima do mínimo, nada");
+    ev::retirar();
+    // 15 SUP: 30 PARAF -> 70 < 80.
+    _entregar("producao.apontada", "op=1&produto=SUP&boa=15&refugo=0&posto=MONT-01&operador=ana");
+    assert(_publicados("estoque.abaixo_minimo") == 1, "um aviso ao cruzar");
+    assert(_get("/sugestoes", "") == "[{\"produto\":\"PARAF\",\"saldo\":70,\"minimo\":80,\"maximo\":300,"
+        + "\"quantidade_sugerida\":230,\"tipo\":\"COMPRAR\",\"endereco\":\"\"}]", "sugestão até o máximo");
+    // Já abaixo: não repete o aviso.
+    _entregar("producao.apontada", "op=2&produto=SUP&boa=1&refugo=0&posto=MONT-01&operador=ana");
+    assert(_publicados("estoque.abaixo_minimo") == 0, "sem aviso repetido");
+    // Transferência não muda o total: não cruza.
+    _post("/entrada", "produto=PARAF&quantidade=100");
+    _post("/enderecos", "codigo=QUAR&tipo=QUARENTENA");
+    ev::retirar();
+    _post("/transferir", "produto=PARAF&de=GERAL&para=QUAR&quantidade=90");
+    assert(_publicados("estoque.abaixo_minimo") == 0, "transferência não cruza o total");
+    // Regra por endereço: vigia só o saldo dele.
+    assert(_post("/reposicao", "produto=PARAF&minimo=50&maximo=100&tipo=COMPRAR&endereco=QUAR") == 201, "regra no endereço");
+    ev::retirar();
+    _post("/transferir", "produto=PARAF&de=QUAR&para=GERAL&quantidade=50");
+    assert(_publicados("estoque.abaixo_minimo") == 1, "cruzou no endereço");
+    assert(contains(_get("/sugestoes", ""), "\"saldo\":40"), "saldo do endereço na sugestão");
+}
+
+test fn pedido_expedido_simulado() ={
+    string dir = _preparar("expedicao");
+    _iniciar(estoque::descritor().iniciar, dir);
+    _post("/enderecos", "codigo=EXP-01&tipo=EXPEDICAO");
+    _post("/entrada", "produto=SUP&quantidade=50");
+    _post("/transferir", "produto=SUP&de=GERAL&para=EXP-01&quantidade=20");
+    _post("/entrada", "produto=BASE&quantidade=10");
+    _entregar("pedido.expedido", "pedido=12&cliente=ACME&itens=" + url_encode("SUP:25;BASE:4"));
+    assert(estoque::saldo_em("EXP-01", "SUP") == 0.0, "expedição esvaziada primeiro");
+    assert(estoque::saldo_em("GERAL", "SUP") == 25.0, "5 do GERAL");
+    assert(estoque::saldo("SUP") == 25.0, "total 50 - 25");
+    assert(estoque::saldo_em("GERAL", "BASE") == 6.0, "BASE só no GERAL");
+    string movs = _get("/movimentos", "");
+    assert(contains(movs, "\"tipo\":\"EXPEDICAO\"") && contains(movs, "\"origem\":\"pedido 12\""), "movimento EXPEDICAO");
+}
