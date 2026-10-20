@@ -2,6 +2,63 @@
 
 ## Não lançado
 
+### Novo — fase 2: comercial, estoque endereçado e OEE ([docs/FASE2.md](docs/FASE2.md))
+Inspirada no MES4 (`tblCustomer`/`tblOrder`, `tblBuffer`/`tblBufferPos`,
+`tblAutomaticOrder`, `tblMachineReport`). Detalhes, decisões e limites de cada
+frente em [`docs/fase2/`](docs/fase2/).
+
+- **Módulo de Pedidos** (`src/modulos/pedidos/`, `/api/pedidos`, escrita por
+  admin/comercial/pcp): clientes; pedidos com itens `PRODUTO:qtd;...` e
+  `prazo_dias`; `gerar_ops` cria as OPs da **falta** (quantidade − saldo
+  livre, com reserva entre pedidos); PRONTO quando as OPs concluem ou o saldo
+  cobre; `expedir` (409 com a lista de faltas se não houver saldo); cancelar
+  com motivo; `atrasado` calculado. Eventos `pedido.criado`,
+  `pedido.ops_geradas`, `pedido.pronto`, `pedido.expedido`, `pedido.cancelado`.
+- **Produção**: a OP ganha `origem` (`PED-12`, `REPOSICAO`, vazio para manual),
+  `pub fn criar_op(...)` para outros módulos e `&origem=` nos eventos `op.*`.
+  OPs gravadas antes continuam sendo lidas.
+- **Estoque endereçado**: endereços (`GERAL` fixo, ALMOXARIFADO, LINHA por
+  posto, EXPEDICAO, QUARENTENA), saldo por produto × endereço, `GET /posicoes`,
+  `POST /transferir` (exige saldo na origem), entrada/ajuste por endereço e
+  movimentos com `endereco`. O backflush consome primeiro da LINHA do posto; a
+  expedição baixa do endereço EXPEDICAO e depois do `GERAL` (assina
+  `pedido.expedido`). `GET /saldos` sem parâmetro **não mudou**; dados antigos
+  migram na leitura para o `GERAL`.
+- **Reposição mín./máx.**: regras por produto (total ou de um endereço),
+  `GET /sugestoes` (quantidade = máximo − saldo, tipo COMPRAR ou PRODUZIR) e o
+  evento `estoque.abaixo_minimo` só no cruzamento.
+- **Módulo de Indicadores** (`src/modulos/indicadores/`, `/api/indicadores`,
+  só leitura): histórico de estado do posto (PARADO > OPERANDO > OCIOSO) e
+  **OEE** por posto e da linha (`GET /estados`, `/oee`, `/oee/serie`), calculado
+  só a partir dos eventos. `indicadores.oee_baixo` quando o OEE da linha em 8 h
+  cai abaixo de `EMP_OEE_ALERTA` (padrão 0,6), no máximo um por hora.
+- **Eventos mais ricos**: `producao.etapa_*` levam produto, `tempo_min`,
+  entrada, `delta_boas`/`delta_refugo` e início/fim; novo
+  `producao.etapa_apontada` a cada apontamento; `maquina.parada`/`liberada`
+  levam motivo e início/fim reais (inclusive em parada retroativa).
+- **Painel**: abas Pedidos (lista com distribuição e atraso, detalhe com itens e
+  OPs ligadas), Clientes em Cadastros, Estoque com endereços e posições,
+  transferência, reposição com *Criar OP* / *Registrar entrada* e detalhe do
+  produto, aba **OEE** (anel da linha, cartões por posto, linha do tempo de
+  estados e OEE por hora em SVG feito no próprio painel), KPI de OEE na visão
+  geral e contadores no menu. [DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md) 1.2.
+- Cargas de demonstração `tools/demo_estoque.cryo`, `demo_comercial.cryo` e
+  `demo_oee.cryo` (rodar depois de `demo.cryo`, nessa ordem).
+- Testes `test_pedidos` (5), `test_estoque` (10) e `test_oee` (11), ligados no
+  `build.ps1`. Capturas 14 a 21 em `docs/screenshots/`.
+
+### Problemas conhecidos (fase 2)
+- OEE: um posto com peças apontadas e **tempo operando zero** (execuções de
+  milissegundos, ou uma parada retroativa que cobre a execução inteira) mostra
+  desempenho 0 e OEE 0. A regra "0 se não operou" precisa considerar o que foi
+  apontado.
+- Pedidos aceitam quantidade fracionada em produto contado em `UN` (ex.: 12,5);
+  a OP gerada arredonda para cima.
+- `/sugestoes` não desconta OPs já abertas nem compras: depois de *Criar OP* a
+  sugestão continua até a produção entrar.
+- Todos os componentes saem do endereço do posto da **última** etapa no
+  backflush: a estrutura não diz em que etapa cada componente entra.
+
 ### Novo — execução por etapas (fase 1 da análise do MES4, [docs/ANALISE_FACTORYVIEWS.md](docs/ANALISE_FACTORYVIEWS.md))
 - **Módulo de Roteiros** (`src/modulos/roteiros/`, prefixo `/api/roteiros`,
   depende de cadastros, escrita por admin/pcp): **operações** (código,
@@ -99,7 +156,7 @@
   - **Modo escuro** automático (segue o sistema) e `prefers-reduced-motion`.
   - Contraste AA medido nos pares de texto; texto grafite sobre o laranja.
 - Rotas, IDs dos formulários e chamadas à API continuam os mesmos.
-- As capturas em `docs/screenshots/` ainda mostram o visual anterior.
+- As capturas em `docs/screenshots/` foram refeitas no visual Forja (fases 1 e 2).
 
 ## 0.2.0 — 2026-10-16
 

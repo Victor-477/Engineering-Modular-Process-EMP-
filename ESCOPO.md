@@ -28,15 +28,17 @@ Requisitos que orientaram a arquitetura:
 
 ## 2. Escopo funcional
 
-### 2.1 Entregue (v0.2)
+### 2.1 Entregue (v0.2 + fases 1 e 2)
 
 | Módulo | Tipo | Responsabilidade | Eventos publicados | Assina |
 |---|---|---|---|---|
 | **Cadastros** | interno | Produtos (MP/SA/PA), estrutura de produto (BOM), postos de trabalho | `produto.salvo`, `estrutura.alterada` | — |
 | **Roteiros** | interno | Operações (tipo, instrução, parâmetros medidos com limites), roteiro de etapas por produto, capacidades posto × operação | `operacao.salva`, `roteiro.alterado`, `capacidade.salva` | — |
-| **Produção** | interno | Ordens de produção (OP) executadas por **etapa** (cópia do roteiro na liberação), fila por posto, medições, concorrência por `versao`, apontamento boa/refugo, indicadores; recusa trabalhar em posto parado | `op.criada`, `op.liberada`, `op.cancelada`, `op.concluida`, `producao.apontada`, `producao.etapa_iniciada`, `producao.etapa_concluida`, `producao.etapa_falhou` | `maquina.*` |
-| **Estoque** | interno | Saldos, movimentos, entrada manual, ajuste de inventário, **backflush** (baixa automática por estrutura ao apontar), alerta de falta na liberação | `estoque.movimentado`, `estoque.falta`, `estoque.negativo` | `producao.apontada`, `op.liberada` |
+| **Produção** | interno | Ordens de produção (OP) executadas por **etapa** (cópia do roteiro na liberação), fila por posto, medições, concorrência por `versao`, apontamento boa/refugo, `origem` da OP (pedido, reposição), indicadores; recusa trabalhar em posto parado | `op.criada`, `op.liberada`, `op.cancelada`, `op.concluida`, `producao.apontada`, `producao.etapa_iniciada`, `producao.etapa_apontada`, `producao.etapa_concluida`, `producao.etapa_falhou` | `maquina.*` |
+| **Pedidos** | interno | Clientes; pedidos com itens e prazo; OPs da falta com reserva entre pedidos; pronto por OPs concluídas ou saldo; expedição; atraso | `pedido.criado`, `pedido.ops_geradas`, `pedido.pronto`, `pedido.expedido`, `pedido.cancelado` | `op.*`, `producao.apontada`, `estoque.movimentado` |
+| **Estoque** | interno | Saldos por produto × **endereço**, transferências, entrada e ajuste por endereço, **backflush** (primeiro da linha do posto), baixa na expedição, alerta de falta, **reposição mín./máx.** com sugestões | `estoque.movimentado`, `estoque.falta`, `estoque.negativo`, `estoque.abaixo_minimo` | `producao.apontada`, `op.liberada`, `pedido.expedido` |
 | **Manutenção** | interno | Paradas de posto por categoria, registro retroativo, encerramento com solução, disponibilidade na janela de 8 h, MTTR | `maquina.parada`, `maquina.liberada` | — |
+| **Indicadores** | interno, só leitura | Histórico de estado do posto (PARADO > OPERANDO > OCIOSO) e **OEE** por posto e da linha, série por hora, alerta de OEE baixo — só a partir dos eventos | `indicadores.oee_baixo` | `maquina.*`, `producao.etapa_*` |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
 | **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
 
@@ -77,10 +79,9 @@ baixadas do estoque.
 | PCP / MRP (planejamento de necessidades) | interno | cadastros, estoque, produção | Explode estrutura × demanda; precisa de datas de calendário (L-12) |
 | Programação da produção (sequenciamento por posto) | interno | produção, cadastros | Capacidade em horas por posto já existe no cadastro |
 | Manutenção preventiva (planos por horas/ciclos) | interno | manutencao | A corretiva entrou na v0.2; a preventiva precisa de calendário (L-12) |
-| OEE / Coleta de chão de fábrica | plugin | produção | Disponibilidade × desempenho × qualidade; integração com CLP depende de L-19 |
+| Coleta automática de chão de fábrica | plugin | indicadores | O OEE entrou na fase 2 com apontamento manual; ler contadores do CLP depende de L-19 |
 | Rastreabilidade de lotes | interno | estoque, produção | Lote/série no apontamento e no consumo |
-| Compras | plugin | estoque | Ouve `estoque.falta` |
-| Vendas / Pedidos / Expedição | plugin | estoque | Gera demanda para o MRP |
+| Compras | plugin | estoque | Ouve `estoque.falta` e `estoque.abaixo_minimo`; as sugestões COMPRAR da fase 2 viram pedido de compra |
 | Custos de produção | interno | estoque, produção | Exige tipo decimal (L-11) |
 | Relatórios / BI | plugin | todos (leitura) | Exportação CSV; PDF/XLSX dependem de L-20 |
 | Turnos e operadores | interno | — | Calendário (L-12) |
@@ -165,22 +166,25 @@ do plugin (`nucleo/plugins.cryo`).
   entregas por ciclo corta laços infinitos entre módulos.
 - `dados` usa *form-encoding* (`op=3&produto=X`), não JSON — ver L-05.
 
-Catálogo de eventos v1:
+Catálogo de eventos:
 
 | Evento | Origem | Dados |
 |---|---|---|
 | `produto.salvo` | cadastros | `codigo` |
 | `estrutura.alterada` | cadastros | `produto` |
-| `op.criada` / `op.liberada` / `op.cancelada` / `op.concluida` | produção | `op`, `produto`, `quantidade` |
+| `op.criada` / `op.liberada` / `op.cancelada` / `op.concluida` | produção | `op`, `produto`, `quantidade`, `origem` |
 | `producao.apontada` | produção | `op`, `produto`, `boa`, `refugo`, `posto`, `operador` |
-| `producao.etapa_iniciada` / `producao.etapa_concluida` / `producao.etapa_falhou` | produção | `op`, `etapa`, `posto`, `operacao`, `boas`, `refugo`, `operador`, `motivo`, `status` |
+| `producao.etapa_iniciada` / `_apontada` / `_concluida` / `_falhou` | produção | `op`, `produto`, `etapa`, `posto`, `operacao`, `tempo_min`, `entrada`, `boas`, `refugo` (acumulados), `delta_boas`, `delta_refugo` (desta ação), `inicio`, `fim`, `operador`, `motivo`, `status` |
+| `pedido.criado` / `.ops_geradas` / `.pronto` / `.expedido` / `.cancelado` | pedidos | `pedido`, `cliente`, `itens="PRODUTO:qtd;..."` (+ `entrega_prevista`, `ops`, `por`, `motivo`) |
 | `operacao.salva` | roteiros | `codigo` |
 | `roteiro.alterado` | roteiros | `produto`, `etapas` |
 | `capacidade.salva` | roteiros | `posto`, `operacao` |
-| `estoque.movimentado` | estoque | `produto`, `quantidade`, `saldo` |
+| `estoque.movimentado` | estoque | `produto`, `quantidade`, `saldo`, `endereco`, `saldo_endereco` |
 | `estoque.falta` | estoque | `op`, `componente`, `necessario`, `disponivel` |
-| `estoque.negativo` | estoque | `produto`, `saldo` |
-| `maquina.parada` / `maquina.liberada` | manutenção | `parada`, `posto`, `categoria`, `minutos` |
+| `estoque.negativo` | estoque | `produto`, `saldo` (do endereço), `endereco`, `saldo_total` |
+| `estoque.abaixo_minimo` | estoque | `produto`, `saldo`, `minimo`, `maximo`, `sugerido`, `tipo`, `endereco` |
+| `maquina.parada` / `maquina.liberada` | manutenção | `parada`, `posto`, `categoria`, `motivo`, `inicio`, `fim`, `minutos` |
+| `indicadores.oee_baixo` | indicadores | `oee`, `limite`, `horas`, `disponibilidade`, `desempenho`, `qualidade` |
 
 ## 4. Contrato de módulo (ABI) — `src/nucleo/contrato.cryo`
 
@@ -236,8 +240,12 @@ Engineering-Modular-Process-EMP-/
 │       ├── roteiros/roteiros.cryo   operações, roteiros, capacidades
 │       ├── producao/producao.cryo
 │       ├── producao/etapas.cryo     máquina de estados das etapas (funções puras)
-│       ├── estoque/estoque.cryo
-│       └── manutencao/manutencao.cryo
+│       ├── pedidos/pedidos.cryo     clientes, pedidos, OPs da falta, expedição
+│       ├── estoque/estoque.cryo     saldos por endereço, transferência, reposição
+│       ├── estoque/regras.cryo      regras puras do estoque (repartição, mínimo, sugestão)
+│       ├── manutencao/manutencao.cryo
+│       ├── indicadores/indicadores.cryo  eventos → histórico do posto, rotas de OEE
+│       └── indicadores/oee.cryo     cálculo puro do OEE
 ├── plugins/                   manifestos lidos em tempo de execução
 │   └── qualidade.plugin
 ├── plugins_src/
@@ -245,10 +253,21 @@ Engineering-Modular-Process-EMP-/
 ├── tests/
 │   ├── test_nucleo.cryo       harness em programa comum
 │   ├── test_eventos.cryo      `test fn` rodado por `cryoc test`
-│   └── test_etapas.cryo       `test fn`: etapas, versão/409, medições, roteiros
-├── tools/
-│   └── demo.cryo              carga de demonstração (via HTTP, modo dev)
-├── docs/screenshots/          capturas do painel
+│   ├── test_etapas.cryo       `test fn`: etapas, versão/409, medições, roteiros
+│   ├── test_pedidos.cryo      pedidos, reserva, falta, expedição, OP antiga
+│   ├── test_estoque.cryo      endereços, migração, backflush, reposição, expedição
+│   └── test_oee.cryo          janela, sobreposição, limites do OEE
+├── tools/                     cargas de demonstração (via HTTP, modo dev), nesta ordem:
+│   ├── demo.cryo              linha base: produtos, roteiros, OPs, paradas
+│   ├── demo_estoque.cryo      endereços, transferências, reposição
+│   ├── demo_comercial.cryo    clientes e pedidos em todos os estados
+│   └── demo_oee.cryo          atividade e paradas retroativas para o OEE
+├── docs/
+│   ├── ANALISE_FACTORYVIEWS.md  análise do MES4 e fase 1
+│   ├── FASE2.md               contrato da fase 2
+│   ├── fase2/                 decisões, verificação e limites de cada frente
+│   ├── DESIGN_SYSTEM.md       sistema de design Forja
+│   └── screenshots/           capturas do painel e do terminal
 └── build/                     emp.exe, qualidade.exe (gerados)
 ```
 
@@ -263,7 +282,10 @@ C:\EMP\
     ├── cadastros\produtos.json  estrutura.json  postos.json
     ├── roteiros\operacoes.json  roteiros.json  capacidades.json
     ├── producao\ordens.json  etapas.json
-    ├── estoque\saldos.json  movimentos.json
+    ├── pedidos\clientes.json  pedidos.json  ops.json
+    ├── estoque\saldos.json  posicoes.json  enderecos.json  movimentos.json  reposicao.json
+    ├── manutencao\paradas.json
+    ├── indicadores\intervalos.json  apontamentos.json  estado.json
     ├── qualidade\ncs.json
     └── auditoria\<ms>-<seq>.log
 ```
@@ -443,6 +465,22 @@ Executado nesta máquina (Windows 11, MinGW gcc, VM Pyro em C):
 - Disponibilidade conferida à mão: PINTURA-01 com 160 min parados em 480 → 66,7%.
 - Capturas em `docs/screenshots/` feitas desse estado.
 
+**Fase 2 (comercial, estoque endereçado, OEE)**, conferido pela coordenadora
+no branch combinado, além do que cada frente registrou em `docs/fase2/`:
+- `build.ps1` passa e os 50 testes passam (núcleo 7, eventos 2, etapas 15,
+  pedidos 5, estoque 10, OEE 11).
+- As quatro cargas de demonstração rodam juntas num só `emp.exe` sem falha na
+  ordem `demo → demo_estoque → demo_comercial → demo_oee`; na ordem
+  comercial → estoque a carga de estoque falha 2 transferências (a expedição
+  já baixou o saldo — recusa correta, dependência entre os scripts).
+- Pedidos em todos os estados (ABERTO atrasado, EM_PRODUCAO, PRONTO sem OP,
+  EXPEDIDO, CANCELADO); sugestões de reposição COMPRAR e PRODUZIR; OEE da linha
+  0,862 com valores por posto coerentes com a demonstração.
+- A frente C conferiu o OEE da PRENSA-03 à mão a partir dos eventos
+  (D 0,9375 × Desemp 0,8325 × Q 0,8 = 0,6244), igual à API.
+- Problemas conhecidos estão no CHANGELOG (OEE com tempo operando zero,
+  quantidade fracionada em produto UN).
+
 **Não verificado:** carga/concorrência, execução como serviço Windows, backends
-go/node para o ERP completo (não compilam — L-17), navegadores além do
-Chromium/Edge.
+go/node para o ERP completo (L-17), navegadores além do Chromium/Edge, perfis
+reais com `ERP_TOKENS` nas telas da fase 2, celular (375 px) na fase 2.
