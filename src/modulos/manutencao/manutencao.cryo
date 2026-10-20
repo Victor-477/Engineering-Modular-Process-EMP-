@@ -79,10 +79,16 @@ fn _parado_na_janela(string posto, int agora) -> int ={
     return total;
 }
 
+// `inicio`/`fim` em ms (fim=0 enquanto aberta): uma parada retroativa
+// (ha_minutos) começa antes do evento, e quem reconstrói o histórico do
+// posto (indicadores/OEE) precisa do início real, não da hora do evento.
 fn _anunciar(string tipo, Parada p) ={
     ev::publicar(tipo, "manutencao", "parada=" + to_string(p.id)
         + "&posto=" + url_encode(p.posto)
         + "&categoria=" + url_encode(p.categoria)
+        + "&motivo=" + url_encode(p.motivo)
+        + "&inicio=" + to_string(p.inicio)
+        + "&fim=" + to_string(p.fim)
         + "&minutos=" + to_string((max(p.fim, p.inicio) - p.inicio) / 60000));
 }
 
