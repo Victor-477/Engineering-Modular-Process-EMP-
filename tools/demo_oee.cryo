@@ -12,8 +12,9 @@
 //    - OP de 6 SUP-03: iniciar, 60 s, apontar 3 boas + 1 refugo,
 //      30 s, apontar 1 boa, concluir (5 peças, 1,25 min teóricos);
 //    - na PRENSA-01 termina a OP 1 da demo e inicia/aponta a OP 6;
-//    - deixa ABERTA uma parada retroativa de 15 min na MONT-01 (enquanto
-//      aberta o indicador a conta a partir do evento — ver docs/fase2/oee.md).
+//    - deixa ABERTA uma parada retroativa de 15 min na MONT-01: o evento
+//      traz o início real, então ela cobre as execuções da demo (PARADO
+//      prevalece) e o desempenho da MONT-01 vai a 0.
 //
 //    python ../Burnout/cryoc.py tools/demo_oee.cryo --backend pyro --run
 //    EMP_URL=http://127.0.0.1:8080   (padrão)

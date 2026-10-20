@@ -37,50 +37,67 @@ nas últimas 8 h < `EMP_OEE_ALERTA` (padrão 0.6), no máximo um por hora (insta
 e só com ≥ 15 min OPERANDO + PARADO na janela — sem essa base o primeiro evento do dia (etapa
 recém-iniciada, nada apontado) dava OEE 0 e alertava (visto na 1ª rodada).
 
-## Exemplo conferido à mão (PRENSA-03, `demo.cryo` + `demo_oee.cryo`, emp.exe em 127.0.0.1:8193)
+## Exemplo conferido à mão (`demo.cryo` + `demo_oee.cryo`, emp.exe em 127.0.0.1:8193, dados novos)
 
-Eventos de `/api/sistema/eventos`:
+Build de `fase2-oee` com o `main` juntado (cb242c1: `maquina.*` com `motivo`, `inicio`, `fim`).
+Os eventos 1..131 foram lidos de `/api/sistema/eventos` em duas tomadas (o buffer guarda 100) e
+recalculados por um script independente do código Cryo.
+
+**PRENSA-03**
 
 | id | evento | dados relevantes |
 |---|---|---|
-| 107 | maquina.liberada ts 1792500130373 | parada=4, minutos=30 |
-| 110 | etapa_iniciada | inicio=1792500130393, tempo_min=0.25 |
-| 118 | etapa_apontada | delta_boas=3, delta_refugo=1 |
-| 126 | etapa_apontada | delta_boas=1, delta_refugo=0 |
-| 130 | etapa_concluida | fim=1792500220496 |
+| 105 | maquina.parada | parada=4, ha_minutos=30 → inicio=1792519996850, fim=0 |
+| 106 | maquina.liberada | inicio=1792519996850, fim=1792521796860 |
+| 109 | etapa_iniciada | inicio=1792521796882, tempo_min=0.25 |
+| 117 | etapa_apontada | delta_boas=3, delta_refugo=1 |
+| 125 | etapa_apontada | delta_boas=1, delta_refugo=0 |
+| 129 | etapa_concluida | fim=1792521886970 |
 
-- janela 8 h = 480 min; parado = 30 min (1 800 000 ms) → D = 450/480 = **0,9375**
-- operando = 1792500220496 − 1792500130393 = 90 103 ms = 1,50172 min (sem sobreposição com a parada)
-- teórico = 0,25 × 4 + 0,25 × 1 = 1,25 min → Desemp = 1,25 / 1,50172 = **0,8324**
-- Q = 4/5 = **0,8**; OEE = 0,9375 × 0,83238 × 0,8 = **0,6243**
+- janela 8 h = 480 min; parado = 1 800 010 ms = 30,0002 min → D = (480 − 30,0002)/480 = **0,9375**
+- operando = 1792521886970 − 1792521796882 = 90 088 ms = 1,50147 min (a parada termina antes)
+- teórico = 0,25 × (3+1) + 0,25 × 1 = 1,25 min → Desemp = 1,25 / 1,50147 = **0,8325**
+- Q = 4/5 = **0,8**; OEE = 0,9375 × 0,8325 × 0,8 = **0,6244**
 
-`GET /api/indicadores/oee?horas=8` devolveu para PRENSA-03 exatamente
-`disponibilidade 0.9375, desempenho 0.8324, qualidade 0.8, oee 0.6243, min_operando 1.5, min_parado 30`.
-A série por hora deu D = 0,5 na hora com os 30 min parados. Erros conferidos: `horas=abc`/`500` → 422,
+`GET /api/indicadores/oee?horas=8` → PRENSA-03 `disponibilidade 0.9375, desempenho 0.8325,
+qualidade 0.8, oee 0.6244, min_operando 1.5, min_parado 30, min_teorico 1.25` — igual.
+
+**MONT-01** (parada retroativa de 15 min deixada aberta): o evento 131 traz o início real
+(15 min antes), a parada cobre as duas execuções de milissegundos da demo (PARADO prevalece) →
+parado 15,004 min, operando 0, D = **0,9687**, Desemp = **0**, Q = 360/363 = **0,9917**, OEE **0** —
+igual à API.
+
+Também conferido: série por hora com D = 0,5 na hora dos 30 min parados; `horas=abc`/`500` → 422,
 posto inexistente → 404, 500+ pontos → 422, POST → 403 (sem perfil de escrita).
+
+**Reinício e alerta** (mesmos dados, `EMP_OEE_ALERTA=0.95`):
+- depois do reinício PRENSA-03 devolve os mesmos números e `/estados` da MONT-01 mostra a mesma
+  parada (o reanúncio de paradas abertas pela manutenção não duplica o intervalo);
+- abrir/encerrar uma parada na PRENSA-02 e abrir outra na PRENSA-01 (3 eventos) gerou **um**
+  `indicadores.oee_baixo` (`oee=0.859&limite=0.95&…`); um novo reinício seguido de outro evento
+  não gerou o segundo (o instante fica em `dados/indicadores/estado.json`).
+- Na carga normal (limite 0,6) nenhum alerta saiu: o OEE da linha ficou em ~0,86.
 
 ## Limites honestos
 
 - **Reinício**: a produção não reanuncia etapas em execução. Como os intervalos ficam gravados, uma
-  execução já vista sobrevive ao reinício; mas uma etapa iniciada sem o indicador ativo (ou com
-  `dados/indicadores/` apagado) aparece OCIOSA até o próximo evento dela — que traz `inicio` e
-  recupera o intervalo retroativamente.
-- **Parada retroativa**: `maquina.parada` não traz `inicio` (só `minutos=0`). Enquanto aberta, a parada
-  conta a partir do evento (ex.: SOLDA-01 e MONT-01 da demo, abertas com 42 e 15 min retroativos,
-  aparecem paradas só desde o evento). Ao ser liberada, o início é corrigido para `fim − minutos`
-  (precisão de 1 min). O módulo já usa `inicio`/`fim`/`motivo` se a manutenção passar a publicá-los
-  (pedido à coordenadora: uma linha em `_anunciar`).
+  execução já vista sobrevive ao reinício (conferido); mas uma etapa iniciada sem o indicador ativo
+  (ou com `dados/indicadores/` apagado) aparece OCIOSA até o próximo evento dela — que traz `inicio`
+  e recupera o intervalo retroativamente.
+- **Parada retroativa**: com `inicio` no evento (main cb242c1) ela vale desde o início real, aberta
+  ou não. Sem o campo (dados antigos), o módulo cai no fallback: conta do evento enquanto aberta e
+  corrige para `fim − minutos` ao liberar (precisão de 1 min).
 - **Reiniciar etapa EM_EXECUCAO** não publica evento: a execução velha só fecha quando a nova começa.
 - Parada retroativa sobre uma execução: PARADO prevalece, então o tempo operando é engolido mas os
-  apontamentos feitos ali continuam contando (PRENSA-02 da demo: desempenho 0 com peças apontadas).
+  apontamentos feitos ali continuam contando (MONT-01 e PRENSA-02 da demo: desempenho 0 com peças
+  apontadas).
 - Execuções de milissegundos (demo.cryo) dão desempenho limitado a 1.
+- Alerta: avaliado só quando um evento muda os intervalos/apontamentos (não há timer, L-08); uma
+  linha que piora só pela passagem do tempo não alerta até o próximo evento.
 
 ## Sem verificar
 
-- O build final (`build.ps1`) passou **antes** de duas correções: base mínima do alerta e
-  `_dir = dir` (os arquivos iam para `dados/indicadores/indicadores/` porque o registro já passa
-  `dados/<id>`). Depois delas só compilei (`cryoc --backend pyro`) e rodei `test_oee.cryo` (11/11);
-  falta rodar `build.ps1` de novo e repetir a conferência HTTP.
-- Não testei: reinício sobre os mesmos dados, `indicadores.oee_baixo` com a base mínima
-  (`EMP_OEE_ALERTA=0.95`), o limite de um por hora, poda por retenção.
-- `test_oee.cryo` não está no `build.ps1` (a coordenadora liga).
+- Poda por retenção (8 dias) — exige dados antigos.
+- O fallback sem `inicio` em `maquina.*` só foi exercido na rodada anterior ao merge do main.
+- `test_oee.cryo` não está no `build.ps1` (a coordenadora liga); roda com
+  `python ../Burnout/cryoc.py test tests/test_oee.cryo --backend pyro` (11/11).
