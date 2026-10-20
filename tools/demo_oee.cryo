@@ -1,0 +1,140 @@
+// ============================================================
+//  demo_oee.cryo — atividade para o histórico do posto e o OEE
+//
+//  Roda DEPOIS de tools/demo.cryo, no mesmo EMP em MODO DEV
+//  (ERP_TOKENS vazio; http_post não manda cabeçalhos, L-09). Leva
+//  ~2 min: o OEE é medido em tempo real (now_ms), então a carga
+//  ESPERA entre iniciar e apontar para haver minutos OPERANDO.
+//
+//  O que faz:
+//    - posto PRENSA-03 e produto SUP-03 (1 etapa ESTAMPAR, 0,25 min/un);
+//    - parada RETROATIVA de 30 min na PRENSA-03 (ha_minutos=30), encerrada;
+//    - OP de 6 SUP-03: iniciar, 60 s, apontar 3 boas + 1 refugo,
+//      30 s, apontar 1 boa, concluir (5 peças, 1,25 min teóricos);
+//    - na PRENSA-01 termina a OP 1 da demo e inicia/aponta a OP 6;
+//    - deixa ABERTA uma parada retroativa de 15 min na MONT-01 (enquanto
+//      aberta o indicador a conta a partir do evento — ver docs/fase2/oee.md).
+//
+//    python ../Burnout/cryoc.py tools/demo_oee.cryo --backend pyro --run
+//    EMP_URL=http://127.0.0.1:8080   (padrão)
+//
+//  Conferência à mão: docs/fase2/oee.md (§Exemplo).
+// ============================================================
+
+string _url = env("EMP_URL");
+if (len(_url) == 0) { _url = "http://127.0.0.1:8080"; }
+
+int _falhas = 0;
+
+fn post(string caminho, string corpo) -> string ={
+    string r = http_post(_url + caminho, corpo);
+    if (len(r) == 0 || starts_with(r, "{\"erro\"")) {
+        _falhas = _falhas + 1;
+        print("  ! " + caminho + "  " + corpo + "  -> " + r);
+    }
+    return r;
+}
+
+// O id de uma resposta JSON `{"...","id":N,...}`.
+fn id_de(string json) -> string ={
+    int i = find(json, "\"id\":");
+    if (i < 0) { return "0"; }
+    string resto = json[i + 5..];
+    int fim = find(resto, ",");
+    if (fim < 0) { fim = find(resto, "}"); }
+    return resto[0..fim];
+}
+
+// json_decode aqui é seguro: o texto vem do próprio EMP (L-05).
+struct EtapaVista {
+    int numero;
+    int versao;
+    string status;
+}
+
+struct OpVista {
+    EtapaVista[] etapas;
+    int etapa_atual;
+}
+
+fn _vista(string op) -> OpVista ={
+    return json_decode(http_get(_url + "/api/producao/ordem?id=" + op)) as OpVista;
+}
+
+fn versao(string op, string numero) -> string ={
+    for (EtapaVista e in _vista(op).etapas) {
+        if (to_string(e.numero) == numero) { return to_string(e.versao); }
+    }
+    return "0";
+}
+
+fn status_etapa(string op, string numero) -> string ={
+    for (EtapaVista e in _vista(op).etapas) {
+        if (to_string(e.numero) == numero) { return e.status; }
+    }
+    return "";
+}
+
+fn etapa(string op, string numero, string acao, string corpo) ={
+    post("/api/producao/etapa/" + acao + "?op=" + op + "&etapa=" + numero,
+        "versao=" + versao(op, numero) + "&" + corpo);
+}
+
+fn parada(string posto, string categoria, string motivo, string ha_minutos) -> string ={
+    return id_de(post("/api/manutencao/paradas", "posto=" + posto + "&categoria=" + categoria
+        + "&motivo=" + url_encode(motivo) + "&ha_minutos=" + ha_minutos));
+}
+
+fn esperar(int segundos, string porque) ={
+    print("  ... " + to_string(segundos) + " s (" + porque + ")");
+    sleep(segundos * 1000);
+}
+
+print("atividade de OEE em " + _url);
+string saude = http_get(_url + "/api/sistema/saude");
+string modulos = http_get(_url + "/api/sistema/modulos");
+if (!contains(saude, "\"status\":\"ok\"")) {
+    print("EMP não respondeu (ou exige token). Suba o emp.exe em modo dev e tente de novo.");
+} else if (!contains(modulos, "\"id\":\"indicadores\"")) {
+    print("o módulo indicadores não está neste emp.exe");
+} else if (!contains(http_get(_url + "/api/cadastros/postos"), "PRENSA-01")) {
+    print("rode antes tools/demo.cryo (faltam os cadastros da demo)");
+} else {
+    print("- PRENSA-03 e SUP-03");
+    post("/api/cadastros/postos", "codigo=PRENSA-03&descricao=" + url_encode("Prensa de bancada 40 t") + "&capacidade_h=8");
+    post("/api/cadastros/produtos", "codigo=SUP-03&descricao=" + url_encode("Suporte compacto") + "&unidade=UN&tipo=PA");
+    post("/api/cadastros/estrutura", "produto=SUP-03&componente=ACO-CH2&quantidade=0.3");
+    post("/api/roteiros/capacidade", "posto=PRENSA-03&operacao=ESTAMPAR&tempo_min=0.25");
+    post("/api/roteiros/etapa", "produto=SUP-03&numero=10&operacao=ESTAMPAR&posto=PRENSA-03&tempo_min=0.25");
+
+    print("- parada retroativa de 30 min na PRENSA-03 (troca de matriz)");
+    string p1 = parada("PRENSA-03", "SETUP", "Troca de matriz para SUP-03", "30");
+    post("/api/manutencao/encerrar?id=" + p1, "solucao=" + url_encode("Matriz 03 montada"));
+
+    print("- OP de 6 SUP-03 na PRENSA-03");
+    string op = id_de(post("/api/producao/ordens", "produto=SUP-03&quantidade=6&posto=PRENSA-03"));
+    post("/api/producao/liberar?id=" + op, "");
+    etapa(op, "10", "iniciar", "operador=joao");
+
+    print("- PRENSA-01: termina a OP 1 e começa a OP 6");
+    // A OP 1 da demo ficou com 347 de 400 na etapa única; a OP 6 aguarda.
+    post("/api/producao/apontar?id=1", "boa=50&refugo=3&operador=marcos");
+    if (status_etapa("6", "10") == "AGUARDANDO") {
+        etapa("6", "10", "iniciar", "operador=marcos");
+    }
+
+    esperar(60, "PRENSA-03 operando");
+    etapa(op, "10", "apontar", "boas=3&refugo=1&operador=joao&medicoes=espessura%3D2.0");
+    etapa("6", "10", "apontar", "boas=40&refugo=2&operador=marcos&medicoes=espessura%3D2.01");
+
+    esperar(30, "PRENSA-03 operando");
+    etapa(op, "10", "apontar", "boas=1&operador=joao");
+    etapa(op, "10", "concluir", "operador=joao");
+
+    print("- parada retroativa de 15 min na MONT-01, deixada aberta");
+    parada("MONT-01", "FALTA_MATERIAL", "Faltou bucha de nylon na bancada", "15");
+
+    string oee = http_get(_url + "/api/indicadores/oee?horas=8");
+    print("  /api/indicadores/oee -> " + oee[0..min(len(oee), 160)]);
+    print("feito: " + to_string(_falhas) + " falha(s); OP da PRENSA-03 = " + op);
+}
