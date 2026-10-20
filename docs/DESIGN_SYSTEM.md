@@ -1,6 +1,6 @@
 # Forja — sistema de design do EMP
 
-> Versão 1.1 · implementado em [`src/nucleo/painel.cryo`](../src/nucleo/painel.cryo)
+> Versão 1.2 (fase 2: pedidos, estoque endereçado, OEE) · implementado em [`src/nucleo/painel.cryo`](../src/nucleo/painel.cryo)
 > e [`src/nucleo/terminal.cryo`](../src/nucleo/terminal.cryo) (terminal do operador).
 > Os tokens ficam em `painel::tokens_css()` e as duas páginas os usam.
 
@@ -65,7 +65,7 @@ de estado usa sempre a `-ink` sobre a `-soft`.
 | Estado | Token | Significa |
 |---|---|---|
 | Bom | `--ok` `#0f9f6e` · `--ok-ink` `#0b7350` | Operando, concluída, encerrada, módulo ativo |
-| Atenção | `--warn` `#e08a00` | Disponibilidade abaixo de 85% |
+| Atenção | `--warn` `#e08a00` · `--warn-ink` `#8f5800` (escuro `#f2b448`) | Disponibilidade abaixo de 85%, OEE entre 60% e 85% |
 | Crítico | `--bad` `#e5383b` · `--bad-ink` `#b8262a` · `--bad-strong` `#c92a2a` (fundo de botão e contador) | Parado, cancelada, parada aberta, falhou |
 | Aguardando | `--info` `#3d6be0` · `--info-ink` `#2a4fb8` | Liberada, esperando para começar |
 | Neutro | `--neutral-soft` | Planejada, sem estado |
@@ -267,7 +267,67 @@ máquina.
 
 Barra empilhada com 14 px de altura e cantos arredondados, com 3 px de espaço
 entre as fatias. Embaixo, uma legenda com chips de cor e a contagem em mono.
-Uso atual: ordens por estado.
+Uso atual: ordens por estado e pedidos por estado (`distribuicao(legenda, contagem)`).
+
+### Pedido (`/#pedidos`, `/#pedidos/N`)
+
+Estados de pedido usam as mesmas classes de estado:
+
+| Estado | Classe | Ícone |
+|---|---|---|
+| aberto | `wait` (azul) | pausa: esperando as OPs |
+| em produção | `act` | play pulsando |
+| pronto | `ok` | check: pode expedir |
+| expedido | `skip` (neutro) | **caminhão** (`ICONE_DE.EXPEDIDO = "envio"`): saiu da fábrica, fica fora do caminho |
+| cancelado | `bad` | ✕, como a OP cancelada |
+
+| Parte | Descrição |
+|---|---|
+| **Sinal de atraso** (`sinalAtraso(p)`) | Pílula `--bad-soft`/`--bad-ink` com ícone de relógio e "atrasado 5 h" (ou "2 d"), ao lado da etiqueta. A linha ganha faixa `e-bad`, a data de entrega fica em `.atraso`, o menu mostra o total de atrasados no contador e o sino soma os atrasados |
+| Lista | Moldura com cliente (nome + código), itens resumidos ("SUP-02 × 150, SUP-01 × 300 +1"), entrega prevista, **cobertura** (barra de LED: quanto do pedido o saldo livre já cobre) e OPs (`.id` com link). Digitar "atrasado" no filtro, ou clicar no "N atrasado(s)" do cartão de estados, filtra os atrasados |
+| Novo pedido | Cliente, prazo em dias, observação e **linhas de item** (`.item-ped`: produto + quantidade + ✕). "+ Item" acrescenta uma linha; o envio monta `itens="PRODUTO:qtd;..."`. Depois de criar, abre o detalhe |
+| Detalhe | Cabeçalho como o da OP (← TODOS OS PEDIDOS, cliente, etiqueta, atraso, números e cobertura); tabela de itens com saldo livre, **falta** em `--bad-ink` e as OPs do item; tabela das OPs ligadas (estado, etapa, progresso); barra de ações (`.ped-acoes`): posto + Gerar OPs, Expedir (principal só quando PRONTO), motivo + Cancelar pedido. O 409 de expedir mostra as faltas no aviso |
+
+As ações só aparecem para `admin`, `pcp` e `comercial`.
+
+### Endereço e posições (`/#estoque/posicoes`)
+
+Cartões de endereço (`.endereco`) em grade: tipo em mono caixa alta (almoxarifado, linha · posto,
+expedição, quarentena), código em `--f-display`, descrição, número de produtos e quantidade.
+**Não usam cores de estado** (tipo não é estado). Um clique filtra a moldura de posições pelo
+endereço (anel `--forja-soft`, `aria-pressed`); outro clique limpa. Saldo negativo aparece em
+`--bad-ink` no cartão e com faixa `e-bad` na linha.
+
+O estoque ganhou abas internas (`/#estoque`, `/#estoque/posicoes`, `/#estoque/reposicao`) e o
+**detalhe do produto** (`/#estoque/produto/SUP-01`, aberto pelo código em qualquer tabela de
+estoque ou de pedido): saldo total, saldo por endereço em barras (`.por-end`), faixa de reposição
+e os últimos movimentos.
+
+### Faixa de reposição
+
+Barra de 10 px: a banda `--ok-soft` com contorno `--ok` vai do **mínimo ao máximo**; o traço de
+4 px é o **saldo** (grafite; vermelho quando abaixo do mínimo, e então a barra inteira ganha as
+listras diagonais de perigo). Escala até 1,25 × máximo. Tem `role="img"` e `aria-label` com os
+três números.
+
+As **sugestões** ficam numa tabela com faixa `e-bad`: produzir → **Criar OP** (principal; vira
+secundário "Criar outra OP" quando já existe OP aberta do produto, que aparece ao lado com link);
+comprar → **Registrar entrada**, que leva à entrada de material com produto, quantidade e endereço
+preenchidos. A OP criada leva `origem=REPOSICAO`. O contador da aba e do menu mostra quantos
+produtos estão abaixo do mínimo.
+
+### OEE (`/#oee`, `/#oee/24`)
+
+| Parte | Descrição |
+|---|---|
+| Seletor de janela (`.janela`) | Pílulas mono "8 h" / "24 h", ativo em grafite como as abas; cada uma tem endereço |
+| Destaque da linha | O bloco escuro do início, com **anel de OEE** (SVG, 156 px, arco na cor do nível) e a conta escrita: `disponibilidade × desempenho × qualidade = OEE`, cada fator num vidro fosco e o resultado em gradiente forja (texto grafite). Embaixo, a etiqueta de nível e a regra do alerta |
+| Nível | ≥ 85% `ok` (check, "na referência"); 60–85% `warn` (alerta, "abaixo de 85%"); < 60% `bad` ("abaixo de 60%", o limite do `indicadores.oee_baixo`). Sempre ícone + texto |
+| Cartão de posto (`.oee-posto`) | Medidor circular com o OEE, faixa esquerda na cor do nível, nome, estado atual (`tag`), três barras finas **neutras** (`--ink-2`) para D, desempenho e Q, e os minutos operando/parado/ocioso, boas e refugo em mono |
+| Linha do tempo de estados (`.tl`) | Uma faixa SVG de 26 px por posto, da abertura da janela até agora: **operando** `--ok` cheio, **parado** com as listras de perigo (padrão `#p-parado`), **ocioso** `--info` a 40%, sem registro `--surface-2`. Cada trecho tem `<title>` (estado, horário, duração, motivo). Eixo com 5 marcas em mono e legenda em chips |
+| OEE por hora | Colunas SVG desenhadas no painel (sem biblioteca), uma série só, em `--forja`, com ponta arredondada de 4 px apoiada na base e 22% de espaço entre colunas; grade recessiva a cada 25%; **meta 85%** tracejada em `--ok`. Passar o mouse (ou tocar) mostra a dica grafite com o horário e os três fatores. "ver em tabela" abre os mesmos números numa tabela. Seletor: linha inteira ou um posto |
+
+O OEE da linha também vira um KPI na visão geral quando o módulo `indicadores` está ativo.
 
 ### Linha do tempo (eventos)
 
@@ -342,6 +402,7 @@ Comportamento:
   | `--ok-ink` sobre `--ok-soft` | 5,1 | 7,7 |
   | `--info-ink` sobre `--info-soft` | 6,1 | 6,8 |
   | `--bad-ink` sobre `--bad-soft` | 5,2 | 6,4 |
+  | `--warn-ink` sobre `--warn-soft` | 5,2 | 8,0 |
   | branco sobre `--bad-strong` | 5,5 | = |
   | rótulos do console (`#8a909b`) sobre `--console` | 5,5 | — |
 
@@ -376,7 +437,7 @@ Comportamento:
 
 1. Uma tela nova é uma `<section class="secao grid" id="s-NOME">` com cartões.
    Registre o título em `TITULOS`, a função em `telas` e o item em `nav`.
-   Para um módulo que pode estar desligado, use `data-mod="id-do-modulo"`.
+   Para um módulo que pode estar desligado, use `data-mod="id-do-modulo"` (fase 2: `pedidos` esconde Pedidos e Clientes; `indicadores` esconde OEE e o KPI).
 2. Um estado novo entra em `ESTADO` (para `plan`, `wait`, `act`, `ok`, `bad`
    ou `skip`) e, se precisar de texto especial, em `ROT`. O terminal tem a
    sua própria cópia de `ESTADO` e `ROT`: mantenha as duas iguais.
