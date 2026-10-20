@@ -15,6 +15,7 @@ import "roteiros/roteiros.cryo"        as roteiros;
 import "producao/producao.cryo"        as producao;
 import "estoque/estoque.cryo"          as estoque;
 import "manutencao/manutencao.cryo"    as manutencao;
+import "pedidos/pedidos.cryo"          as pedidos;
 
 pub fn todos() -> k::Modulo[] ={
     return [
@@ -22,6 +23,7 @@ pub fn todos() -> k::Modulo[] ={
         roteiros::descritor(),
         producao::descritor(),
         estoque::descritor(),
-        manutencao::descritor()
+        manutencao::descritor(),
+        pedidos::descritor()
     ];
 }
