@@ -1,0 +1,557 @@
+// ============================================================
+//  pedidos.cryo — Módulo Comercial: clientes e pedidos de venda
+//
+//  Inspirado no MES4 (tblCustomer/tblOrder). Um pedido tem itens
+//  "PRODUTO:qtd;..." e uma entrega prevista; dele saem as OPs da
+//  FALTA de cada item (quantidade − saldo livre).
+//
+//    ABERTO --gerar_ops--> EM_PRODUCAO --(OPs concluídas ou saldo cobre)--> PRONTO
+//      |                       |                                           |
+//      +--------cancelar-------+----------------cancelar-------------------+--expedir--> EXPEDIDO
+//
+//  Saldo livre de um produto para o pedido P = saldo do estoque menos
+//  o que os OUTROS pedidos já reservaram dele:
+//    - PRONTO reserva a quantidade inteira do item;
+//    - EM_PRODUCAO reserva a parte que não vem das suas OPs
+//      (quantidade − o que as OPs abertas ainda vão produzir);
+//    - ABERTO, EXPEDIDO e CANCELADO não reservam.
+//  Assim dois pedidos não contam com a mesma peça da prateleira.
+//
+//  Rotas (prefixo /api/pedidos):
+//    GET  /clientes                   lista
+//    POST /clientes                   codigo=&nome=&documento=&contato=&email=&telefone=&endereco=
+//    GET  /pedidos[?status=X]         lista, mais novos primeiro
+//    GET  /pedido?id=N                um pedido, com saldo e OPs por item
+//    POST /pedidos                    cliente=&itens=PROD:qtd;...&prazo_dias=&observacao=
+//    POST /gerar_ops?id=N             posto= (opcional)
+//    POST /expedir?id=N               409 se faltar saldo de algum item
+//    POST /cancelar?id=N              motivo=  (não cancela as OPs)
+//
+//  Eventos publicados:
+//    pedido.criado, pedido.ops_geradas, pedido.pronto, pedido.expedido,
+//    pedido.cancelado — todos com pedido, cliente, itens="PROD:qtd;..."
+//    (ops_geradas leva ops="3,4"; cancelado leva motivo).
+//
+//  Eventos assinados:
+//    op.*               — op.concluida/op.cancelada das OPs do pedido
+//    producao.apontada  — o quanto cada OP do pedido já produziu
+//    estoque.movimentado — um pedido EM_PRODUCAO fica PRONTO quando o
+//                          saldo passa a cobrir todos os itens
+// ============================================================
+
+import "../../nucleo/contrato.cryo" as k;
+import "../../nucleo/persist.cryo"  as db;
+import "../../nucleo/eventos.cryo"  as ev;
+import "../../nucleo/form.cryo"     as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+import "../producao/producao.cryo"   as producao;
+import "../estoque/estoque.cryo"     as estoque;
+
+pub struct Cliente {
+    string codigo;
+    string nome;
+    string documento;
+    string contato;
+    string email;
+    string telefone;
+    string endereco;
+}
+
+pub struct ItemPedido {
+    string produto;
+    number quantidade;
+    int[] ops;
+}
+
+pub struct Pedido {
+    int id;
+    string cliente;
+    ItemPedido[] itens;
+    string status;
+    int criado_em;
+    int entrega_prevista;
+    int expedido_em;
+    string observacao;
+    string motivo;          // do cancelamento
+    int atualizado_em;
+}
+
+// Uma OP gerada por um pedido, acompanhada pelos eventos da produção.
+pub struct OpPedido {
+    int op;
+    int pedido;
+    string produto;
+    number quantidade;
+    number produzido;
+    string status;          // ABERTA, CONCLUIDA, CANCELADA
+}
+
+pub struct LeituraItens {
+    ItemPedido[] itens;
+    string erro;
+}
+
+// O pedido como a API o devolve: saldo livre e OPs por item, atraso.
+struct ItemVista {
+    string produto;
+    number quantidade;
+    number saldo;
+    int[] ops;
+}
+
+struct PedidoVista {
+    int id;
+    string cliente;
+    string nome_cliente;
+    ItemVista[] itens;
+    string status;
+    int criado_em;
+    int entrega_prevista;
+    bool atrasado;
+    int[] ops;
+    int expedido_em;
+    string observacao;
+    string motivo;
+    int atualizado_em;
+}
+
+// ── regras puras (testadas em tests/test_pedidos.cryo) ────
+
+fn _nenhum_item() -> ItemPedido[] ={
+    ItemPedido[] v = [];
+    return v;
+}
+
+fn _leitura_erro(string erro) -> LeituraItens ={
+    return LeituraItens { itens: _nenhum_item(), erro: erro };
+}
+
+// "SUP-02:100; SUP-01:2,5" -> itens. Produto em maiúsculas; o mesmo
+// produto repetido soma as quantidades. Não confere o cadastro.
+pub fn ler_itens(string texto) -> LeituraItens ={
+    ItemPedido[] itens = _nenhum_item();
+    for (string parte in split(texto, ";")) {
+        string t = trim(parte);
+        if (len(t) == 0) { continue; }
+        int dp = find(t, ":");
+        if (dp <= 0) { return _leitura_erro("item '" + t + "' deve ser PRODUTO:quantidade"); }
+        string produto = upper(trim(t[0..dp]));
+        string qtxt = replace(trim(t[dp + 1..]), ",", ".");
+        // Número de fora: eh_numero + parse_number, nunca to_number (aborta).
+        if (!form::eh_numero(qtxt)) { return _leitura_erro("quantidade de " + produto + " não é um número"); }
+        number q = parse_number(qtxt) ?? 0.0;
+        if (q <= 0.0) { return _leitura_erro("quantidade de " + produto + " deve ser positiva"); }
+        ItemPedido[] novos = _nenhum_item();
+        bool somou = false;
+        for (ItemPedido it in itens) {
+            if (it.produto == produto) {
+                novos = concat(novos, [ItemPedido { produto: produto, quantidade: it.quantidade + q, ops: it.ops }]);
+                somou = true;
+            } else {
+                novos = concat(novos, [it]);
+            }
+        }
+        if (!somou) {
+            int[] sem_ops = [];
+            novos = concat(novos, [ItemPedido { produto: produto, quantidade: q, ops: sem_ops }]);
+        }
+        itens = novos;
+    }
+    if (len(itens) == 0) { return _leitura_erro("informe ao menos um item (PRODUTO:quantidade)"); }
+    return LeituraItens { itens: itens, erro: "" };
+}
+
+pub fn itens_texto(ItemPedido[] itens) -> string ={
+    string[] partes = [];
+    for (ItemPedido it in itens) {
+        partes = concat(partes, [it.produto + ":" + to_string(it.quantidade)]);
+    }
+    return join(partes, ";");
+}
+
+// O que uma OP do pedido ainda vai produzir (0 se concluída/cancelada).
+pub fn pendente_op(OpPedido o) -> number ={
+    if (o.status != "ABERTA") { return 0.0; }
+    if (o.produzido >= o.quantidade) { return 0.0; }
+    return o.quantidade - o.produzido;
+}
+
+// Quanto do saldo em prateleira um item de pedido segura, dado o status
+// do pedido e o que as OPs dele ainda vão produzir (`pendente`).
+pub fn reserva(string status, number quantidade, number pendente) -> number ={
+    if (status == "PRONTO") { return quantidade; }
+    if (status == "EM_PRODUCAO" && quantidade > pendente) { return quantidade - pendente; }
+    return 0.0;
+}
+
+// Quanto falta produzir de um item com `livre` em estoque.
+pub fn falta(number quantidade, number livre) -> number ={
+    if (livre <= 0.0) { return quantidade; }
+    if (livre >= quantidade) { return 0.0; }
+    return quantidade - livre;
+}
+
+pub fn entrega(int agora, number prazo_dias) -> int ={
+    return agora + to_int(prazo_dias * 86400000.0);
+}
+
+pub fn atrasado(string status, int entrega_prevista, int agora) -> bool ={
+    return status != "EXPEDIDO" && status != "CANCELADO" && agora > entrega_prevista;
+}
+
+// Structs não têm atribuição de campo (L-07): toda mudança reconstrói.
+pub fn com(Pedido p, ItemPedido[] itens, string status, int expedido_em, string motivo, int agora) -> Pedido ={
+    return Pedido {
+        id: p.id, cliente: p.cliente, itens: itens, status: status,
+        criado_em: p.criado_em, entrega_prevista: p.entrega_prevista,
+        expedido_em: expedido_em, observacao: p.observacao, motivo: motivo,
+        atualizado_em: agora
+    };
+}
+
+pub fn origem(int pedido) -> string ={
+    return "PED-" + to_string(pedido);
+}
+
+// ── estado ────────────────────────────────────────────────
+
+string _dir = "";
+map<string,string> _clientes = {};  // codigo -> json(Cliente)
+map<string,string> _pedidos = {};   // id -> json(Pedido)
+map<string,string> _ops = {};       // id da OP -> json(OpPedido)
+int _proximo = 1;
+
+fn _ler(int id) -> Pedido ={
+    return json_decode(_pedidos[to_string(id)]) as Pedido;
+}
+
+fn _gravar(Pedido p) -> bool ={
+    _pedidos[to_string(p.id)] = json_encode(p);
+    return db::salvar(_dir, "pedidos", _pedidos);
+}
+
+fn _ler_op(int op) -> OpPedido ={
+    return json_decode(_ops[to_string(op)]) as OpPedido;
+}
+
+fn _gravar_op(OpPedido o) -> bool ={
+    _ops[to_string(o.op)] = json_encode(o);
+    return db::salvar(_dir, "ops", _ops);
+}
+
+fn _nome_cliente(string codigo) -> string ={
+    if (!has(_clientes, codigo)) { return ""; }
+    Cliente c = json_decode(_clientes[codigo]) as Cliente;
+    return c.nome;
+}
+
+fn _pendente(ItemPedido it) -> number ={
+    number total = 0.0;
+    for (int op in it.ops) {
+        if (has(_ops, to_string(op))) { total = total + pendente_op(_ler_op(op)); }
+    }
+    return total;
+}
+
+// O que os pedidos diferentes de `exceto` reservam de `produto`.
+fn _reservado(string produto, int exceto) -> number ={
+    number total = 0.0;
+    for (int n in 1.._proximo) {
+        if (n == exceto || !has(_pedidos, to_string(n))) { continue; }
+        Pedido p = _ler(n);
+        if (p.status != "PRONTO" && p.status != "EM_PRODUCAO") { continue; }
+        for (ItemPedido it in p.itens) {
+            if (it.produto == produto) { total = total + reserva(p.status, it.quantidade, _pendente(it)); }
+        }
+    }
+    return total;
+}
+
+fn _livre(string produto, int pedido) -> number ={
+    return estoque::saldo(produto) - _reservado(produto, pedido);
+}
+
+fn _todas_ops(Pedido p) -> int[] ={
+    int[] ops = [];
+    for (ItemPedido it in p.itens) { ops = concat(ops, it.ops); }
+    return ops;
+}
+
+fn _vista(Pedido p) -> string ={
+    ItemVista[] itens = [];
+    for (ItemPedido it in p.itens) {
+        number livre = _livre(it.produto, p.id);
+        if (livre < 0.0) { livre = 0.0; }
+        itens = concat(itens, [ItemVista { produto: it.produto, quantidade: it.quantidade,
+                                           saldo: livre, ops: it.ops }]);
+    }
+    return json_encode(PedidoVista {
+        id: p.id, cliente: p.cliente, nome_cliente: _nome_cliente(p.cliente), itens: itens,
+        status: p.status, criado_em: p.criado_em, entrega_prevista: p.entrega_prevista,
+        atrasado: atrasado(p.status, p.entrega_prevista, now_ms()), ops: _todas_ops(p),
+        expedido_em: p.expedido_em, observacao: p.observacao, motivo: p.motivo,
+        atualizado_em: p.atualizado_em
+    });
+}
+
+fn _evento(string tipo, Pedido p, string extra) ={
+    ev::publicar(tipo, "pedidos", "pedido=" + to_string(p.id)
+        + "&cliente=" + url_encode(p.cliente)
+        + "&itens=" + url_encode(itens_texto(p.itens)) + extra);
+}
+
+// EM_PRODUCAO -> PRONTO quando todas as OPs do pedido concluíram ou o
+// saldo livre já cobre todos os itens.
+fn _pronto(Pedido p) -> string ={
+    int[] ops = _todas_ops(p);
+    bool concluidas = len(ops) > 0;
+    for (int op in ops) {
+        if (!has(_ops, to_string(op)) || _ler_op(op).status != "CONCLUIDA") { concluidas = false; }
+    }
+    if (concluidas) { return "ops"; }
+    for (ItemPedido it in p.itens) {
+        if (_livre(it.produto, p.id) < it.quantidade) { return ""; }
+    }
+    return "saldo";
+}
+
+// EM_PRODUCAO -> PRONTO quando todas as OPs do pedido concluíram ou o
+// saldo livre já cobre todos os itens.
+fn _avaliar(int id) -> bool ={
+    if (!has(_pedidos, to_string(id))) { return false; }
+    Pedido p = _ler(id);
+    if (p.status != "EM_PRODUCAO") { return false; }
+    string porque = _pronto(p);
+    if (len(porque) == 0) { return false; }
+    Pedido pronto = com(p, p.itens, "PRONTO", p.expedido_em, p.motivo, now_ms());
+    _gravar(pronto);
+    _evento("pedido.pronto", pronto, "&por=" + porque);
+    return true;
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _clientes = db::carregar(dir, "clientes");
+    _pedidos = db::carregar(dir, "pedidos");
+    _ops = db::carregar(dir, "ops");
+    _proximo = db::maior_id(_pedidos) + 1;
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    map<string,string> d = form::ler(e.dados);
+    if (e.tipo == "estoque.movimentado") {
+        string produto = form::campo(d, "produto");
+        for (int n in 1.._proximo) {
+            if (!has(_pedidos, to_string(n))) { continue; }
+            Pedido p = _ler(n);
+            if (p.status != "EM_PRODUCAO") { continue; }
+            for (ItemPedido it in p.itens) {
+                if (it.produto == produto) { _avaliar(n); break; }
+            }
+        }
+        return true;
+    }
+    string op = form::campo(d, "op");
+    if (!has(_ops, op)) { return true; }    // OP que não veio de pedido
+    OpPedido o = _ler_op(parse_int(op) ?? 0);
+    string status = o.status;
+    number produzido = o.produzido;
+    if (e.tipo == "producao.apontada") { produzido = produzido + form::numero(d, "boa", 0.0); }
+    if (e.tipo == "op.concluida") { status = "CONCLUIDA"; }
+    if (e.tipo == "op.cancelada") { status = "CANCELADA"; }
+    _gravar_op(OpPedido { op: o.op, pedido: o.pedido, produto: o.produto, quantidade: o.quantidade,
+                          produzido: produzido, status: status });
+    if (e.tipo == "op.concluida") { _avaliar(o.pedido); }
+    return true;
+}
+
+// ── handlers ──────────────────────────────────────────────
+
+fn _lista_clientes() -> string ={
+    string[] itens = [];
+    for (string c in sort(keys(_clientes))) { itens = concat(itens, [_clientes[c]]); }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _salvar_cliente(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string codigo = upper(form::campo(f, "codigo"));
+    string nome = form::campo(f, "nome");
+    if (len(codigo) == 0 || len(nome) == 0) { return k::erro(400, "codigo e nome são obrigatórios"); }
+    Cliente c = Cliente {
+        codigo: codigo, nome: nome,
+        documento: form::campo(f, "documento"), contato: form::campo(f, "contato"),
+        email: form::campo(f, "email"), telefone: form::campo(f, "telefone"),
+        endereco: form::campo(f, "endereco")
+    };
+    _clientes[codigo] = json_encode(c);
+    if (!db::salvar(_dir, "clientes", _clientes)) { return k::erro(500, "falha ao gravar clientes"); }
+    return k::criado(_clientes[codigo]);
+}
+
+fn _listar(string status) -> string ={
+    string[] itens = [];
+    int n = _proximo - 1;
+    while (n >= 1) {
+        if (has(_pedidos, to_string(n))) {
+            Pedido p = _ler(n);
+            if (len(status) == 0 || p.status == status) { itens = concat(itens, [_vista(p)]); }
+        }
+        n = n - 1;
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _criar(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string cliente = upper(form::campo(f, "cliente"));
+    if (!has(_clientes, cliente)) { return k::erro(422, "cliente " + cliente + " não cadastrado"); }
+    LeituraItens li = ler_itens(form::campo(f, "itens"));
+    if (len(li.erro) > 0) { return k::erro(422, li.erro); }
+    for (ItemPedido it in li.itens) {
+        if (!cadastros::existe(it.produto)) { return k::erro(422, "produto " + it.produto + " não cadastrado"); }
+        if (cadastros::produto(it.produto).tipo == "MP") {
+            return k::erro(422, it.produto + " é matéria-prima: pedido é de produto produzido (SA/PA)");
+        }
+    }
+    string prazo_txt = replace(form::campo(f, "prazo_dias"), ",", ".");
+    number prazo = 7.0;
+    if (len(prazo_txt) > 0) {
+        if (!form::eh_numero(prazo_txt)) { return k::erro(422, "prazo_dias deve ser um número"); }
+        prazo = parse_number(prazo_txt) ?? -1.0;
+        if (prazo < 0.0) { return k::erro(422, "prazo_dias não pode ser negativo"); }
+    }
+    int agora = now_ms();
+    Pedido p = Pedido {
+        id: _proximo, cliente: cliente, itens: li.itens, status: "ABERTO",
+        criado_em: agora, entrega_prevista: entrega(agora, prazo), expedido_em: 0,
+        observacao: form::campo(f, "observacao"), motivo: "", atualizado_em: agora
+    };
+    _proximo = _proximo + 1;
+    if (!_gravar(p)) { return k::erro(500, "falha ao gravar o pedido"); }
+    _evento("pedido.criado", p, "&entrega_prevista=" + to_string(p.entrega_prevista));
+    return k::criado(_vista(p));
+}
+
+fn _pedido_de(k::Requisicao r) -> int ={
+    // parse_int, nunca to_int: to_int("abc") aborta o processo inteiro.
+    int id = parse_int(k::param(r, "id")) ?? 0;
+    if (!has(_pedidos, to_string(id))) { return 0; }
+    return id;
+}
+
+fn _gerar_ops(k::Requisicao r) -> k::Resposta ={
+    int id = _pedido_de(r);
+    if (id == 0) { return k::erro(404, "pedido inexistente"); }
+    Pedido p = _ler(id);
+    if (p.status != "ABERTO") {
+        return k::erro(409, "pedido " + to_string(id) + " está " + p.status + ": OPs só se geram de pedido ABERTO");
+    }
+    map<string,string> f = form::ler(r.corpo);
+    string posto = upper(form::campo(f, "posto"));
+    if (len(posto) == 0) { posto = upper(k::param(r, "posto")); }
+    if (len(posto) > 0 && !cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
+    ItemPedido[] itens = _nenhum_item();
+    string[] criadas = [];
+    bool falhou = false;
+    for (ItemPedido it in p.itens) {
+        number q = falta(it.quantidade, _livre(it.produto, id));
+        int[] ops = it.ops;
+        if (q > 0.0 && !falhou) {
+            int op = producao::criar_op(it.produto, q, posto, origem(id));
+            if (op == 0) {
+                falhou = true;
+            } else {
+                _gravar_op(OpPedido { op: op, pedido: id, produto: it.produto, quantidade: q,
+                                      produzido: 0.0, status: "ABERTA" });
+                ops = concat(ops, [op]);
+                criadas = concat(criadas, [to_string(op)]);
+            }
+        }
+        itens = concat(itens, [ItemPedido { produto: it.produto, quantidade: it.quantidade, ops: ops }]);
+    }
+    if (falhou) {
+        // As OPs já criadas ficam ligadas ao pedido, que continua ABERTO.
+        _gravar(com(p, itens, p.status, p.expedido_em, p.motivo, now_ms()));
+        return k::erro(500, "falha ao criar OP (criadas: " + join(criadas, ",") + ")");
+    }
+    Pedido novo = com(p, itens, "EM_PRODUCAO", p.expedido_em, p.motivo, now_ms());
+    if (!_gravar(novo)) { return k::erro(500, "falha ao gravar o pedido"); }
+    _evento("pedido.ops_geradas", novo, "&ops=" + join(criadas, ","));
+    _avaliar(id);       // nenhuma OP (saldo já cobre) -> PRONTO
+    return k::ok(_vista(_ler(id)));
+}
+
+fn _expedir(k::Requisicao r) -> k::Resposta ={
+    int id = _pedido_de(r);
+    if (id == 0) { return k::erro(404, "pedido inexistente"); }
+    Pedido p = _ler(id);
+    if (p.status == "EXPEDIDO" || p.status == "CANCELADO") {
+        return k::erro(409, "pedido " + to_string(id) + " está " + p.status);
+    }
+    string[] faltas = [];
+    for (ItemPedido it in p.itens) {
+        number livre = _livre(it.produto, id);
+        if (livre < it.quantidade) {
+            faltas = concat(faltas, ["{\"produto\":" + json_encode(it.produto)
+                + ",\"quantidade\":" + to_string(it.quantidade)
+                + ",\"saldo\":" + to_string(livre) + "}"]);
+        }
+    }
+    if (len(faltas) > 0) {
+        return k::json(409, "{\"erro\":" + json_encode("saldo insuficiente para expedir o pedido " + to_string(id))
+            + ",\"faltas\":[" + join(faltas, ",") + "]}");
+    }
+    int agora = now_ms();
+    Pedido novo = com(p, p.itens, "EXPEDIDO", agora, p.motivo, agora);
+    if (!_gravar(novo)) { return k::erro(500, "falha ao gravar o pedido"); }
+    _evento("pedido.expedido", novo, "");
+    return k::ok(_vista(novo));
+}
+
+fn _cancelar(k::Requisicao r) -> k::Resposta ={
+    int id = _pedido_de(r);
+    if (id == 0) { return k::erro(404, "pedido inexistente"); }
+    Pedido p = _ler(id);
+    if (p.status == "EXPEDIDO" || p.status == "CANCELADO") {
+        return k::erro(409, "pedido " + to_string(id) + " está " + p.status + ", não pode ser cancelado");
+    }
+    string motivo = form::campo(form::ler(r.corpo), "motivo");
+    Pedido novo = com(p, p.itens, "CANCELADO", p.expedido_em, motivo, now_ms());
+    if (!_gravar(novo)) { return k::erro(500, "falha ao gravar o pedido"); }
+    _evento("pedido.cancelado", novo, "&motivo=" + url_encode(motivo));
+    return k::ok(_vista(novo));
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/clientes" && r.metodo == "GET")  { return k::ok(_lista_clientes()); }
+    if (r.rota == "/clientes" && r.metodo == "POST") { return _salvar_cliente(r); }
+    if (r.rota == "/pedidos" && r.metodo == "GET")   { return k::ok(_listar(upper(k::param(r, "status")))); }
+    if (r.rota == "/pedido" && r.metodo == "GET") {
+        int id = _pedido_de(r);
+        if (id == 0) { return k::erro(404, "pedido inexistente"); }
+        return k::ok(_vista(_ler(id)));
+    }
+    if (r.rota == "/pedidos" && r.metodo == "POST")   { return _criar(r); }
+    if (r.rota == "/gerar_ops" && r.metodo == "POST") { return _gerar_ops(r); }
+    if (r.rota == "/expedir" && r.metodo == "POST")   { return _expedir(r); }
+    if (r.rota == "/cancelar" && r.metodo == "POST")  { return _cancelar(r); }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "pedidos",
+        nome: "Comercial (clientes e pedidos)",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/pedidos",
+        depende: ["cadastros", "producao", "estoque"],
+        assina: ["op.*", "producao.apontada", "estoque.movimentado"],
+        perfis_escrita: ["admin", "comercial", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

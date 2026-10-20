@@ -24,7 +24,7 @@
 //  Rotas (prefixo /api/producao):
 //    GET  /ordens[?status=X]          lista (cada OP com etapas e etapa_atual)
 //    GET  /ordem?id=N                 uma OP, com etapas e etapa_atual
-//    POST /ordens                     produto=&quantidade=&posto=
+//    POST /ordens                     produto=&quantidade=&posto=&origem=
 //    POST /liberar?id=N               copia o roteiro para a OP
 //    POST /apontar?id=N               boa=&refugo=&operador=  (na etapa atual;
 //                                     inicia a etapa se estiver aguardando)
@@ -43,12 +43,17 @@
 //  pessoa","etapa":{...}} — a etapa atualizada vai junto.
 //
 //  Eventos publicados:
-//    op.criada, op.liberada, op.cancelada, op.concluida,
+//    op.criada, op.liberada, op.cancelada, op.concluida
+//      (op, produto, quantidade, origem — "PED-12" se veio de um pedido,
+//       vazio para OP manual),
 //    producao.apontada (op, produto, boa, refugo, posto, operador),
 //    producao.etapa_iniciada, producao.etapa_apontada, producao.etapa_concluida,
 //    producao.etapa_falhou
 //      (op, produto, etapa, posto, operacao, tempo_min, entrada, boas, refugo,
 //       delta_boas, delta_refugo, inicio, fim, operador, motivo, status)
+//
+//  API para outros módulos:
+//    criar_op(produto, quantidade, posto, origem) -> id da OP (0 em erro)
 //
 //  Eventos assinados:
 //    maquina.parada / maquina.liberada — um posto parado recusa iniciar,
@@ -74,6 +79,7 @@ pub struct OrdemProducao {
     string posto;
     int criada_em;
     int atualizada_em;
+    string origem;      // "PED-12" (pedido), vazio = OP manual
 }
 
 string _dir = "";
@@ -82,8 +88,13 @@ map<string,string> _execucoes = {}; // id -> json(etp::Execucao)
 map<string,string> _parados = {};   // posto -> id da parada aberta
 int _proximo = 1;
 
+// OPs gravadas antes de `origem` existir (v0.2/fase 1) não têm o
+// campo: json_decode deixaria um nulo que aborta no primeiro uso, então
+// a leitura acrescenta `"origem":""`. Só é gravada na próxima ação.
 fn _ler(int id) -> OrdemProducao ={
-    return json_decode(_ordens[to_string(id)]) as OrdemProducao;
+    string bruto = _ordens[to_string(id)];
+    if (!contains(bruto, "\"origem\":")) { bruto = bruto[0..len(bruto) - 1] + ",\"origem\":\"\"}"; }
+    return json_decode(bruto) as OrdemProducao;
 }
 
 // Structs não têm atribuição de campo (L-07): toda mudança de estado
@@ -92,7 +103,7 @@ fn _com(OrdemProducao op, string status, number produzido, number refugo) -> Ord
     return OrdemProducao {
         id: op.id, produto: op.produto, quantidade: op.quantidade,
         produzido: produzido, refugo: refugo, status: status, posto: op.posto,
-        criada_em: op.criada_em, atualizada_em: now_ms()
+        criada_em: op.criada_em, atualizada_em: now_ms(), origem: op.origem
     };
 }
 
@@ -111,7 +122,8 @@ fn _gravar_execucao(int id, etp::Execucao ex) -> bool ={
 fn _evento_op(string tipo, OrdemProducao op) ={
     ev::publicar(tipo, "producao", "op=" + to_string(op.id)
         + "&produto=" + url_encode(op.produto)
-        + "&quantidade=" + to_string(op.quantidade));
+        + "&quantidade=" + to_string(op.quantidade)
+        + "&origem=" + url_encode(op.origem));
 }
 
 // `boas`/`refugo` são os ACUMULADOS da etapa; `delta_boas`/`delta_refugo`
@@ -211,25 +223,49 @@ fn _erro_parado(string posto) -> k::Resposta ={
 
 // ── handlers ──────────────────────────────────────────────
 
+// "" se a OP pode ser criada, senão o motivo (422).
+fn _validar(string produto, number qtd, string posto) -> string ={
+    if (!cadastros::existe(produto)) { return "produto " + produto + " não cadastrado"; }
+    if (len(posto) > 0 && !cadastros::posto_existe(posto)) { return "posto " + posto + " não cadastrado"; }
+    if (cadastros::produto(produto).tipo == "MP") { return "matéria-prima não é produzida"; }
+    if (qtd <= 0.0) { return "quantidade deve ser positiva"; }
+    return "";
+}
+
+// Cria e grava uma OP PLANEJADA já validada; 0 se a gravação falhar.
+fn _nova_op(string produto, number qtd, string posto, string origem) -> int ={
+    int agora = now_ms();
+    OrdemProducao op = OrdemProducao {
+        id: _proximo, produto: produto, quantidade: qtd, produzido: 0.0, refugo: 0.0,
+        status: "PLANEJADA", posto: posto,
+        criada_em: agora, atualizada_em: agora, origem: origem
+    };
+    _proximo = _proximo + 1;
+    if (!_gravar(op)) { return 0; }
+    _evento_op("op.criada", op);
+    return op.id;
+}
+
+// Para outros módulos (pedidos): cria uma OP PLANEJADA com `origem`
+// (ex.: "PED-12"). Devolve o id, ou 0 se os dados forem inválidos ou
+// a gravação falhar.
+pub fn criar_op(string produto, number quantidade, string posto, string origem) -> int ={
+    string p = upper(trim(produto));
+    string pt = upper(trim(posto));
+    if (len(_validar(p, quantidade, pt)) > 0) { return 0; }
+    return _nova_op(p, quantidade, pt, trim(origem));
+}
+
 fn _criar(k::Requisicao r) -> k::Resposta ={
     map<string,string> f = form::ler(r.corpo);
     string produto = upper(form::campo(f, "produto"));
     number qtd = form::numero(f, "quantidade", 0.0);
     string posto = upper(form::campo(f, "posto"));
-    if (!cadastros::existe(produto)) { return k::erro(422, "produto " + produto + " não cadastrado"); }
-    if (len(posto) > 0 && !cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
-    if (cadastros::produto(produto).tipo == "MP") { return k::erro(422, "matéria-prima não é produzida"); }
-    if (qtd <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
-    int agora = now_ms();
-    OrdemProducao op = OrdemProducao {
-        id: _proximo, produto: produto, quantidade: qtd, produzido: 0.0, refugo: 0.0,
-        status: "PLANEJADA", posto: posto,
-        criada_em: agora, atualizada_em: agora
-    };
-    _proximo = _proximo + 1;
-    if (!_gravar(op)) { return k::erro(500, "falha ao gravar a OP"); }
-    _evento_op("op.criada", op);
-    return k::criado(_op_json(op));
+    string falha = _validar(produto, qtd, posto);
+    if (len(falha) > 0) { return k::erro(422, falha); }
+    int id = _nova_op(produto, qtd, posto, form::campo(f, "origem"));
+    if (id == 0) { return k::erro(500, "falha ao gravar a OP"); }
+    return k::criado(_op_json(_ler(id)));
 }
 
 fn _transicao(k::Requisicao r, string de1, string de2, string para, string evento) -> k::Resposta ={
@@ -543,7 +579,7 @@ pub fn descritor() -> k::Modulo ={
     return k::Modulo {
         id: "producao",
         nome: "Ordens de Produção, Etapas e Apontamento",
-        versao: "1.1.0",
+        versao: "1.2.0",
         contrato: 1,
         prefixo: "/api/producao",
         depende: ["cadastros", "roteiros"],

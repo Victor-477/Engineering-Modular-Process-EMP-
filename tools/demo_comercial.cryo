@@ -1,0 +1,179 @@
+// ============================================================
+//  demo_comercial.cryo — carga de demonstração do módulo comercial
+//
+//  Roda DEPOIS de tools/demo.cryo, no mesmo EMP em execução e em
+//  MODO DEV (ERP_TOKENS vazio; http_post não manda cabeçalhos, L-09):
+//
+//    python ../Burnout/cryoc.py tools/demo.cryo --backend pyro --run
+//    python ../Burnout/cryoc.py tools/demo_comercial.cryo --backend pyro --run
+//    EMP_URL=http://127.0.0.1:8080   (padrão)
+//
+//  Clientes e cinco pedidos em estados diferentes:
+//    1. SUP-02 + SUP-01 acima do saldo -> OPs da falta (origem PED-n),
+//       executadas etapa por etapa -> PRONTO -> EXPEDIDO
+//    2. SUP-02 em quantidade grande -> expedir dá 409 (sem saldo);
+//       as OPs são geradas e ficam PLANEJADAS
+//    3. BASE-SUP coberto pelo saldo -> gerar não cria OP -> PRONTO
+//    4. prazo 0 -> ABERTO e atrasado
+//    5. cancelado pelo cliente
+//
+//  A demo.cryo deixa a SOLDA-01 parada (disjuntor); o pedido 1 passa
+//  por ela, então a parada é encerrada antes da execução.
+// ============================================================
+
+string _url = env("EMP_URL");
+if (len(_url) == 0) { _url = "http://127.0.0.1:8080"; }
+
+int _falhas = 0;
+
+fn post(string caminho, string corpo) -> string ={
+    string r = http_post(_url + caminho, corpo);
+    if (len(r) == 0 || starts_with(r, "{\"erro\"")) {
+        _falhas = _falhas + 1;
+        print("  ! " + caminho + "  " + corpo + "  -> " + r);
+    }
+    return r;
+}
+
+// O id de uma resposta JSON `{"...","id":N,...}`.
+fn id_de(string json) -> string ={
+    int i = find(json, "\"id\":");
+    if (i < 0) { return "0"; }
+    string resto = json[i + 5..];
+    int fim = find(resto, ",");
+    if (fim < 0) { fim = find(resto, "}"); }
+    return resto[0..fim];
+}
+
+fn cliente(string codigo, string nome, string documento, string contato, string email,
+           string telefone, string endereco) ={
+    post("/api/pedidos/clientes", "codigo=" + codigo + "&nome=" + url_encode(nome)
+        + "&documento=" + url_encode(documento) + "&contato=" + url_encode(contato)
+        + "&email=" + url_encode(email) + "&telefone=" + url_encode(telefone)
+        + "&endereco=" + url_encode(endereco));
+}
+
+fn pedido(string cliente, string itens, string prazo, string observacao) -> string ={
+    return id_de(post("/api/pedidos/pedidos", "cliente=" + cliente + "&itens=" + url_encode(itens)
+        + "&prazo_dias=" + prazo + "&observacao=" + url_encode(observacao)));
+}
+
+// Só os campos de que a carga precisa; o resto do JSON é ignorado.
+// json_decode aqui é seguro: o texto vem do próprio EMP (L-05).
+struct ItemVisto {
+    string produto;
+    int[] ops;
+}
+
+struct PedidoVisto {
+    int id;
+    string status;
+    ItemVisto[] itens;
+}
+
+struct EtapaVista {
+    int numero;
+    int versao;
+    number entrada;
+}
+
+struct OpVista {
+    int id;
+    string origem;
+    EtapaVista[] etapas;
+    int etapa_atual;
+}
+
+struct ParadaVista {
+    int id;
+    string posto;
+}
+
+fn ver_pedido(string id) -> PedidoVisto ={
+    return json_decode(http_get(_url + "/api/pedidos/pedido?id=" + id)) as PedidoVisto;
+}
+
+fn ver_op(string id) -> OpVista ={
+    return json_decode(http_get(_url + "/api/producao/ordem?id=" + id)) as OpVista;
+}
+
+// Executa a OP etapa por etapa: iniciar e apontar a entrada inteira
+// como boa (o apontamento que completa a entrada conclui a etapa).
+fn executar(string op, string operador) ={
+    post("/api/producao/liberar?id=" + op, "");
+    OpVista v = ver_op(op);
+    int passos = 0;
+    while (v.etapa_atual > 0 && passos < 10) {
+        for (EtapaVista e in v.etapas) {
+            if (e.numero == v.etapa_atual) {
+                string q = "?op=" + op + "&etapa=" + to_string(e.numero);
+                post("/api/producao/etapa/iniciar" + q, "versao=" + to_string(e.versao) + "&operador=" + operador);
+                post("/api/producao/etapa/apontar" + q, "versao=" + to_string(e.versao + 1)
+                    + "&boas=" + to_string(e.entrada) + "&operador=" + operador);
+            }
+        }
+        v = ver_op(op);
+        passos = passos + 1;
+    }
+}
+
+print("carga comercial em " + _url);
+string saude = http_get(_url + "/api/sistema/saude");
+if (!contains(saude, "\"status\":\"ok\"")) {
+    print("EMP não respondeu (ou exige token). Suba o emp.exe em modo dev e tente de novo.");
+} else if (!contains(http_get(_url + "/api/sistema/modulos"), "\"id\":\"pedidos\"")) {
+    print("o módulo pedidos não está neste EMP.");
+} else {
+    print("- clientes");
+    cliente("HORIZONTE", "Construtora Horizonte Ltda", "12.345.678/0001-90", "Marina Souza",
+        "compras@horizonte.example", "(11) 4002-1000", "Av. das Nações, 1200 - São Paulo/SP");
+    cliente("FERRAGENS-SUL", "Ferragens Sul Distribuidora", "98.765.432/0001-10", "Paulo Kremer",
+        "pedidos@ferragenssul.example", "(51) 3221-4455", "Rua Voluntários da Pátria, 845 - Porto Alegre/RS");
+    cliente("MAKRO-OBRAS", "Makro Obras Home Center", "45.678.912/0001-33", "Juliana Prado",
+        "suprimentos@makroobras.example", "(31) 3555-7800", "Rod. Fernão Dias, km 4 - Contagem/MG");
+
+    print("- pedido 1: acima do saldo -> OPs da falta -> etapas -> PRONTO -> EXPEDIDO");
+    string p1 = pedido("HORIZONTE", "SUP-02:150;SUP-01:300", "5", "Obra Residencial Parque das Águas");
+    post("/api/pedidos/gerar_ops?id=" + p1, "posto=MONT-01");
+    PedidoVisto v1 = ver_pedido(p1);
+    print("  pedido " + p1 + ": " + v1.status);
+    // A SOLDA-01 ficou parada na demo.cryo e a OP do SUP-02 passa por ela.
+    ParadaVista[] abertas = json_decode(http_get(_url + "/api/manutencao/paradas?status=ABERTA")) as ParadaVista[];
+    for (ParadaVista pa in abertas) {
+        if (pa.posto == "SOLDA-01") {
+            post("/api/manutencao/encerrar?id=" + to_string(pa.id), "solucao=" + url_encode("Disjuntor rearmado e cabo do robô reapertado"));
+        }
+    }
+    for (ItemVisto it in v1.itens) {
+        for (int op in it.ops) {
+            OpVista o = ver_op(to_string(op));
+            print("  OP " + to_string(op) + " (" + it.produto + ") origem " + o.origem);
+            executar(to_string(op), "ana");
+        }
+    }
+    v1 = ver_pedido(p1);
+    print("  pedido " + p1 + ": " + v1.status);
+    post("/api/pedidos/expedir?id=" + p1, "");
+    print("  expedir pedido " + p1 + " -> " + ver_pedido(p1).status);
+
+    print("- pedido 2: sem saldo -> expedir 409; OPs geradas e planejadas");
+    string p2 = pedido("FERRAGENS-SUL", "SUP-02:400", "12", "Reposição do CD de Canoas");
+    string recusa = http_post(_url + "/api/pedidos/expedir?id=" + p2, "");
+    print("  expedir sem saldo -> " + recusa[0..min(len(recusa), 90)]);
+    post("/api/pedidos/gerar_ops?id=" + p2, "");
+    print("  pedido " + p2 + ": " + ver_pedido(p2).status);
+
+    print("- pedido 3: coberto pelo saldo -> PRONTO sem OP");
+    string p3 = pedido("MAKRO-OBRAS", "BASE-SUP:30", "3", "Kit de reposição balcão");
+    post("/api/pedidos/gerar_ops?id=" + p3, "");
+    print("  pedido " + p3 + ": " + ver_pedido(p3).status);
+
+    print("- pedido 4: prazo vencido -> atrasado");
+    pedido("MAKRO-OBRAS", "SUP-01:60", "0", "Urgente: loja Contagem");
+
+    print("- pedido 5: cancelado");
+    string p5 = pedido("FERRAGENS-SUL", "SUP-01:25", "10", "");
+    post("/api/pedidos/cancelar?id=" + p5, "motivo=" + url_encode("Cliente reduziu o mix de suportes"));
+
+    print("feito: " + to_string(_falhas) + " falha(s)");
+}

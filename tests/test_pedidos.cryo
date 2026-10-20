@@ -1,0 +1,198 @@
+// Testes do módulo comercial (pedidos) com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_pedidos.cryo --backend pyro
+//
+// Duas partes: as regras puras de pedidos.cryo (itens, falta, reserva,
+// atraso) e um fluxo completo pelos módulos de verdade — registro,
+// cadastros, roteiros, produção, estoque e pedidos — num diretório de
+// dados novo em build/, com os eventos drenados como no servidor.
+
+import "../src/nucleo/contrato.cryo"           as k;
+import "../src/nucleo/registro.cryo"           as reg;
+import "../src/modulos/cadastros/cadastros.cryo" as cadastros;
+import "../src/modulos/roteiros/roteiros.cryo"   as roteiros;
+import "../src/modulos/producao/producao.cryo"   as producao;
+import "../src/modulos/estoque/estoque.cryo"     as estoque;
+import "../src/modulos/pedidos/pedidos.cryo"     as ped;
+
+// ── regras puras ──────────────────────────────────────────
+
+test fn itens_validos() ={
+    ped::LeituraItens li = ped::ler_itens(" sup-02:100; SUP-01:2,5 ;sup-02:20;");
+    assert(li.erro == "", "sem erro");
+    assert(len(li.itens) == 2, "produto repetido soma");
+    assert(li.itens[0].produto == "SUP-02" && li.itens[0].quantidade == 120.0, "maiúsculas e soma");
+    assert(li.itens[1].quantidade == 2.5, "vírgula decimal");
+    assert(len(li.itens[0].ops) == 0, "sem OPs");
+    assert(ped::itens_texto(li.itens) == "SUP-02:" + to_string(120.0) + ";SUP-01:" + to_string(2.5), "texto de volta");
+}
+
+test fn itens_invalidos() ={
+    assert(ped::ler_itens("").erro != "", "vazio");
+    assert(ped::ler_itens("SUP-02").erro != "", "sem quantidade");
+    assert(ped::ler_itens(":10").erro != "", "sem produto");
+    assert(ped::ler_itens("SUP-02:abc").erro != "", "quantidade não numérica");
+    assert(ped::ler_itens("SUP-02:0").erro != "", "quantidade zero");
+    assert(ped::ler_itens("SUP-02:-3").erro != "", "quantidade negativa");
+    assert(ped::ler_itens("SUP-02:1e9999").erro != "", "texto que to_number abortaria");
+}
+
+test fn falta_e_reserva() ={
+    assert(ped::falta(100.0, 30.0) == 70.0, "falta parcial");
+    assert(ped::falta(100.0, 150.0) == 0.0, "saldo cobre");
+    assert(ped::falta(100.0, -20.0) == 100.0, "saldo negativo = nada livre");
+    assert(ped::reserva("PRONTO", 50.0, 0.0) == 50.0, "pronto reserva tudo");
+    assert(ped::reserva("EM_PRODUCAO", 100.0, 70.0) == 30.0, "em produção reserva o que veio da prateleira");
+    assert(ped::reserva("EM_PRODUCAO", 100.0, 120.0) == 0.0, "OP maior que o item");
+    assert(ped::reserva("ABERTO", 100.0, 0.0) == 0.0, "aberto não reserva");
+    assert(ped::reserva("EXPEDIDO", 100.0, 0.0) == 0.0, "expedido não reserva");
+    ped::OpPedido o = ped::OpPedido { op: 1, pedido: 1, produto: "X", quantidade: 80.0, produzido: 30.0, status: "ABERTA" };
+    assert(ped::pendente_op(o) == 50.0, "pendente da OP aberta");
+    ped::OpPedido c = ped::OpPedido { op: 1, pedido: 1, produto: "X", quantidade: 80.0, produzido: 30.0, status: "CONCLUIDA" };
+    assert(ped::pendente_op(c) == 0.0, "concluída não tem pendente");
+}
+
+test fn entrega_e_atraso() ={
+    assert(ped::entrega(1000, 2.0) == 1000 + 2 * 86400000, "dias em ms");
+    assert(ped::entrega(1000, 0.5) == 1000 + 43200000, "meio dia");
+    assert(ped::atrasado("EM_PRODUCAO", 5000, 6000), "passou da entrega");
+    assert(!ped::atrasado("EM_PRODUCAO", 5000, 4000), "no prazo");
+    assert(!ped::atrasado("EXPEDIDO", 5000, 6000), "expedido nunca atrasa");
+    assert(!ped::atrasado("CANCELADO", 5000, 6000), "cancelado nunca atrasa");
+    assert(ped::origem(12) == "PED-12", "origem da OP");
+}
+
+// ── fluxo completo pelos módulos ──────────────────────────
+
+fn req(string metodo, string caminho, string corpo) -> k::Resposta ={
+    string path = caminho;
+    string query = "";
+    int q = find(caminho, "?");
+    if (q >= 0) { path = caminho[0..q]; query = caminho[q + 1..]; }
+    k::Requisicao r = k::Requisicao { metodo: metodo, rota: "", query: query, corpo: corpo,
+                                      usuario: "teste", perfil: "admin" };
+    k::Resposta resp = reg::despachar(path, r);
+    reg::drenar_eventos(1000);
+    return resp;
+}
+
+fn post(string caminho, string corpo) -> k::Resposta ={ return req("POST", caminho, corpo); }
+fn get(string caminho) -> k::Resposta ={ return req("GET", caminho, ""); }
+
+struct ItemVisto { string produto; number quantidade; number saldo; int[] ops; }
+struct PedidoVisto { int id; string status; ItemVisto[] itens; int[] ops; bool atrasado; }
+struct OpVista { int id; string origem; string status; }
+
+fn pedido(string id) -> PedidoVisto ={
+    return json_decode(get("/api/pedidos/pedido?id=" + id).corpo) as PedidoVisto;
+}
+
+fn op(int id) -> OpVista ={
+    return json_decode(get("/api/producao/ordem?id=" + to_string(id)).corpo) as OpVista;
+}
+
+fn id_de(string json) -> string ={
+    int i = find(json, "\"id\":");
+    string resto = json[i + 5..];
+    int fim = find(resto, ",");
+    if (fim < 0) { fim = find(resto, "}"); }
+    return resto[0..fim];
+}
+
+test fn fluxo_pedido_completo() ={
+    string dir = "build/test_pedidos_" + to_string(now_ms());
+    if (!is_dir("build")) { make_dir("build"); }
+    make_dir(dir);
+    // Uma OP gravada na fase 1 (sem `origem`) precisa continuar legível.
+    make_dir(dir + "/producao");
+    string legado = "{\"id\":1,\"produto\":\"PA-1\",\"quantidade\":4,\"produzido\":0,\"refugo\":0,"
+        + "\"status\":\"PLANEJADA\",\"posto\":\"\",\"criada_em\":1,\"atualizada_em\":1}";
+    map<string,string> ordens = {};
+    ordens["1"] = legado;
+    write_file(dir + "/producao/ordens.json", json_encode(ordens));
+    reg::registrar(cadastros::descritor());
+    reg::registrar(roteiros::descritor());
+    reg::registrar(producao::descritor());
+    reg::registrar(estoque::descritor());
+    reg::registrar(ped::descritor());
+    assert(reg::iniciar_todos(dir) == 5, "cinco módulos ativos");
+
+    post("/api/cadastros/produtos", "codigo=ACO&descricao=Aco&tipo=MP");
+    post("/api/cadastros/produtos", "codigo=PA-1&descricao=Produto+1&tipo=PA");
+    post("/api/cadastros/produtos", "codigo=PA-2&descricao=Produto+2&tipo=PA");
+    post("/api/cadastros/estrutura", "produto=PA-1&componente=ACO&quantidade=1");
+    post("/api/cadastros/postos", "codigo=P1&descricao=Posto");
+    post("/api/estoque/entrada", "produto=PA-2&quantidade=30");
+
+    assert(post("/api/pedidos/clientes", "codigo=c1").status == 400, "cliente sem nome");
+    assert(post("/api/pedidos/clientes", "codigo=c1&nome=Cliente+Um").status == 201, "cliente criado");
+    assert(contains(get("/api/pedidos/clientes").corpo, "\"codigo\":\"C1\""), "cliente listado");
+
+    assert(post("/api/pedidos/pedidos", "cliente=X9&itens=PA-1:10").status == 422, "cliente inexistente");
+    assert(post("/api/pedidos/pedidos", "cliente=C1&itens=NADA:10").status == 422, "produto inexistente");
+    assert(post("/api/pedidos/pedidos", "cliente=C1&itens=ACO:10").status == 422, "matéria-prima");
+    assert(post("/api/pedidos/pedidos", "cliente=C1&itens=PA-1:10&prazo_dias=abc").status == 422, "prazo inválido");
+
+    k::Resposta cr = post("/api/pedidos/pedidos", "cliente=C1&itens=PA-1:10;PA-2:50&prazo_dias=3");
+    assert(cr.status == 201, "pedido criado");
+    string id = id_de(cr.corpo);
+    PedidoVisto p = pedido(id);
+    assert(p.status == "ABERTO" && len(p.itens) == 2 && !p.atrasado, "aberto, dois itens");
+    assert(p.itens[1].saldo == 30.0, "saldo livre de PA-2");
+
+    assert(post("/api/pedidos/expedir?id=" + id, "").status == 409, "expedir sem saldo -> 409");
+    assert(post("/api/pedidos/gerar_ops?id=" + id, "posto=NAO").status == 422, "posto inexistente");
+    k::Resposta g = post("/api/pedidos/gerar_ops?id=" + id, "posto=P1");
+    assert(g.status == 200, "OPs geradas");
+    p = pedido(id);
+    assert(p.status == "EM_PRODUCAO" && len(p.ops) == 2, "em produção, duas OPs");
+    OpVista o1 = op(p.itens[0].ops[0]);
+    OpVista o2 = op(p.itens[1].ops[0]);
+    assert(o1.origem == "PED-" + id && o1.status == "PLANEJADA", "OP com origem");
+    assert(contains(get("/api/producao/ordem?id=" + to_string(o2.id)).corpo, "\"quantidade\":20"), "OP da falta (50 - 30)");
+    assert(post("/api/pedidos/gerar_ops?id=" + id, "").status == 409, "gerar de novo -> 409");
+
+    // Um segundo pedido não conta com as 30 peças de PA-2 reservadas.
+    string id2 = id_de(post("/api/pedidos/pedidos", "cliente=C1&itens=PA-2:5").corpo);
+    assert(pedido(id2).itens[0].saldo == 0.0, "saldo de PA-2 já reservado");
+
+    // Conclui as duas OPs (sem roteiro: etapa única APONTAMENTO).
+    post("/api/producao/liberar?id=" + to_string(o1.id), "");
+    post("/api/producao/liberar?id=" + to_string(o2.id), "");
+    post("/api/producao/apontar?id=" + to_string(o1.id), "boa=10");
+    assert(pedido(id).status == "EM_PRODUCAO", "uma OP ainda aberta");
+    post("/api/producao/apontar?id=" + to_string(o2.id), "boa=20");
+    assert(op(o2.id).status == "CONCLUIDA", "OP concluída");
+    p = pedido(id);
+    assert(p.status == "PRONTO", "todas as OPs concluídas -> PRONTO");
+    assert(p.itens[0].saldo == 10.0 && p.itens[1].saldo == 50.0, "saldo cobre os itens");
+
+    k::Resposta ex = post("/api/pedidos/expedir?id=" + id, "");
+    assert(ex.status == 200 && contains(ex.corpo, "\"status\":\"EXPEDIDO\""), "expedido");
+    assert(post("/api/pedidos/expedir?id=" + id, "").status == 409, "expedir duas vezes");
+    assert(post("/api/pedidos/cancelar?id=" + id, "").status == 409, "expedido não cancela");
+
+    // Pedido coberto pelo saldo: gerar não cria OP e já fica PRONTO.
+    // (Sem o módulo de estoque da fase 2 a expedição não baixa o saldo.)
+    post("/api/estoque/entrada", "produto=PA-1&quantidade=100");
+    string id3 = id_de(post("/api/pedidos/pedidos", "cliente=C1&itens=PA-1:5").corpo);
+    post("/api/pedidos/gerar_ops?id=" + id3, "");
+    p = pedido(id3);
+    assert(p.status == "PRONTO" && len(p.ops) == 0, "saldo cobre -> PRONTO sem OP");
+
+    k::Resposta ca = post("/api/pedidos/cancelar?id=" + id2, "motivo=cliente+desistiu");
+    assert(ca.status == 200 && contains(ca.corpo, "\"motivo\":\"cliente desistiu\""), "cancelado com motivo");
+    assert(contains(get("/api/pedidos/pedidos?status=cancelado").corpo, "\"id\":" + id2), "filtro por status");
+    assert(!contains(get("/api/pedidos/pedidos?status=cancelado").corpo, "\"id\":" + id + ","), "filtro exclui os outros");
+    assert(get("/api/pedidos/pedido?id=abc").status == 404, "id inválido não aborta");
+
+    // A OP da fase 1 é lida com origem vazia e segue o ciclo normal.
+    assert(op(1).origem == "" && op(1).status == "PLANEJADA", "OP legada legível");
+    assert(contains(get("/api/producao/ordens").corpo, "\"id\":1,"), "OP legada na lista");
+    assert(post("/api/producao/cancelar?id=1", "").status == 200, "OP legada cancela");
+    assert(op(1).status == "CANCELADA", "OP legada regravada");
+
+    // OP manual continua sem origem.
+    k::Resposta manual = post("/api/producao/ordens", "produto=PA-1&quantidade=3&posto=P1");
+    assert(manual.status == 201 && contains(manual.corpo, "\"origem\":\"\""), "OP manual sem origem");
+    assert(producao::criar_op("NADA", 1.0, "", "PED-1") == 0, "criar_op em erro -> 0");
+}
