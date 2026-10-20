@@ -1,0 +1,155 @@
+// Testes do cálculo de OEE com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_oee.cryo --backend pyro
+//
+// Só funções puras (modulos/indicadores/oee.cryo): janela, sobreposição,
+// segmentos de estado e frações. Tempos em ms a partir de T0.
+
+import "../src/modulos/indicadores/oee.cryo" as oee;
+
+const int T0 = 1000000000;
+const int MIN = 60000;
+const int HORA = 3600000;
+
+fn _iv(string posto, string tipo, int inicio, int fim) -> oee::Intervalo ={
+    return oee::Intervalo { posto: posto, tipo: tipo, inicio: inicio, fim: fim, motivo: tipo };
+}
+
+fn _ap(string posto, int ts, number tempo_min, number boas, number refugo) -> oee::Apontamento ={
+    return oee::Apontamento { posto: posto, ts: ts, tempo_min: tempo_min, boas: boas, refugo: refugo };
+}
+
+fn _nenhum_iv() -> oee::Intervalo[] ={
+    oee::Intervalo[] v = [];
+    return v;
+}
+
+fn _nenhum_ap() -> oee::Apontamento[] ={
+    oee::Apontamento[] v = [];
+    return v;
+}
+
+fn _perto(number a, number b) -> bool ={
+    return abs(a - b) < 0.000001;
+}
+
+// ── janela ────────────────────────────────────────────────
+
+test fn sobreposicao_de_intervalos() ={
+    assert(oee::sobreposicao(0, 10, 5, 20) == 5, "parcial à direita");
+    assert(oee::sobreposicao(0, 10, -5, 3) == 3, "parcial à esquerda");
+    assert(oee::sobreposicao(2, 4, 0, 10) == 2, "contido");
+    assert(oee::sobreposicao(0, 10, 10, 20) == 0, "só encosta");
+    assert(oee::sobreposicao(0, 10, 15, 20) == 0, "disjunto");
+}
+
+test fn em_curso_conta_ate_agora() ={
+    assert(oee::fim_efetivo(_iv("P", oee::PARADO, T0, 0), T0 + 5 * MIN) == T0 + 5 * MIN, "aberto -> agora");
+    assert(oee::fim_efetivo(_iv("P", oee::PARADO, T0, T0 + MIN), T0 + 5 * MIN) == T0 + MIN, "fechado -> fim");
+}
+
+test fn passos_da_serie() ={
+    int[] p = oee::passos(T0, T0 + 150 * MIN, 60 * MIN);
+    assert(len(p) == 3, "3 passos (o último mais curto)");
+    assert(p[0] == T0 && p[2] == T0 + 120 * MIN, "inícios");
+}
+
+// ── casos do contrato ─────────────────────────────────────
+
+test fn posto_sempre_parado() ={
+    oee::Intervalo[] ivs = [_iv("P1", oee::PARADO, T0 - HORA, 0)];
+    oee::Segmento[] s = oee::segmentos(ivs, "P1", T0, T0 + 8 * HORA);
+    assert(len(s) == 1 && s[0].estado == oee::PARADO, "um segmento PARADO");
+    assert(s[0].inicio == T0 && s[0].fim == T0 + 8 * HORA, "cobre a janela inteira");
+    oee::Oee o = oee::calcular(ivs, _nenhum_ap(), "P1", T0, T0 + 8 * HORA);
+    assert(o.ms_parado == 8 * HORA && o.ms_operando == 0 && o.ms_ocioso == 0, "só parado");
+    assert(_perto(o.disponibilidade, 0.0), "disponibilidade 0");
+    assert(_perto(o.desempenho, 0.0), "não operou -> desempenho 0");
+    assert(_perto(o.oee, 0.0), "OEE 0");
+}
+
+test fn posto_sempre_ocioso() ={
+    oee::Segmento[] s = oee::segmentos(_nenhum_iv(), "P1", T0, T0 + 8 * HORA);
+    assert(len(s) == 1 && s[0].estado == oee::OCIOSO, "um segmento OCIOSO");
+    oee::Oee o = oee::calcular(_nenhum_iv(), _nenhum_ap(), "P1", T0, T0 + 8 * HORA);
+    assert(o.ms_ocioso == 8 * HORA, "ocioso a janela inteira");
+    assert(_perto(o.disponibilidade, 1.0), "ocioso não tira disponibilidade");
+    assert(_perto(o.desempenho, 0.0), "desempenho 0");
+    assert(_perto(o.qualidade, 1.0), "qualidade 1");
+    assert(_perto(o.oee, 0.0), "OEE 0");
+}
+
+test fn desempenho_acima_de_1_e_limitado() ={
+    // 10 min operando; 100 peças × 0,2 min = 20 min teóricos -> 2,0 -> 1.
+    oee::Intervalo[] ivs = [_iv("P1", oee::OPERANDO, T0, T0 + 10 * MIN)];
+    oee::Apontamento[] aps = [_ap("P1", T0 + 5 * MIN, 0.2, 100.0, 0.0)];
+    oee::Oee o = oee::calcular(ivs, aps, "P1", T0, T0 + HORA);
+    assert(_perto(o.min_teorico, 20.0), "20 min teóricos");
+    assert(_perto(o.desempenho, 1.0), "limitado a 1");
+    // Metade: 25 peças × 0,2 = 5 min de 10 -> 0,5.
+    oee::Oee m = oee::calcular(ivs, [_ap("P1", T0 + 5 * MIN, 0.2, 20.0, 5.0)], "P1", T0, T0 + HORA);
+    assert(_perto(m.desempenho, 0.5), "desempenho 0,5");
+    assert(_perto(m.qualidade, 0.8), "qualidade 20/25");
+    assert(_perto(m.oee, 1.0 * 0.5 * 0.8), "OEE = D × Desemp × Q");
+}
+
+test fn qualidade_sem_apontamento_e_1() ={
+    oee::Intervalo[] ivs = [_iv("P1", oee::OPERANDO, T0, T0 + 30 * MIN)];
+    oee::Oee o = oee::calcular(ivs, _nenhum_ap(), "P1", T0, T0 + HORA);
+    assert(_perto(o.qualidade, 1.0), "qualidade 1 sem apontamento");
+    assert(_perto(o.desempenho, 0.0), "operou sem produzir -> desempenho 0");
+    // Apontamento de outro posto ou fora da janela não conta.
+    oee::Apontamento[] aps = [_ap("P2", T0 + MIN, 1.0, 1.0, 9.0), _ap("P1", T0 - MIN, 1.0, 0.0, 9.0)];
+    assert(_perto(oee::calcular(ivs, aps, "P1", T0, T0 + HORA).qualidade, 1.0), "só o posto e a janela");
+}
+
+test fn parada_que_comeca_antes_da_janela() ={
+    // Parada de T0−30 min a T0+30 min; janela [T0, T0+2 h): 30 min parado.
+    oee::Intervalo[] ivs = [_iv("P1", oee::PARADO, T0 - 30 * MIN, T0 + 30 * MIN)];
+    oee::Segmento[] s = oee::segmentos(ivs, "P1", T0, T0 + 2 * HORA);
+    assert(len(s) == 2, "PARADO e depois OCIOSO");
+    assert(s[0].estado == oee::PARADO && s[0].inicio == T0 && s[0].fim == T0 + 30 * MIN, "recortada no início da janela");
+    assert(s[1].estado == oee::OCIOSO && s[1].fim == T0 + 2 * HORA, "ocioso até o fim");
+    oee::Oee o = oee::calcular(ivs, _nenhum_ap(), "P1", T0, T0 + 2 * HORA);
+    assert(o.ms_parado == 30 * MIN, "30 min parado");
+    assert(_perto(o.disponibilidade, 0.75), "disponibilidade 90/120");
+}
+
+// ── precedência e linha ───────────────────────────────────
+
+test fn parado_prevalece_sobre_operando() ={
+    // Operando de 0 a 60 min; parada de 20 a 30 min no meio.
+    oee::Intervalo[] ivs = [_iv("P1", oee::OPERANDO, T0, T0 + 60 * MIN),
+                            _iv("P1", oee::PARADO, T0 + 20 * MIN, T0 + 30 * MIN),
+                            _iv("P2", oee::PARADO, T0, T0 + 60 * MIN)];
+    oee::Segmento[] s = oee::segmentos(ivs, "P1", T0, T0 + 90 * MIN);
+    assert(len(s) == 4, "OPERANDO, PARADO, OPERANDO, OCIOSO");
+    assert(s[0].estado == oee::OPERANDO && s[1].estado == oee::PARADO, "parada no meio");
+    assert(s[2].estado == oee::OPERANDO && s[3].estado == oee::OCIOSO, "volta a operar, depois ocioso");
+    oee::Oee o = oee::calcular(ivs, _nenhum_ap(), "P1", T0, T0 + 90 * MIN);
+    assert(o.ms_operando == 50 * MIN && o.ms_parado == 10 * MIN && o.ms_ocioso == 30 * MIN, "somas");
+}
+
+test fn duas_execucoes_seguidas_nao_se_juntam() ={
+    oee::Intervalo[] ivs = [
+        oee::Intervalo { posto: "P1", tipo: oee::OPERANDO, inicio: T0, fim: T0 + 10 * MIN, motivo: "OP 1 etapa 10" },
+        oee::Intervalo { posto: "P1", tipo: oee::OPERANDO, inicio: T0 + 10 * MIN, fim: T0 + 20 * MIN, motivo: "OP 2 etapa 10" }
+    ];
+    oee::Segmento[] s = oee::segmentos(ivs, "P1", T0, T0 + 20 * MIN);
+    assert(len(s) == 2 && s[0].motivo == "OP 1 etapa 10" && s[1].motivo == "OP 2 etapa 10", "um segmento por OP");
+    oee::Segmento[] m = oee::segmentos([_iv("P1", oee::OPERANDO, T0, T0 + 10 * MIN),
+                                        _iv("P1", oee::OPERANDO, T0 + 5 * MIN, T0 + 20 * MIN)], "P1", T0, T0 + 20 * MIN);
+    assert(len(m) == 1 && m[0].fim == T0 + 20 * MIN, "mesmo estado e motivo se juntam");
+}
+
+test fn linha_soma_os_postos() ={
+    // P1: 1 h janela, 30 min parado, 30 min operando, 20 boas + 5 refugo a 1 min.
+    // P2: 1 h ocioso.
+    oee::Intervalo[] ivs = [_iv("P1", oee::PARADO, T0, T0 + 30 * MIN),
+                            _iv("P1", oee::OPERANDO, T0 + 30 * MIN, 0)];
+    oee::Apontamento[] aps = [_ap("P1", T0 + 40 * MIN, 1.0, 20.0, 5.0)];
+    oee::Oee l = oee::linha(ivs, aps, ["P1", "P2"], T0, T0 + HORA);
+    assert(_perto(l.disponibilidade, 0.75), "(120 − 30) / 120");
+    assert(_perto(l.desempenho, 25.0 / 30.0), "25 min teóricos / 30 operando");
+    assert(_perto(l.qualidade, 0.8), "20 / 25");
+    assert(_perto(l.oee, 0.75 * (25.0 / 30.0) * 0.8), "produto");
+}

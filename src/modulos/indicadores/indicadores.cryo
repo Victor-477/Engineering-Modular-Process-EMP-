@@ -1,0 +1,388 @@
+// ============================================================
+//  indicadores.cryo — Histórico de estado do posto e OEE
+//
+//  Inspirado na tblMachineReport do MES4: cada posto tem uma linha do
+//  tempo de estados (PARADO, OPERANDO, OCIOSO) e, dela e dos
+//  apontamentos, sai o OEE por posto e da linha.
+//
+//  Tudo vem dos EVENTOS — o módulo não importa produção nem
+//  manutenção:
+//    maquina.parada / maquina.liberada          -> intervalos PARADO
+//    producao.etapa_iniciada/apontada/
+//             concluida/falhou                  -> intervalos OPERANDO
+//                                                  e apontamentos
+//  Os intervalos são gravados como chegam (com início e fim) e os
+//  segmentos de estado são DERIVADOS na consulta (oee.cryo): assim uma
+//  parada retroativa ou uma etapa que só se vê ao concluir corrigem o
+//  passado sem reescrever segmentos.
+//
+//  Fórmulas e precedência de estados: ver oee.cryo e docs/fase2/oee.md.
+//
+//  Rotas (prefixo /api/indicadores, só leitura):
+//    GET /estados?posto=X&horas=8       [{posto, estado, inicio, fim, motivo}]
+//                                       fim = 0: em curso
+//    GET /oee?horas=8                   {janela_ms, inicio, fim, linha:{...},
+//                                        postos:[{posto, frações, min_operando,
+//                                        min_parado, min_ocioso, min_teorico,
+//                                        boas, refugo}]}
+//    GET /oee/serie?posto=X&horas=24&passo_min=60
+//                                       [{inicio, fim, frações}]; posto vazio = linha
+//
+//  Evento publicado:
+//    indicadores.oee_baixo (oee, limite, horas, disponibilidade, desempenho,
+//    qualidade) quando o OEE da linha nas últimas 8 h fica abaixo de
+//    EMP_OEE_ALERTA (padrão 0.6), no máximo um por hora. Só avalia com
+//    pelo menos 15 min OPERANDO + PARADO na janela: sem isso o primeiro
+//    evento do dia (etapa recém-iniciada, nada apontado) daria OEE 0.
+//
+//  Persistência: dados/indicadores/{intervalos,apontamentos,estado}.json,
+//  com retenção de 8 dias (a janela máxima consultável é 168 h).
+// ============================================================
+
+import "../../nucleo/contrato.cryo"  as k;
+import "../../nucleo/persist.cryo"   as db;
+import "../../nucleo/eventos.cryo"   as ev;
+import "../../nucleo/form.cryo"      as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+import "oee.cryo"                    as oee;
+
+const int HORA_MS = 3600000;
+const int JANELA_ALERTA_MS = 28800000;       // 8 h
+const int BASE_ALERTA_MS = 900000;           // 15 min operando + parado
+const int RETENCAO_MS = 691200000;           // 8 dias
+const number HORAS_MAX = 168.0;
+const int PASSOS_MAX = 500;
+
+string _dir = "";
+map<string,string> _ivs = {};        // chave -> json(oee::Intervalo)
+map<string,string> _aps = {};        // id -> json(oee::Apontamento)
+map<string,string> _estado = {};     // "ultimo_alerta" -> ms
+int _proximo_ap = 1;
+int _ultima_poda = 0;
+
+// Chaves dos intervalos:
+//   "P<parada>"              uma parada (id da manutenção)
+//   "E<op>-<etapa>-<inicio>" uma execução de etapa; o início separa as
+//                            execuções de uma etapa reiniciada
+
+fn _iv(string chave) -> oee::Intervalo ={
+    return json_decode(_ivs[chave]) as oee::Intervalo;
+}
+
+fn _intervalos() -> oee::Intervalo[] ={
+    oee::Intervalo[] lista = [];
+    for (string c in keys(_ivs)) { lista = concat(lista, [_iv(c)]); }
+    return lista;
+}
+
+fn _apontamentos() -> oee::Apontamento[] ={
+    oee::Apontamento[] lista = [];
+    for (string c in keys(_aps)) {
+        lista = concat(lista, [json_decode(_aps[c]) as oee::Apontamento]);
+    }
+    return lista;
+}
+
+// Sem atribuição a campo de struct (L-07): reconstrói.
+fn _com_fim(oee::Intervalo i, int inicio, int fim) -> oee::Intervalo ={
+    return oee::Intervalo { posto: i.posto, tipo: i.tipo, inicio: inicio, fim: fim, motivo: i.motivo };
+}
+
+// Descarta o que já saiu da retenção. Roda no início e, depois, no
+// máximo uma vez por hora.
+fn _podar(int agora) -> bool ={
+    int corte = agora - RETENCAO_MS;
+    bool mudou = false;
+    for (string c in keys(_ivs)) {
+        oee::Intervalo i = _iv(c);
+        if (i.fim > 0 && i.fim < corte) { remove(_ivs, c); mudou = true; }
+    }
+    for (string c in keys(_aps)) {
+        oee::Apontamento a = json_decode(_aps[c]) as oee::Apontamento;
+        if (a.ts < corte) { remove(_aps, c); mudou = true; }
+    }
+    _ultima_poda = agora;
+    return mudou;
+}
+
+fn _gravar() -> bool ={
+    bool ok1 = db::salvar(_dir, "intervalos", _ivs);
+    bool ok2 = db::salvar(_dir, "apontamentos", _aps);
+    return ok1 && ok2;
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;     // o registro já passa dados/indicadores
+    _ivs = db::carregar(_dir, "intervalos");
+    _aps = db::carregar(_dir, "apontamentos");
+    _estado = db::carregar(_dir, "estado");
+    _proximo_ap = db::maior_id(_aps) + 1;
+    if (_podar(now_ms())) { _gravar(); }
+    return true;
+}
+
+// ── eventos ───────────────────────────────────────────────
+
+// maquina.parada abre um intervalo PARADO; maquina.liberada o fecha.
+// O evento não traz o início da parada: uma parada retroativa
+// (ha_minutos) começa no evento enquanto aberta e é corrigida ao ser
+// liberada, por fim − minutos (precisão de 1 min). Se o evento trouxer
+// `inicio`/`fim`, eles valem. O reanúncio de paradas abertas no início
+// da manutenção não altera um intervalo já conhecido.
+fn _maquina(k::Evento e, map<string,string> d) -> bool ={
+    string posto = upper(form::campo(d, "posto"));
+    string id = form::campo(d, "parada");
+    if (len(posto) == 0 || len(id) == 0) { return false; }
+    string chave = "P" + id;
+    int inicio_ev = form::inteiro(d, "inicio", 0);
+    string motivo = form::campo_ou(d, "motivo", form::campo(d, "categoria"));
+    if (e.tipo == "maquina.parada") {
+        if (has(_ivs, chave)) { return false; }
+        int inicio = inicio_ev > 0 ? inicio_ev : e.ts;
+        _ivs[chave] = json_encode(oee::Intervalo {
+            posto: posto, tipo: oee::PARADO, inicio: inicio, fim: 0, motivo: motivo
+        });
+        return true;
+    }
+    if (e.tipo != "maquina.liberada") { return false; }
+    int fim = form::inteiro(d, "fim", 0);
+    if (fim <= 0) { fim = e.ts; }
+    int inicio = inicio_ev;
+    if (inicio <= 0) {
+        number minutos = form::numero(d, "minutos", 0.0);
+        inicio = fim - to_int(round(minutos * 60000.0));
+        if (has(_ivs, chave)) { inicio = min(inicio, _iv(chave).inicio); }
+    }
+    if (has(_ivs, chave)) { motivo = _iv(chave).motivo; }
+    _ivs[chave] = json_encode(oee::Intervalo {
+        posto: posto, tipo: oee::PARADO, inicio: inicio, fim: max(fim, inicio), motivo: motivo
+    });
+    return true;
+}
+
+// Fecha em `quando` as execuções abertas da etapa (prefixo da chave):
+// a produção não publica nada ao reiniciar uma etapa EM_EXECUCAO, então
+// a execução velha só fecha quando a nova começa.
+fn _fechar_abertos(string prefixo, int quando) ={
+    for (string c in keys(_ivs)) {
+        if (!starts_with(c, prefixo)) { continue; }
+        oee::Intervalo i = _iv(c);
+        if (i.fim == 0) { _ivs[c] = json_encode(_com_fim(i, i.inicio, max(quando, i.inicio))); }
+    }
+}
+
+// producao.etapa_*: um apontamento por delta e um intervalo OPERANDO
+// por execução. Cada evento traz `inicio`, então a execução se
+// recupera mesmo que o evento de início tenha sido perdido.
+fn _etapa(k::Evento e, map<string,string> d) -> bool ={
+    string posto = upper(form::campo(d, "posto"));
+    if (len(posto) == 0) { return false; }
+    string op = form::campo(d, "op");
+    string etapa = form::campo(d, "etapa");
+    string status = form::campo(d, "status");
+    int inicio = form::inteiro(d, "inicio", 0);
+    int fim = form::inteiro(d, "fim", 0);
+    int fim_ef = fim > 0 ? fim : e.ts;
+    bool mudou = false;
+
+    number boas = form::numero(d, "delta_boas", 0.0);
+    number refugo = form::numero(d, "delta_refugo", 0.0);
+    if (boas + refugo > 0.0) {
+        _aps[to_string(_proximo_ap)] = json_encode(oee::Apontamento {
+            posto: posto, ts: e.ts, tempo_min: form::numero(d, "tempo_min", 0.0),
+            boas: boas, refugo: refugo
+        });
+        _proximo_ap = _proximo_ap + 1;
+        mudou = true;
+    }
+
+    string prefixo = "E" + op + "-" + etapa + "-";
+    if (inicio <= 0) {
+        // Etapa que nunca começou (pulada/erro antes de iniciar).
+        _fechar_abertos(prefixo, e.ts);
+        return true;
+    }
+    string chave = prefixo + to_string(inicio);
+    if (has(_ivs, chave)) {
+        oee::Intervalo i = _iv(chave);
+        if (status != "EM_EXECUCAO" && i.fim == 0) {
+            _ivs[chave] = json_encode(_com_fim(i, i.inicio, max(fim_ef, i.inicio)));
+            mudou = true;
+        }
+        return mudou;
+    }
+    _fechar_abertos(prefixo, inicio);
+    int fim_iv = 0;
+    if (status != "EM_EXECUCAO") { fim_iv = max(fim_ef, inicio); }
+    _ivs[chave] = json_encode(oee::Intervalo {
+        posto: posto, tipo: oee::OPERANDO, inicio: inicio, fim: fim_iv,
+        motivo: "OP " + op + " etapa " + etapa
+    });
+    return true;
+}
+
+fn _limite_alerta() -> number ={
+    string v = replace(trim(env("EMP_OEE_ALERTA")), ",", ".");
+    if (!form::eh_numero(v)) { return 0.6; }
+    return parse_number(v) ?? 0.6;
+}
+
+// indicadores.oee_baixo: OEE da linha nas últimas 8 h abaixo do limite,
+// no máximo um por hora (o instante do último vai para estado.json),
+// e só com base mínima de BASE_ALERTA_MS operando + parado.
+fn _talvez_alertar(int agora) ={
+    int ultimo = 0;
+    if (has(_estado, "ultimo_alerta")) { ultimo = parse_int(_estado["ultimo_alerta"]) ?? 0; }
+    if (ultimo > 0 && agora - ultimo < HORA_MS) { return; }
+    oee::Oee l = oee::linha(_intervalos(), _apontamentos(), cadastros::postos_codigos(),
+                            agora - JANELA_ALERTA_MS, agora);
+    if (l.ms_operando + l.ms_parado < BASE_ALERTA_MS) { return; }
+    number limite = _limite_alerta();
+    if (l.oee >= limite) { return; }
+    _estado["ultimo_alerta"] = to_string(agora);
+    db::salvar(_dir, "estado", _estado);
+    ev::publicar("indicadores.oee_baixo", "indicadores",
+        "oee=" + to_string(oee::arred(l.oee, 10000.0))
+        + "&limite=" + to_string(limite)
+        + "&horas=8"
+        + "&disponibilidade=" + to_string(oee::arred(l.disponibilidade, 10000.0))
+        + "&desempenho=" + to_string(oee::arred(l.desempenho, 10000.0))
+        + "&qualidade=" + to_string(oee::arred(l.qualidade, 10000.0)));
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    map<string,string> d = form::ler(e.dados);
+    bool mudou = false;
+    if (starts_with(e.tipo, "maquina.")) { mudou = _maquina(e, d); }
+    if (starts_with(e.tipo, "producao.etapa_")) { mudou = _etapa(e, d); }
+    if (!mudou) { return true; }
+    if (e.ts - _ultima_poda >= HORA_MS) { _podar(e.ts); }
+    _gravar();
+    _talvez_alertar(e.ts);
+    return true;
+}
+
+// ── consultas ─────────────────────────────────────────────
+
+// Número de uma consulta: `padrao` se ausente, -1 se não for número.
+fn _num_param(k::Requisicao r, string nome, number padrao) -> number ={
+    string v = replace(trim(k::param(r, nome)), ",", ".");
+    if (len(v) == 0) { return padrao; }
+    if (!form::eh_numero(v)) { return -1.0; }
+    return parse_number(v) ?? -1.0;
+}
+
+fn _janela_ms(number horas) -> int ={
+    return to_int(round(horas * 3600000.0));
+}
+
+fn _min(int ms) -> number ={
+    return oee::arred(ms / 60000.0, 100.0);
+}
+
+// Postos consultados: o informado (se cadastrado) ou todos.
+fn _postos(string posto) -> string[] ={
+    if (len(posto) > 0) { return [posto]; }
+    return cadastros::postos_codigos();
+}
+
+fn _estados(k::Requisicao r) -> k::Resposta ={
+    string posto = upper(trim(k::param(r, "posto")));
+    if (len(posto) > 0 && !cadastros::posto_existe(posto)) { return k::erro(404, "posto " + posto + " não cadastrado"); }
+    number horas = _num_param(r, "horas", 8.0);
+    if (horas <= 0.0 || horas > HORAS_MAX) { return k::erro(422, "horas deve estar entre 0 e 168"); }
+    int agora = now_ms();
+    oee::Intervalo[] ivs = _intervalos();
+    string[] itens = [];
+    for (string p in _postos(posto)) {
+        for (oee::Segmento s in oee::segmentos(ivs, p, agora - _janela_ms(horas), agora)) {
+            int fim = s.fim;
+            if (fim >= agora) { fim = 0; }
+            itens = concat(itens, ["{\"posto\":" + json_encode(s.posto)
+                + ",\"estado\":" + json_encode(s.estado)
+                + ",\"inicio\":" + to_string(s.inicio)
+                + ",\"fim\":" + to_string(fim)
+                + ",\"motivo\":" + json_encode(s.motivo) + "}"]);
+        }
+    }
+    return k::ok("[" + join(itens, ",") + "]");
+}
+
+fn _oee(k::Requisicao r) -> k::Resposta ={
+    number horas = _num_param(r, "horas", 8.0);
+    if (horas <= 0.0 || horas > HORAS_MAX) { return k::erro(422, "horas deve estar entre 0 e 168"); }
+    int agora = now_ms();
+    int ini = agora - _janela_ms(horas);
+    oee::Intervalo[] ivs = _intervalos();
+    oee::Apontamento[] aps = _apontamentos();
+    oee::Oee[] todos = [];
+    string[] itens = [];
+    for (string p in cadastros::postos_codigos()) {
+        oee::Oee o = oee::calcular(ivs, aps, p, ini, agora);
+        todos = concat(todos, [o]);
+        itens = concat(itens, ["{\"posto\":" + json_encode(p) + "," + oee::fracoes_json(o)
+            + ",\"min_operando\":" + to_string(_min(o.ms_operando))
+            + ",\"min_parado\":" + to_string(_min(o.ms_parado))
+            + ",\"min_ocioso\":" + to_string(_min(o.ms_ocioso))
+            + ",\"min_teorico\":" + to_string(oee::arred(o.min_teorico, 100.0))
+            + ",\"boas\":" + to_string(o.boas)
+            + ",\"refugo\":" + to_string(o.refugo) + "}"]);
+    }
+    oee::Oee l = oee::agregar(todos);
+    return k::ok("{\"janela_ms\":" + to_string(agora - ini)
+        + ",\"inicio\":" + to_string(ini) + ",\"fim\":" + to_string(agora)
+        + ",\"linha\":{" + oee::fracoes_json(l) + "}"
+        + ",\"postos\":[" + join(itens, ",") + "]}");
+}
+
+fn _serie(k::Requisicao r) -> k::Resposta ={
+    string posto = upper(trim(k::param(r, "posto")));
+    if (len(posto) > 0 && !cadastros::posto_existe(posto)) { return k::erro(404, "posto " + posto + " não cadastrado"); }
+    number horas = _num_param(r, "horas", 24.0);
+    if (horas <= 0.0 || horas > HORAS_MAX) { return k::erro(422, "horas deve estar entre 0 e 168"); }
+    number passo_min = _num_param(r, "passo_min", 60.0);
+    if (passo_min < 1.0) { return k::erro(422, "passo_min deve ser ao menos 1"); }
+    int janela = _janela_ms(horas);
+    int passo = to_int(round(passo_min * 60000.0));
+    if ((janela + passo - 1) / passo > PASSOS_MAX) {
+        return k::erro(422, "muitos pontos: no máximo " + to_string(PASSOS_MAX) + " (aumente passo_min)");
+    }
+    int agora = now_ms();
+    oee::Intervalo[] ivs = _intervalos();
+    oee::Apontamento[] aps = _apontamentos();
+    string[] postos = _postos(posto);
+    string[] itens = [];
+    for (int ini in oee::passos(agora - janela, agora, passo)) {
+        int fim = min(ini + passo, agora);
+        oee::Oee o = oee::linha(ivs, aps, postos, ini, fim);
+        itens = concat(itens, ["{\"inicio\":" + to_string(ini) + ",\"fim\":" + to_string(fim)
+            + "," + oee::fracoes_json(o) + "}"]);
+    }
+    return k::ok("[" + join(itens, ",") + "]");
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (!k::eh_leitura(r)) { return k::nao_encontrado(); }
+    if (r.rota == "/estados")   { return _estados(r); }
+    if (r.rota == "/oee")       { return _oee(r); }
+    if (r.rota == "/oee/serie") { return _serie(r); }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    string[] nenhum = [];
+    return k::Modulo {
+        id: "indicadores",
+        nome: "Histórico do Posto e OEE",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/indicadores",
+        depende: ["cadastros"],
+        assina: ["maquina.*", "producao.etapa_iniciada", "producao.etapa_apontada",
+                 "producao.etapa_concluida", "producao.etapa_falhou"],
+        perfis_escrita: nenhum,
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

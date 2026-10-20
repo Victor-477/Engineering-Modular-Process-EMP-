@@ -1,0 +1,244 @@
+// ============================================================
+//  oee.cryo — cálculo PURO do histórico do posto e do OEE
+//
+//  Sem estado, sem eventos, sem arquivo: recebe os intervalos e os
+//  apontamentos e uma janela [ini, fim) em ms, devolve segmentos e
+//  frações. O módulo indicadores.cryo grava e alimenta; aqui só a
+//  regra, para poder ser testada sem servidor (tests/test_oee.cryo).
+//
+//  Estado de um posto num instante:
+//    PARADO   se houver parada aberta (prevalece sobre tudo);
+//    OPERANDO se houver etapa EM_EXECUCAO no posto;
+//    OCIOSO   no resto.
+//
+//  Definições (janela, parado, operando em minutos da janela):
+//    Disponibilidade = (janela − parado) / janela
+//    Desempenho      = Σ(tempo_min × (delta_boas + delta_refugo)) / operando,
+//                      limitado a 1; 0 se não operou
+//    Qualidade       = Σ delta_boas / Σ(delta_boas + delta_refugo); 1 se nada
+//    OEE             = Disponibilidade × Desempenho × Qualidade
+//  A linha usa as mesmas fórmulas sobre as somas de todos os postos.
+// ============================================================
+
+pub const string PARADO = "PARADO";
+pub const string OPERANDO = "OPERANDO";
+pub const string OCIOSO = "OCIOSO";
+
+// Uma parada (tipo PARADO) ou uma etapa em execução (tipo OPERANDO)
+// de um posto. `fim` 0 = ainda em curso.
+pub struct Intervalo {
+    string posto;
+    string tipo;
+    int inicio;
+    int fim;
+    string motivo;
+}
+
+// Um apontamento de etapa: o que ESTA ação acrescentou.
+pub struct Apontamento {
+    string posto;
+    int ts;
+    number tempo_min;       // minutos por unidade
+    number boas;
+    number refugo;
+}
+
+pub struct Segmento {
+    string posto;
+    string estado;
+    int inicio;
+    int fim;
+    string motivo;
+}
+
+// Somas de uma janela e as frações calculadas a partir delas.
+pub struct Oee {
+    string posto;           // "" = linha
+    int janela_ms;
+    int ms_operando;
+    int ms_parado;
+    int ms_ocioso;
+    number min_teorico;     // Σ tempo_min × (boas + refugo)
+    number boas;
+    number refugo;
+    number disponibilidade;
+    number desempenho;
+    number qualidade;
+    number oee;
+}
+
+// ── janela ────────────────────────────────────────────────
+
+// Fim de um intervalo para cálculo: em curso conta até `agora`.
+pub fn fim_efetivo(Intervalo i, int agora) -> int ={
+    if (i.fim == 0) { return agora; }
+    return i.fim;
+}
+
+// Quanto [a, b) e [ini, fim) têm em comum, em ms (0 se nada).
+pub fn sobreposicao(int a, int b, int ini, int fim) -> int ={
+    int x = max(a, ini);
+    int y = min(b, fim);
+    if (y > x) { return y - x; }
+    return 0;
+}
+
+// ── segmentos de estado ───────────────────────────────────
+
+// O intervalo do `tipo` que cobre [p, q) no posto, ou índice -1.
+// `agora` fecha os intervalos em curso.
+fn _cobre(Intervalo[] ivs, string posto, string tipo, int p, int q, int agora) -> int ={
+    for (int k in 0..len(ivs)) {
+        Intervalo i = ivs[k];
+        if (i.posto == posto && i.tipo == tipo && i.inicio <= p && fim_efetivo(i, agora) >= q) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// A linha do tempo do posto dentro de [ini, fim): segmentos contíguos,
+// sem buracos, do mais antigo ao mais novo. Intervalos em curso contam
+// até `fim` (que é o "agora" de quem pergunta). Dois segmentos vizinhos
+// só se juntam se tiverem o mesmo estado e o mesmo motivo.
+pub fn segmentos(Intervalo[] ivs, string posto, int ini, int fim) -> Segmento[] ={
+    Segmento[] saida = [];
+    if (fim <= ini) { return saida; }
+    int[] marcas = [ini, fim];
+    for (Intervalo i in ivs) {
+        if (i.posto != posto) { continue; }
+        int a = i.inicio;
+        int b = fim_efetivo(i, fim);
+        if (a > ini && a < fim) { marcas = concat(marcas, [a]); }
+        if (b > ini && b < fim) { marcas = concat(marcas, [b]); }
+    }
+    marcas = sort(marcas);
+    int k = 0;
+    while (k < len(marcas) - 1) {
+        int p = marcas[k];
+        int q = marcas[k + 1];
+        k = k + 1;
+        if (q <= p) { continue; }
+        string estado = OCIOSO;
+        string motivo = "";
+        int ip = _cobre(ivs, posto, PARADO, p, q, fim);
+        if (ip >= 0) {
+            estado = PARADO;
+            motivo = ivs[ip].motivo;
+        } else {
+            int io = _cobre(ivs, posto, OPERANDO, p, q, fim);
+            if (io >= 0) {
+                estado = OPERANDO;
+                motivo = ivs[io].motivo;
+            }
+        }
+        int n = len(saida);
+        if (n > 0 && saida[n - 1].estado == estado && saida[n - 1].motivo == motivo) {
+            Segmento ult = saida[n - 1];
+            saida = concat(saida[0..n - 1], [Segmento {
+                posto: posto, estado: estado, inicio: ult.inicio, fim: q, motivo: motivo
+            }]);
+        } else {
+            saida = concat(saida, [Segmento { posto: posto, estado: estado, inicio: p, fim: q, motivo: motivo }]);
+        }
+    }
+    return saida;
+}
+
+// ── frações ───────────────────────────────────────────────
+
+// As quatro frações a partir das somas. Desempenho limitado a 1.
+pub fn fracoes(string posto, int janela_ms, int ms_operando, int ms_parado, int ms_ocioso,
+               number min_teorico, number boas, number refugo) -> Oee ={
+    number disp = 0.0;
+    if (janela_ms > 0) { disp = (janela_ms - ms_parado) * 1.0 / janela_ms; }
+    number desemp = 0.0;
+    if (ms_operando > 0) { desemp = min(1.0, min_teorico / (ms_operando / 60000.0)); }
+    number qual = 1.0;
+    if (boas + refugo > 0.0) { qual = boas / (boas + refugo); }
+    return Oee {
+        posto: posto, janela_ms: janela_ms, ms_operando: ms_operando, ms_parado: ms_parado,
+        ms_ocioso: ms_ocioso, min_teorico: min_teorico, boas: boas, refugo: refugo,
+        disponibilidade: disp, desempenho: desemp, qualidade: qual, oee: disp * desemp * qual
+    };
+}
+
+// OEE de um posto na janela [ini, fim).
+pub fn calcular(Intervalo[] ivs, Apontamento[] aps, string posto, int ini, int fim) -> Oee ={
+    int operando = 0;
+    int parado = 0;
+    int ocioso = 0;
+    for (Segmento s in segmentos(ivs, posto, ini, fim)) {
+        int d = s.fim - s.inicio;
+        if (s.estado == PARADO) { parado = parado + d; }
+        else if (s.estado == OPERANDO) { operando = operando + d; }
+        else { ocioso = ocioso + d; }
+    }
+    number teorico = 0.0;
+    number boas = 0.0;
+    number refugo = 0.0;
+    for (Apontamento a in aps) {
+        if (a.posto != posto || a.ts < ini || a.ts >= fim) { continue; }
+        teorico = teorico + a.tempo_min * (a.boas + a.refugo);
+        boas = boas + a.boas;
+        refugo = refugo + a.refugo;
+    }
+    return fracoes(posto, max(fim - ini, 0), operando, parado, ocioso, teorico, boas, refugo);
+}
+
+// A linha: as mesmas fórmulas sobre as somas de todos os postos.
+pub fn agregar(Oee[] itens) -> Oee ={
+    int janela = 0;
+    int operando = 0;
+    int parado = 0;
+    int ocioso = 0;
+    number teorico = 0.0;
+    number boas = 0.0;
+    number refugo = 0.0;
+    for (Oee o in itens) {
+        janela = janela + o.janela_ms;
+        operando = operando + o.ms_operando;
+        parado = parado + o.ms_parado;
+        ocioso = ocioso + o.ms_ocioso;
+        teorico = teorico + o.min_teorico;
+        boas = boas + o.boas;
+        refugo = refugo + o.refugo;
+    }
+    return fracoes("", janela, operando, parado, ocioso, teorico, boas, refugo);
+}
+
+// A linha na janela: um Oee por posto e a agregação.
+pub fn linha(Intervalo[] ivs, Apontamento[] aps, string[] postos, int ini, int fim) -> Oee ={
+    Oee[] itens = [];
+    for (string p in postos) {
+        itens = concat(itens, [calcular(ivs, aps, p, ini, fim)]);
+    }
+    return agregar(itens);
+}
+
+// Janelas consecutivas de `passo_ms` cobrindo [ini, fim); a última pode
+// ser mais curta. Devolve os inícios.
+pub fn passos(int ini, int fim, int passo_ms) -> int[] ={
+    int[] saida = [];
+    if (passo_ms <= 0) { return saida; }
+    int t = ini;
+    while (t < fim) {
+        saida = concat(saida, [t]);
+        t = t + passo_ms;
+    }
+    return saida;
+}
+
+// ── apresentação ──────────────────────────────────────────
+
+pub fn arred(number x, number casas) -> number ={
+    return round(x * casas) / casas;
+}
+
+// As frações com 4 casas, como objeto JSON (sem chaves externas).
+pub fn fracoes_json(Oee o) -> string ={
+    return "\"disponibilidade\":" + to_string(arred(o.disponibilidade, 10000.0))
+        + ",\"desempenho\":" + to_string(arred(o.desempenho, 10000.0))
+        + ",\"qualidade\":" + to_string(arred(o.qualidade, 10000.0))
+        + ",\"oee\":" + to_string(arred(o.oee, 10000.0));
+}
