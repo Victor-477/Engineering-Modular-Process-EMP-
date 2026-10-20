@@ -45,8 +45,10 @@
 //  Eventos publicados:
 //    op.criada, op.liberada, op.cancelada, op.concluida,
 //    producao.apontada (op, produto, boa, refugo, posto, operador),
-//    producao.etapa_iniciada, producao.etapa_concluida, producao.etapa_falhou
-//      (op, etapa, posto, operacao, boas, refugo, operador, motivo, status)
+//    producao.etapa_iniciada, producao.etapa_apontada, producao.etapa_concluida,
+//    producao.etapa_falhou
+//      (op, produto, etapa, posto, operacao, tempo_min, entrada, boas, refugo,
+//       delta_boas, delta_refugo, inicio, fim, operador, motivo, status)
 //
 //  Eventos assinados:
 //    maquina.parada / maquina.liberada — um posto parado recusa iniciar,
@@ -112,12 +114,22 @@ fn _evento_op(string tipo, OrdemProducao op) ={
         + "&quantidade=" + to_string(op.quantidade));
 }
 
-fn _evento_etapa(string tipo, OrdemProducao op, etp::EtapaOP e, string operador, string motivo) ={
+// `boas`/`refugo` são os ACUMULADOS da etapa; `delta_boas`/`delta_refugo`
+// o que esta ação acrescentou. `tempo_min` (por unidade), `entrada`,
+// `inicio`/`fim` (ms) e `produto` existem para quem calcula indicadores
+// (OEE) só a partir dos eventos, sem importar a produção.
+fn _evento_etapa(string tipo, OrdemProducao op, etp::EtapaOP e, string operador, string motivo,
+                 number delta_boas, number delta_refugo) ={
     ev::publicar(tipo, "producao", "op=" + to_string(op.id)
+        + "&produto=" + url_encode(op.produto)
         + "&etapa=" + to_string(e.numero)
         + "&posto=" + url_encode(e.posto)
         + "&operacao=" + url_encode(e.operacao)
+        + "&tempo_min=" + to_string(e.tempo_min)
+        + "&entrada=" + to_string(e.entrada)
         + "&boas=" + to_string(e.boas) + "&refugo=" + to_string(e.refugo)
+        + "&delta_boas=" + to_string(delta_boas) + "&delta_refugo=" + to_string(delta_refugo)
+        + "&inicio=" + to_string(e.inicio) + "&fim=" + to_string(e.fim)
         + "&operador=" + url_encode(operador)
         + "&motivo=" + url_encode(motivo)
         + "&status=" + e.status);
@@ -314,10 +326,11 @@ fn _aplicar(OrdemProducao op, etp::Execucao ex, int i, etp::Resultado res, strin
     OrdemProducao nova = _com(op, status, produzido, refugo_op);
     _gravar(nova);
 
-    if (acao == "iniciar") { _evento_etapa("producao.etapa_iniciada", nova, e, operador, ""); }
-    if (acao == "erro") { _evento_etapa("producao.etapa_falhou", nova, e, operador, motivo); }
+    if (acao == "iniciar") { _evento_etapa("producao.etapa_iniciada", nova, e, operador, "", 0.0, 0.0); }
+    if (acao == "erro") { _evento_etapa("producao.etapa_falhou", nova, e, operador, motivo, 0.0, 0.0); }
+    if (acao == "apontar") { _evento_etapa("producao.etapa_apontada", nova, e, operador, "", boas, refugo); }
     if (publica) { _evento_apontada(nova, boa_pub, refugo_pub, e.posto, operador); }
-    if (res.concluiu) { _evento_etapa("producao.etapa_concluida", nova, e, operador, motivo); }
+    if (res.concluiu) { _evento_etapa("producao.etapa_concluida", nova, e, operador, motivo, 0.0, 0.0); }
     if (terminou && op.status != "CONCLUIDA") { _evento_op("op.concluida", nova); }
     return nova;
 }
