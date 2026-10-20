@@ -1,0 +1,165 @@
+// ============================================================
+//  demo_estoque.cryo — carga do estoque endereçado (fase 2, frente B)
+//
+//  Roda DEPOIS de tools/demo.cryo, no mesmo EMP em MODO DEV
+//  (ERP_TOKENS vazio — http_post não envia token, L-09):
+//
+//    python ../Burnout/cryoc.py tools/demo.cryo --backend pyro --run
+//    python ../Burnout/cryoc.py tools/demo_estoque.cryo --backend pyro --run
+//    EMP_URL=http://127.0.0.1:8080   (padrão)
+//
+//  Cria endereços (almoxarifado, linha da montagem, expedição,
+//  quarentena), abastece a linha por transferência, produz SUP-01 no
+//  MONT-01 (o backflush sai do endereço LINHA) e cruza o mínimo de
+//  parafusos (sugestão de compra + estoque.abaixo_minimo). Confere cada
+//  passo e termina com "feito: N falha(s)".
+// ============================================================
+
+string _url = env("EMP_URL");
+if (len(_url) == 0) { _url = "http://127.0.0.1:8080"; }
+
+int _falhas = 0;
+
+fn post(string caminho, string corpo) -> string ={
+    string r = http_post(_url + caminho, corpo);
+    if (len(r) == 0 || starts_with(r, "{\"erro\"")) {
+        _falhas = _falhas + 1;
+        print("  ! " + caminho + "  " + corpo + "  -> " + r);
+    }
+    return r;
+}
+
+fn confere(bool ok, string o_que) ={
+    if (ok) {
+        print("  ok  " + o_que);
+    } else {
+        _falhas = _falhas + 1;
+        print("  !!  " + o_que);
+    }
+}
+
+fn id_de(string json) -> string ={
+    int i = find(json, "\"id\":");
+    if (i < 0) { return "0"; }
+    string resto = json[i + 5..];
+    int fim = find(resto, ",");
+    if (fim < 0) { fim = find(resto, "}"); }
+    return resto[0..fim];
+}
+
+// json_decode é seguro aqui: o texto vem do próprio EMP (L-05).
+struct Posicao {
+    string endereco;
+    string produto;
+    number quantidade;
+}
+
+fn posicoes() -> Posicao[] ={
+    return json_decode(http_get(_url + "/api/estoque/posicoes")) as Posicao[];
+}
+
+fn total(string produto) -> number ={
+    map<string,string> s = json_decode(http_get(_url + "/api/estoque/saldos")) as map<string,string>;
+    if (!has(s, produto)) { return 0.0; }
+    return parse_number(s[produto]) ?? 0.0;
+}
+
+fn no_endereco(string endereco, string produto) -> number ={
+    for (Posicao p in posicoes()) {
+        if (p.endereco == endereco && p.produto == produto) { return p.quantidade; }
+    }
+    return 0.0;
+}
+
+fn perto(number a, number b) -> bool ={
+    return abs(a - b) < 0.0001;
+}
+
+// Para cada produto, a soma das posições bate com o total de /saldos.
+fn soma_bate() -> bool ={
+    map<string,string> totais = json_decode(http_get(_url + "/api/estoque/saldos")) as map<string,string>;
+    Posicao[] ps = posicoes();
+    for (string produto in keys(totais)) {
+        number soma = 0.0;
+        for (Posicao p in ps) {
+            if (p.produto == produto) { soma = soma + p.quantidade; }
+        }
+        if (!perto(soma, parse_number(totais[produto]) ?? 0.0)) {
+            print("    " + produto + ": soma " + to_string(soma) + " ≠ total " + totais[produto]);
+            return false;
+        }
+    }
+    return true;
+}
+
+print("estoque endereçado em " + _url);
+string saude = http_get(_url + "/api/sistema/saude");
+if (!contains(saude, "\"status\":\"ok\"")) {
+    print("EMP não respondeu (ou exige token). Suba o emp.exe em modo dev e tente de novo.");
+} else if (!contains(http_get(_url + "/api/estoque/saldos"), "PARAF-M6")) {
+    print("Sem os dados de tools/demo.cryo: rode-a antes.");
+} else {
+    print("- totais depois da demo.cryo");
+    print("  " + http_get(_url + "/api/estoque/saldos"));
+
+    print("- endereços");
+    post("/api/estoque/enderecos", "codigo=ALMOX-MP&descricao=" + url_encode("Almoxarifado de matéria-prima") + "&tipo=ALMOXARIFADO");
+    post("/api/estoque/enderecos", "codigo=LINHA-MONT&descricao=" + url_encode("Supermercado da montagem") + "&tipo=LINHA&posto=MONT-01");
+    post("/api/estoque/enderecos", "codigo=EXP-01&descricao=" + url_encode("Doca de expedição") + "&tipo=EXPEDICAO");
+    post("/api/estoque/enderecos", "codigo=QUAR-01&descricao=" + url_encode("Quarentena da qualidade") + "&tipo=QUARENTENA");
+    string dup = http_post(_url + "/api/estoque/enderecos", "codigo=LINHA-MONT2&tipo=LINHA&posto=MONT-01");
+    confere(contains(dup, "já tem o endereço LINHA"), "segundo endereço LINHA no MONT-01 recusado");
+    print("  " + http_get(_url + "/api/estoque/enderecos"));
+
+    print("- entrada endereçada e transferências");
+    number buchas = total("BUCHA-08");
+    post("/api/estoque/entrada", "produto=BUCHA-08&quantidade=500&origem=NF+10411+Ciser&endereco=ALMOX-MP");
+    confere(perto(no_endereco("ALMOX-MP", "BUCHA-08"), 500.0) && perto(total("BUCHA-08"), buchas + 500.0),
+        "entrada no ALMOX-MP soma no total");
+    number parafusos = total("PARAF-M6");
+    post("/api/estoque/transferir", "produto=PARAF-M6&de=GERAL&para=LINHA-MONT&quantidade=1000");
+    post("/api/estoque/transferir", "produto=TINTA-PO&de=GERAL&para=LINHA-MONT&quantidade=5");
+    confere(perto(total("PARAF-M6"), parafusos), "transferência não muda o total de PARAF-M6");
+    confere(perto(no_endereco("LINHA-MONT", "PARAF-M6"), 1000.0), "1000 PARAF-M6 na LINHA-MONT");
+    string sem_saldo = http_post(_url + "/api/estoque/transferir", "produto=PARAF-M6&de=EXP-01&para=GERAL&quantidade=1");
+    confere(starts_with(sem_saldo, "{\"erro\""), "transferir de onde não há saldo é recusado");
+    print("  " + http_get(_url + "/api/estoque/saldos?produto=PARAF-M6"));
+    confere(soma_bate(), "saldo por endereço soma o total (todos os produtos)");
+
+    print("- regra de reposição");
+    post("/api/estoque/reposicao", "produto=PARAF-M6&minimo=" + to_string(parafusos - 10.0)
+        + "&maximo=8000&tipo=COMPRAR");
+    post("/api/estoque/reposicao", "produto=SUP-01&minimo=100&maximo=400&tipo=PRODUZIR&endereco=GERAL");
+    confere(!contains(http_get(_url + "/api/estoque/sugestoes"), "PARAF-M6"), "PARAF-M6 ainda acima do mínimo");
+
+    print("- produção na montagem (backflush da LINHA-MONT)");
+    string op = id_de(post("/api/producao/ordens", "produto=SUP-01&quantidade=20&posto=MONT-01"));
+    post("/api/producao/liberar?id=" + op, "");
+    number base_geral = no_endereco("GERAL", "BASE-SUP");
+    post("/api/producao/apontar?id=" + op, "boa=19&refugo=1&operador=ana");
+    // 20 SUP-01 consumidos: 40 PARAF-M6 e 0,6 TINTA-PO da linha; BASE-SUP do GERAL.
+    confere(perto(no_endereco("LINHA-MONT", "PARAF-M6"), 960.0), "40 PARAF-M6 saíram da LINHA-MONT");
+    confere(perto(no_endereco("LINHA-MONT", "TINTA-PO"), 4.4), "0,6 TINTA-PO saíram da LINHA-MONT");
+    confere(perto(no_endereco("GERAL", "BASE-SUP"), base_geral - 20.0), "BASE-SUP (fora da linha) saiu do GERAL");
+    confere(perto(total("PARAF-M6"), parafusos - 40.0), "total de PARAF-M6 caiu 40");
+    string movs = http_get(_url + "/api/estoque/movimentos");
+    confere(contains(movs, "\"tipo\":\"CONSUMO\",\"quantidade\":-40,\"saldo\":" + to_string(parafusos - 40.0)
+        + ",\"origem\":\"OP " + op + "\""), "movimento CONSUMO da OP " + op);
+    confere(soma_bate(), "saldo por endereço soma o total depois do backflush");
+
+    print("- sugestões de reposição");
+    string sug = http_get(_url + "/api/estoque/sugestoes");
+    print("  " + sug);
+    confere(contains(sug, "\"produto\":\"PARAF-M6\"") && contains(sug, "\"tipo\":\"COMPRAR\""),
+        "PARAF-M6 caiu abaixo do mínimo: sugestão de compra");
+    confere(contains(http_get(_url + "/api/sistema/eventos?n=60"), "\"tipo\":\"estoque.abaixo_minimo\""),
+        "evento estoque.abaixo_minimo publicado");
+
+    print("- quarentena e expedição");
+    post("/api/estoque/transferir", "produto=SUP-02&de=GERAL&para=QUAR-01&quantidade=6");
+    post("/api/estoque/transferir", "produto=SUP-01&de=GERAL&para=EXP-01&quantidade=30");
+    print("  " + http_get(_url + "/api/estoque/posicoes?endereco=EXP-01"));
+    confere(soma_bate(), "saldo por endereço soma o total no fim");
+
+    print("feito: " + to_string(_falhas) + " falha(s)");
+}

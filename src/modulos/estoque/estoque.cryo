@@ -1,21 +1,39 @@
 // ============================================================
-//  estoque.cryo — Módulo de Estoque
+//  estoque.cryo — Módulo de Estoque endereçado e reposição
 //
-//  Não conhece o módulo de produção: reage a EVENTOS.
-//    producao.apontada -> entrada do produto bom
+//  Não conhece o módulo de produção nem o de pedidos: reage a EVENTOS.
+//    producao.apontada -> entrada do produto bom no GERAL
 //                       + baixa por estrutura (backflush) dos
-//                         componentes de (boa + refugo)
-//    op.liberada       -> confere disponibilidade dos componentes e
-//                         publica estoque.falta se faltar material
+//                         componentes de (boa + refugo): primeiro do
+//                         endereço LINHA do posto da etapa, até o saldo
+//                         que ele tiver; o resto do GERAL
+//    op.liberada       -> confere disponibilidade (saldo total) dos
+//                         componentes e publica estoque.falta se faltar
+//    pedido.expedido   -> saída EXPEDICAO de cada item: dos endereços
+//                         EXPEDICAO até o saldo deles; o resto do GERAL
+//
+//  Saldo por produto × endereço (tblBuffer/tblBufferPos do MES4). O
+//  endereço GERAL existe sempre; dados da v0.2 (saldo só por produto)
+//  viram saldo no GERAL ao carregar (ver iniciar). Regras de reposição
+//  mín./máx. (tblAutomaticOrder) geram sugestões e o evento
+//  estoque.abaixo_minimo ao cruzar para baixo do mínimo.
 //
 //  Rotas (prefixo /api/estoque):
-//    GET  /saldos[?produto=X]
+//    GET  /saldos                {produto: saldo_total}   (formato da v0.2)
+//    GET  /saldos?produto=X      {produto, saldo, por_endereco:{END: qtd}}
+//    GET  /enderecos             [{codigo, descricao, tipo, posto}]
+//    POST /enderecos             codigo=&descricao=&tipo=&posto=
+//    GET  /posicoes[?endereco=]  [{endereco, produto, quantidade}] (só ≠ 0)
 //    GET  /movimentos
-//    POST /entrada     produto=&quantidade=&origem=
-//    POST /ajuste      produto=&saldo=&motivo=
+//    POST /entrada               produto=&quantidade=&origem=&endereco=(GERAL)
+//    POST /ajuste                produto=&saldo=&motivo=&endereco=(GERAL)
+//    POST /transferir            produto=&de=&para=&quantidade=
+//    GET  /reposicao             [{produto, minimo, maximo, tipo, endereco}]
+//    POST /reposicao             produto=&minimo=&maximo=&tipo=&endereco=
+//    GET  /sugestoes             regras com saldo < mínimo
 //
 //  Eventos publicados: estoque.movimentado, estoque.falta,
-//                      estoque.negativo
+//                      estoque.negativo, estoque.abaixo_minimo
 // ============================================================
 
 import "../../nucleo/contrato.cryo" as k;
@@ -23,22 +41,66 @@ import "../../nucleo/persist.cryo"  as db;
 import "../../nucleo/eventos.cryo"  as ev;
 import "../../nucleo/form.cryo"     as form;
 import "../cadastros/cadastros.cryo" as cadastros;
+import "regras.cryo"                as rg;
 
 string _dir = "";
-map<string,string> _saldos = {};       // produto -> saldo (texto)
+map<string,string> _saldos = {};       // produto -> saldo TOTAL (texto; formato da v0.2)
+map<string,string> _posicoes = {};     // "ENDERECO|PRODUTO" -> saldo (texto)
+map<string,string> _enderecos = {};    // codigo -> json(rg::Endereco)
+map<string,string> _regras = {};       // produto -> json(rg::Regra)
 map<string,string> _movimentos = {};   // id -> json
 int _proximo = 1;
+
+// ── saldos ────────────────────────────────────────────────
 
 pub fn saldo(string produto) -> number ={
     if (!has(_saldos, produto)) { return 0.0; }
     return parse_number(_saldos[produto]) ?? 0.0;
 }
 
-// Um movimento grava as DUAS coleções. Não há transação na
-// linguagem (L-02): se a segunda gravação falhar, saldo e histórico
-// divergem até a próxima reconciliação.
-fn _movimentar(string produto, number qtd, string tipo, string origem) -> bool ={
+pub fn saldo_em(string endereco, string produto) -> number ={
+    string ch = rg::chave(endereco, produto);
+    if (!has(_posicoes, ch)) { return 0.0; }
+    return parse_number(_posicoes[ch]) ?? 0.0;
+}
+
+fn _endereco_existe(string codigo) -> bool ={
+    return has(_enderecos, codigo);
+}
+
+fn _endereco(string codigo) -> rg::Endereco ={
+    return json_decode(_enderecos[codigo]) as rg::Endereco;
+}
+
+// O endereço LINHA que atende o posto ("" se nenhum).
+fn _linha_do_posto(string posto) -> string ={
+    if (len(posto) == 0) { return ""; }
+    for (string c in sort(keys(_enderecos))) {
+        rg::Endereco e = _endereco(c);
+        if (e.tipo == "LINHA" && e.posto == posto) { return c; }
+    }
+    return "";
+}
+
+fn _enderecos_do_tipo(string tipo) -> string[] ={
+    string[] lista = [];
+    for (string c in sort(keys(_enderecos))) {
+        if (_endereco(c).tipo == tipo) { lista = concat(lista, [c]); }
+    }
+    return lista;
+}
+
+// Um movimento grava TRÊS coleções, nesta ordem: posições (a verdade),
+// totais e histórico. Não há transação na linguagem (L-02): se uma
+// gravação falhar no meio, iniciar() reconcilia os totais a partir das
+// posições; o histórico pode ficar sem o movimento.
+//
+// O total é somado incrementalmente (saldo + qtd), exatamente como na
+// v0.2, para que os totais não mudem nem na última casa decimal.
+fn _movimentar(string produto, string endereco, number qtd, string tipo, string origem) -> bool ={
+    number novo_end = saldo_em(endereco, produto) + qtd;
     number novo = saldo(produto) + qtd;
+    _posicoes[rg::chave(endereco, produto)] = to_string(novo_end);
     _saldos[produto] = to_string(novo);
     string id = to_string(_proximo);
     _proximo = _proximo + 1;
@@ -48,35 +110,157 @@ fn _movimentar(string produto, number qtd, string tipo, string origem) -> bool =
         + ",\"quantidade\":" + to_string(qtd)
         + ",\"saldo\":" + to_string(novo)
         + ",\"origem\":" + json_encode(origem)
-        + ",\"ts\":" + to_string(now_ms()) + "}";
-    bool ok = db::salvar(_dir, "saldos", _saldos) && db::salvar(_dir, "movimentos", _movimentos);
+        + ",\"ts\":" + to_string(now_ms())
+        + ",\"endereco\":" + json_encode(endereco)
+        + ",\"saldo_endereco\":" + to_string(novo_end) + "}";
+    bool ok = db::salvar(_dir, "posicoes", _posicoes)
+        && db::salvar(_dir, "saldos", _saldos)
+        && db::salvar(_dir, "movimentos", _movimentos);
     ev::publicar("estoque.movimentado", "estoque",
-        "produto=" + url_encode(produto) + "&quantidade=" + to_string(qtd) + "&saldo=" + to_string(novo));
-    if (novo < 0.0) {
+        "produto=" + url_encode(produto) + "&quantidade=" + to_string(qtd) + "&saldo=" + to_string(novo)
+        + "&endereco=" + url_encode(endereco) + "&saldo_endereco=" + to_string(novo_end));
+    // `saldo` é o do endereço que ficou negativo (na v0.2, só havia o
+    // GERAL, então era o total); `saldo_total` vai junto.
+    if (novo_end < 0.0) {
         ev::publicar("estoque.negativo", "estoque",
-            "produto=" + url_encode(produto) + "&saldo=" + to_string(novo));
+            "produto=" + url_encode(produto) + "&saldo=" + to_string(novo_end)
+            + "&endereco=" + url_encode(endereco) + "&saldo_total=" + to_string(novo));
     }
     return ok;
 }
+
+// Saída de `precisa` unidades: dos endereços `preferidos`, em ordem,
+// até o saldo positivo de cada um; o que faltar sai do GERAL (que pode
+// ficar negativo). Sem preferidos (ou sem saldo neles) é exatamente o
+// movimento único da v0.2.
+fn _consumir(string produto, string[] preferidos, number precisa, string tipo, string origem) ={
+    number restante = precisa;
+    bool moveu = false;
+    for (string end in preferidos) {
+        if (end == rg::GERAL) { continue; }
+        number tira = rg::repartir(restante, saldo_em(end, produto));
+        if (tira > 0.0) {
+            _movimentar(produto, end, 0.0 - tira, tipo, origem);
+            restante = restante - tira;
+            moveu = true;
+        }
+    }
+    if (restante > 0.0 || !moveu) {
+        _movimentar(produto, rg::GERAL, 0.0 - restante, tipo, origem);
+    }
+}
+
+// ── reposição ─────────────────────────────────────────────
+
+fn _tem_regra(string produto) -> bool ={
+    return has(_regras, produto);
+}
+
+fn _regra(string produto) -> rg::Regra ={
+    return json_decode(_regras[produto]) as rg::Regra;
+}
+
+// O saldo que a regra vigia: o do endereço dela, ou o total.
+fn _saldo_regra(rg::Regra r) -> number ={
+    if (len(r.endereco) == 0) { return saldo(r.produto); }
+    return saldo_em(r.endereco, r.produto);
+}
+
+// Fotografia antes de uma operação (0 sem regra: não é usada).
+fn _antes(string produto) -> number ={
+    if (!_tem_regra(produto)) { return 0.0; }
+    return _saldo_regra(_regra(produto));
+}
+
+// Depois da operação inteira (uma transferência são dois movimentos:
+// o total não pode "cruzar" só porque a saída veio antes da entrada).
+fn _conferir_minimo(string produto, number antes) -> bool ={
+    if (!_tem_regra(produto)) { return false; }
+    rg::Regra r = _regra(produto);
+    number depois = _saldo_regra(r);
+    if (!rg::cruzou_abaixo(r, antes, depois)) { return false; }
+    ev::publicar("estoque.abaixo_minimo", "estoque",
+        "produto=" + url_encode(produto) + "&saldo=" + to_string(depois)
+        + "&minimo=" + to_string(r.minimo) + "&sugerido=" + to_string(rg::sugerido(r, depois))
+        + "&tipo=" + r.tipo + "&maximo=" + to_string(r.maximo)
+        + "&endereco=" + url_encode(r.endereco));
+    return true;
+}
+
+fn _sugestoes() -> string ={
+    string[] itens = [];
+    for (string p in sort(keys(_regras))) {
+        rg::Regra r = _regra(p);
+        number s = _saldo_regra(r);
+        if (!rg::abaixo(r, s)) { continue; }
+        itens = concat(itens, ["{\"produto\":" + json_encode(p)
+            + ",\"saldo\":" + to_string(s)
+            + ",\"minimo\":" + to_string(r.minimo)
+            + ",\"maximo\":" + to_string(r.maximo)
+            + ",\"quantidade_sugerida\":" + to_string(rg::sugerido(r, s))
+            + ",\"tipo\":" + json_encode(r.tipo)
+            + ",\"endereco\":" + json_encode(r.endereco) + "}"]);
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+// ── ciclo de vida ─────────────────────────────────────────
 
 fn iniciar(string dir) -> bool ={
     _dir = dir;
     _saldos = db::carregar(dir, "saldos");
     _movimentos = db::carregar(dir, "movimentos");
+    _enderecos = db::carregar(dir, "enderecos");
+    _regras = db::carregar(dir, "reposicao");
     _proximo = db::maior_id(_movimentos) + 1;
+    if (!has(_enderecos, rg::GERAL)) { _enderecos[rg::GERAL] = json_encode(rg::geral()); }
+    if (file_exists(db::caminho(dir, "posicoes"))) {
+        _posicoes = db::carregar(dir, "posicoes");
+        // Reconcilia: as posições são a verdade. Um total que diverge
+        // da soma (gravação interrompida, L-02) é recalculado; um que
+        // bate fica como está (sem ruído de ponto flutuante).
+        map<string,string> soma = {};
+        for (string ch in keys(_posicoes)) {
+            string p = rg::produto_da_chave(ch);
+            number atual = 0.0;
+            if (has(soma, p)) { atual = parse_number(soma[p]) ?? 0.0; }
+            soma[p] = to_string(atual + (parse_number(_posicoes[ch]) ?? 0.0));
+        }
+        for (string p in keys(soma)) {
+            number s = parse_number(soma[p]) ?? 0.0;
+            if (abs(s - saldo(p)) > 0.000001) { _saldos[p] = soma[p]; }
+        }
+    } else {
+        // Migração da v0.2: saldo só por produto -> endereço GERAL. Só
+        // em memória; o primeiro movimento grava posicoes.json.
+        map<string,string> migradas = {};
+        _posicoes = migradas;
+        for (string p in keys(_saldos)) {
+            _posicoes[rg::chave(rg::GERAL, p)] = _saldos[p];
+        }
+    }
     return true;
 }
+
+// ── eventos ───────────────────────────────────────────────
 
 fn _backflush(map<string,string> d) ={
     string produto = form::campo(d, "produto");
     number boa = form::numero(d, "boa", 0.0);
     number consumida = boa + form::numero(d, "refugo", 0.0);
     string origem = "OP " + form::campo(d, "op");
+    string linha = _linha_do_posto(form::campo(d, "posto"));
+    string[] preferidos = [];
+    if (len(linha) > 0) { preferidos = [linha]; }
     if (boa > 0.0) {
-        _movimentar(produto, boa, "ENTRADA_PRODUCAO", origem);
+        number antes = _antes(produto);
+        _movimentar(produto, rg::GERAL, boa, "ENTRADA_PRODUCAO", origem);
+        _conferir_minimo(produto, antes);
     }
     for (cadastros::ItemEstrutura it in cadastros::estrutura(produto)) {
-        _movimentar(it.componente, 0.0 - it.quantidade * consumida, "CONSUMO", origem);
+        number antes = _antes(it.componente);
+        _consumir(it.componente, preferidos, it.quantidade * consumida, "CONSUMO", origem);
+        _conferir_minimo(it.componente, antes);
     }
 }
 
@@ -94,55 +278,211 @@ fn _conferir(map<string,string> d) ={
     }
 }
 
+fn _expedir(map<string,string> d) ={
+    string origem = "pedido " + form::campo(d, "pedido");
+    string[] expedicao = _enderecos_do_tipo("EXPEDICAO");
+    for (rg::ItemPedido it in rg::ler_itens(form::campo(d, "itens"))) {
+        number antes = _antes(it.produto);
+        _consumir(it.produto, expedicao, it.quantidade, "EXPEDICAO", origem);
+        _conferir_minimo(it.produto, antes);
+    }
+}
+
 fn ao_evento(k::Evento e) -> bool ={
     map<string,string> d = form::ler(e.dados);
     if (e.tipo == "producao.apontada") { _backflush(d); }
     if (e.tipo == "op.liberada") { _conferir(d); }
+    if (e.tipo == "pedido.expedido") { _expedir(d); }
     return true;
+}
+
+// ── rotas ─────────────────────────────────────────────────
+
+fn _lista(map<string,string> m) -> string ={
+    string[] itens = [];
+    for (string c in sort(keys(m))) { itens = concat(itens, [m[c]]); }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _saldo_produto(string p) -> string ={
+    string[] por = [];
+    for (string ch in sort(keys(_posicoes))) {
+        if (rg::produto_da_chave(ch) != p) { continue; }
+        number q = parse_number(_posicoes[ch]) ?? 0.0;
+        if (q == 0.0) { continue; }
+        por = concat(por, [json_encode(rg::endereco_da_chave(ch)) + ":" + to_string(q)]);
+    }
+    return "{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p))
+        + ",\"por_endereco\":{" + join(por, ",") + "}}";
+}
+
+fn _posicoes_json(string endereco) -> string ={
+    string[] itens = [];
+    for (string ch in sort(keys(_posicoes))) {
+        string end = rg::endereco_da_chave(ch);
+        if (len(endereco) > 0 && end != endereco) { continue; }
+        number q = parse_number(_posicoes[ch]) ?? 0.0;
+        if (q == 0.0) { continue; }
+        itens = concat(itens, ["{\"endereco\":" + json_encode(end)
+            + ",\"produto\":" + json_encode(rg::produto_da_chave(ch))
+            + ",\"quantidade\":" + to_string(q) + "}"]);
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+// Movimentos da v0.2 não têm endereço: eram todos do GERAL.
+fn _movimentos_json() -> string ={
+    string[] itens = [];
+    for (string id in keys(_movimentos)) {
+        string m = _movimentos[id];
+        if (!contains(m, "\"endereco\":") && ends_with(m, "}")) {
+            m = m[0..len(m) - 1] + ",\"endereco\":\"GERAL\"}";
+        }
+        itens = concat(itens, [m]);
+    }
+    return "[" + join(itens, ",") + "]";
+}
+
+fn _resposta_saldo(string p, string endereco) -> string ={
+    return "{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p))
+        + ",\"endereco\":" + json_encode(endereco)
+        + ",\"saldo_endereco\":" + to_string(saldo_em(endereco, p)) + "}";
+}
+
+fn _salvar_endereco(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string tipo = upper(form::campo(f, "tipo"));
+    string posto = "";
+    if (tipo == "LINHA") { posto = upper(form::campo(f, "posto")); }
+    rg::Endereco e = rg::Endereco {
+        codigo: upper(form::campo(f, "codigo")),
+        descricao: form::campo(f, "descricao"),
+        tipo: tipo,
+        posto: posto
+    };
+    string falha = rg::validar_endereco(e, cadastros::posto_existe(posto), _linha_do_posto(posto));
+    if (e.codigo == rg::GERAL) { return k::erro(409, falha); }
+    if (len(falha) > 0) {
+        if (starts_with(falha, "o posto ")) { return k::erro(409, falha); }
+        return k::erro(422, falha);
+    }
+    _enderecos[e.codigo] = json_encode(e);
+    if (!db::salvar(_dir, "enderecos", _enderecos)) { return k::erro(500, "falha ao gravar endereços"); }
+    return k::criado(_enderecos[e.codigo]);
+}
+
+fn _entrada(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string p = upper(form::campo(f, "produto"));
+    number q = form::numero(f, "quantidade", 0.0);
+    string end = upper(form::campo_ou(f, "endereco", rg::GERAL));
+    if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
+    if (q <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
+    if (!_endereco_existe(end)) { return k::erro(422, "endereço " + end + " não cadastrado"); }
+    number antes = _antes(p);
+    _movimentar(p, end, q, "ENTRADA", form::campo_ou(f, "origem", "manual:" + r.usuario));
+    _conferir_minimo(p, antes);
+    return k::criado(_resposta_saldo(p, end));
+}
+
+fn _ajuste(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string p = upper(form::campo(f, "produto"));
+    string end = upper(form::campo_ou(f, "endereco", rg::GERAL));
+    if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
+    if (!_endereco_existe(end)) { return k::erro(422, "endereço " + end + " não cadastrado"); }
+    number alvo = form::numero(f, "saldo", saldo_em(end, p));
+    number antes = _antes(p);
+    _movimentar(p, end, alvo - saldo_em(end, p), "AJUSTE", "ajuste:" + r.usuario + ":" + form::campo(f, "motivo"));
+    _conferir_minimo(p, antes);
+    return k::ok(_resposta_saldo(p, end));
+}
+
+fn _transferir(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string p = upper(form::campo(f, "produto"));
+    string de = upper(form::campo(f, "de"));
+    string para = upper(form::campo(f, "para"));
+    number q = form::numero(f, "quantidade", 0.0);
+    if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
+    if (q <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
+    if (!_endereco_existe(de)) { return k::erro(422, "endereço " + de + " não cadastrado"); }
+    if (!_endereco_existe(para)) { return k::erro(422, "endereço " + para + " não cadastrado"); }
+    if (de == para) { return k::erro(422, "origem e destino iguais"); }
+    // Não se tira de uma prateleira o que não está nela.
+    if (saldo_em(de, p) < q) {
+        return k::erro(409, "saldo de " + p + " em " + de + " é " + to_string(saldo_em(de, p))
+            + ", menor que " + to_string(q));
+    }
+    string origem = "transferencia " + de + "->" + para + ":" + r.usuario;
+    number antes = _antes(p);
+    _movimentar(p, de, 0.0 - q, "TRANSFERENCIA", origem);
+    _movimentar(p, para, q, "TRANSFERENCIA", origem);
+    _conferir_minimo(p, antes);
+    return k::criado("{\"produto\":" + json_encode(p) + ",\"de\":" + json_encode(de)
+        + ",\"para\":" + json_encode(para) + ",\"quantidade\":" + to_string(q)
+        + ",\"saldo_de\":" + to_string(saldo_em(de, p))
+        + ",\"saldo_para\":" + to_string(saldo_em(para, p))
+        + ",\"saldo\":" + to_string(saldo(p)) + "}");
+}
+
+fn _salvar_regra(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string p = upper(form::campo(f, "produto"));
+    if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
+    // Sem tipo: matéria-prima se compra, o resto se produz.
+    string tipo_padrao = "PRODUZIR";
+    if (cadastros::produto(p).tipo == "MP") { tipo_padrao = "COMPRAR"; }
+    string end = upper(form::campo(f, "endereco"));
+    if (len(end) > 0 && !_endereco_existe(end)) { return k::erro(422, "endereço " + end + " não cadastrado"); }
+    if (!form::eh_numero(replace(form::campo(f, "minimo"), ",", "."))
+        || !form::eh_numero(replace(form::campo(f, "maximo"), ",", "."))) {
+        return k::erro(422, "minimo e maximo são obrigatórios e numéricos");
+    }
+    rg::Regra regra = rg::Regra {
+        produto: p,
+        minimo: form::numero(f, "minimo", -1.0),
+        maximo: form::numero(f, "maximo", -1.0),
+        tipo: upper(form::campo_ou(f, "tipo", tipo_padrao)),
+        endereco: end
+    };
+    string falha = rg::validar_regra(regra);
+    if (len(falha) > 0) { return k::erro(422, falha); }
+    _regras[p] = json_encode(regra);
+    if (!db::salvar(_dir, "reposicao", _regras)) { return k::erro(500, "falha ao gravar a regra"); }
+    return k::criado(_regras[p]);
 }
 
 fn rotear(k::Requisicao r) -> k::Resposta ={
     if (r.rota == "/saldos" && r.metodo == "GET") {
         string p = upper(k::param(r, "produto"));
-        if (len(p) > 0) {
-            return k::ok("{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p)) + "}");
-        }
+        if (len(p) > 0) { return k::ok(_saldo_produto(p)); }
         return k::ok(json_encode(_saldos));
     }
-    if (r.rota == "/movimentos" && r.metodo == "GET") {
-        string[] itens = [];
-        for (string id in keys(_movimentos)) { itens = concat(itens, [_movimentos[id]]); }
-        return k::ok("[" + join(itens, ",") + "]");
+    if (r.rota == "/enderecos" && r.metodo == "GET") { return k::ok(_lista(_enderecos)); }
+    if (r.rota == "/enderecos" && r.metodo == "POST") { return _salvar_endereco(r); }
+    if (r.rota == "/posicoes" && r.metodo == "GET") {
+        return k::ok(_posicoes_json(upper(k::param(r, "endereco"))));
     }
-    if (r.rota == "/entrada" && r.metodo == "POST") {
-        map<string,string> f = form::ler(r.corpo);
-        string p = upper(form::campo(f, "produto"));
-        number q = form::numero(f, "quantidade", 0.0);
-        if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
-        if (q <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
-        _movimentar(p, q, "ENTRADA", form::campo_ou(f, "origem", "manual:" + r.usuario));
-        return k::criado("{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p)) + "}");
-    }
-    if (r.rota == "/ajuste" && r.metodo == "POST") {
-        map<string,string> f = form::ler(r.corpo);
-        string p = upper(form::campo(f, "produto"));
-        if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
-        number alvo = form::numero(f, "saldo", saldo(p));
-        _movimentar(p, alvo - saldo(p), "AJUSTE", "ajuste:" + r.usuario + ":" + form::campo(f, "motivo"));
-        return k::ok("{\"produto\":" + json_encode(p) + ",\"saldo\":" + to_string(saldo(p)) + "}");
-    }
+    if (r.rota == "/movimentos" && r.metodo == "GET") { return k::ok(_movimentos_json()); }
+    if (r.rota == "/entrada" && r.metodo == "POST") { return _entrada(r); }
+    if (r.rota == "/ajuste" && r.metodo == "POST") { return _ajuste(r); }
+    if (r.rota == "/transferir" && r.metodo == "POST") { return _transferir(r); }
+    if (r.rota == "/reposicao" && r.metodo == "GET") { return k::ok(_lista(_regras)); }
+    if (r.rota == "/reposicao" && r.metodo == "POST") { return _salvar_regra(r); }
+    if (r.rota == "/sugestoes" && r.metodo == "GET") { return k::ok(_sugestoes()); }
     return k::nao_encontrado();
 }
 
 pub fn descritor() -> k::Modulo ={
     return k::Modulo {
         id: "estoque",
-        nome: "Estoque e Backflush",
-        versao: "1.0.0",
+        nome: "Estoque endereçado e reposição",
+        versao: "1.1.0",
         contrato: 1,
         prefixo: "/api/estoque",
         depende: ["cadastros"],
-        assina: ["producao.apontada", "op.liberada"],
+        assina: ["producao.apontada", "op.liberada", "pedido.expedido"],
         perfis_escrita: ["admin", "almoxarife"],
         iniciar: iniciar,
         rotear: rotear,

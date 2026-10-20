@@ -1,0 +1,129 @@
+// ============================================================
+//  regras.cryo — regras puras do estoque endereçado
+//
+//  Sem estado e sem E/S: o módulo (estoque.cryo) guarda os saldos e
+//  chama estas funções; os testes (tests/test_estoque.cryo) as
+//  exercitam direto.
+//
+//  Endereço (inspirado no tblBuffer/tblBufferPos do MES4): um lugar
+//  onde há saldo. GERAL existe sempre e é o endereço de tudo o que
+//  veio da v0.2 (saldo só por produto).
+//
+//  Regra de reposição (tblAutomaticOrder): mínimo e máximo de um
+//  produto. Abaixo do mínimo, sugere repor até o máximo.
+// ============================================================
+
+pub const string GERAL = "GERAL";
+
+pub struct Endereco {
+    string codigo;
+    string descricao;
+    string tipo;        // ALMOXARIFADO, LINHA, EXPEDICAO, QUARENTENA
+    string posto;       // só para LINHA
+}
+
+pub struct Regra {
+    string produto;
+    number minimo;
+    number maximo;
+    string tipo;        // PRODUZIR, COMPRAR
+    string endereco;    // "" = saldo total do produto
+}
+
+pub struct ItemPedido {
+    string produto;
+    number quantidade;
+}
+
+pub fn tipo_valido(string tipo) -> bool ={
+    return tipo == "ALMOXARIFADO" || tipo == "LINHA" || tipo == "EXPEDICAO" || tipo == "QUARENTENA";
+}
+
+pub fn geral() -> Endereco ={
+    return Endereco { codigo: GERAL, descricao: "Estoque geral", tipo: "ALMOXARIFADO", posto: "" };
+}
+
+// Chave de uma posição: "ENDERECO|PRODUTO". O código de endereço não
+// pode ter "|", então a PRIMEIRA barra sempre separa os dois.
+pub fn chave(string endereco, string produto) -> string ={
+    return endereco + "|" + produto;
+}
+
+pub fn endereco_da_chave(string ch) -> string ={
+    int i = find(ch, "|");
+    if (i < 0) { return ""; }
+    return ch[0..i];
+}
+
+pub fn produto_da_chave(string ch) -> string ={
+    int i = find(ch, "|");
+    if (i < 0) { return ch; }
+    return ch[i + 1..];
+}
+
+// Erro de um endereço novo ("" = válido). `posto_existe` vem de quem
+// chama (cadastros); `linha_do_posto` é o código do endereço LINHA que
+// já atende esse posto ("" se nenhum).
+pub fn validar_endereco(Endereco e, bool posto_existe, string linha_do_posto) -> string ={
+    if (len(e.codigo) == 0) { return "codigo é obrigatório"; }
+    if (contains(e.codigo, "|") || contains(e.codigo, " ")) { return "codigo não pode ter espaço nem |"; }
+    if (e.codigo == GERAL) { return "o endereço GERAL é fixo"; }
+    if (!tipo_valido(e.tipo)) { return "tipo deve ser ALMOXARIFADO, LINHA, EXPEDICAO ou QUARENTENA"; }
+    if (e.tipo == "LINHA") {
+        if (len(e.posto) == 0) { return "endereço LINHA exige posto"; }
+        if (!posto_existe) { return "posto " + e.posto + " não cadastrado"; }
+        if (len(linha_do_posto) > 0 && linha_do_posto != e.codigo) {
+            return "o posto " + e.posto + " já tem o endereço LINHA " + linha_do_posto;
+        }
+    }
+    return "";
+}
+
+// Quanto tirar de um endereço preferido que tem `disponivel`, para uma
+// necessidade `precisa`: o que houver de positivo, até a necessidade.
+// O resto sai do GERAL (que pode ficar negativo).
+pub fn repartir(number precisa, number disponivel) -> number ={
+    if (precisa <= 0.0 || disponivel <= 0.0) { return 0.0; }
+    return min(precisa, disponivel);
+}
+
+// "PRODUTO:qtd;PRODUTO:qtd" (itens de pedido.expedido). Item malformado
+// ou com quantidade ≤ 0 é ignorado — o evento vem do próprio EMP, mas
+// um pedaço ruim não pode derrubar o resto.
+pub fn ler_itens(string texto) -> ItemPedido[] ={
+    ItemPedido[] itens = [];
+    for (string pedaco in split(texto, ";")) {
+        string item = trim(pedaco);
+        if (len(item) == 0) { continue; }
+        int dp = find(item, ":");
+        if (dp <= 0) { continue; }
+        string produto = upper(trim(item[0..dp]));
+        string qtxt = replace(trim(item[dp + 1..]), ",", ".");
+        number q = parse_number(qtxt) ?? 0.0;
+        if (len(produto) == 0 || q <= 0.0) { continue; }
+        itens = concat(itens, [ItemPedido { produto: produto, quantidade: q }]);
+    }
+    return itens;
+}
+
+pub fn validar_regra(Regra r) -> string ={
+    if (r.minimo < 0.0) { return "minimo deve ser ≥ 0"; }
+    if (r.maximo <= r.minimo) { return "maximo deve ser maior que minimo"; }
+    if (r.tipo != "PRODUZIR" && r.tipo != "COMPRAR") { return "tipo deve ser PRODUZIR ou COMPRAR"; }
+    return "";
+}
+
+pub fn abaixo(Regra r, number saldo) -> bool ={
+    return saldo < r.minimo;
+}
+
+// Cruzou para baixo do mínimo: estava em cima (≥) e agora está abaixo.
+pub fn cruzou_abaixo(Regra r, number antes, number depois) -> bool ={
+    return antes >= r.minimo && depois < r.minimo;
+}
+
+// Repor até o máximo.
+pub fn sugerido(Regra r, number saldo) -> number ={
+    if (saldo >= r.maximo) { return 0.0; }
+    return r.maximo - saldo;
+}
