@@ -93,7 +93,11 @@ Somente leitura pela API; assina `maquina.*` e `producao.etapa_*`; depende de
 Definições (escrever no código e no doc):
 - **Disponibilidade** = (janela − parado) / janela.
 - **Desempenho** = Σ(`tempo_min` × (`delta_boas` + `delta_refugo`)) / minutos
-  OPERANDO, limitado a 1 (0 se não operou).
+  OPERANDO, limitado a 1. *Revisto depois da fase 2:* com peças apontadas mas
+  sem tempo operando ou sem `tempo_min`, o desempenho **não é medido** (vale 1,
+  `desempenho_medido: false`); sem produção, 0. A linha usa só os postos
+  medidos. A regra original ("0 se não operou") zerava o OEE de postos que
+  produziram.
 - **Qualidade** = Σ`delta_boas` / Σ(`delta_boas` + `delta_refugo`) (1 se nada).
 - **OEE** = produto dos três.
 - Estado: PARADO enquanto houver parada aberta (prevalece); OPERANDO enquanto

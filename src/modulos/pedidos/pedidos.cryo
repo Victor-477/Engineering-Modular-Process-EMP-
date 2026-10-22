@@ -414,6 +414,8 @@ fn _criar(k::Requisicao r) -> k::Resposta ={
         if (cadastros::produto(it.produto).tipo == "MP") {
             return k::erro(422, it.produto + " é matéria-prima: pedido é de produto produzido (SA/PA)");
         }
+        string inteira = cadastros::quantidade_invalida(it.produto, it.quantidade);
+        if (len(inteira) > 0) { return k::erro(422, inteira); }
     }
     string prazo_txt = replace(form::campo(f, "prazo_dias"), ",", ".");
     number prazo = 7.0;

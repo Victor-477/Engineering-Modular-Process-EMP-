@@ -51,6 +51,23 @@ pub fn produto(string codigo) -> Produto ={
     return json_decode(_produtos[codigo]) as Produto;
 }
 
+// Unidades contadas peça a peça: não aceitam quantidade fracionada.
+pub fn unidade_contavel(string unidade) -> bool ={
+    return index_of(["UN", "PC", "PÇ", "CX", "PAR"], upper(trim(unidade))) >= 0;
+}
+
+// "" se `q` serve para o produto, senão o motivo (para um 422). Só olha a
+// unidade: 12,5 UN não existe, 12,5 KG sim. Produto inexistente passa
+// (quem chama já confere o cadastro).
+pub fn quantidade_invalida(string codigo, number q) -> string ={
+    if (!existe(codigo)) { return ""; }
+    string un = produto(codigo).unidade;
+    if (unidade_contavel(un) && floor(q) != q) {
+        return "quantidade de " + codigo + " deve ser inteira (unidade " + upper(trim(un)) + ")";
+    }
+    return "";
+}
+
 pub fn estrutura(string codigo) -> ItemEstrutura[] ={
     if (!has(_estrutura, codigo)) {
         ItemEstrutura[] vazia = [];

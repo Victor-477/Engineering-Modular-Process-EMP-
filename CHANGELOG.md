@@ -47,13 +47,22 @@ frente em [`docs/fase2/`](docs/fase2/).
 - Testes `test_pedidos` (5), `test_estoque` (10) e `test_oee` (11), ligados no
   `build.ps1`. Capturas 14 a 21 em `docs/screenshots/`.
 
+### Corrigido (fase 2)
+- **OEE de um posto que produziu não zera mais por falta de tempo.** Com peças
+  apontadas mas sem tempo operando registrado (execuções de milissegundos, ou
+  uma parada retroativa que cobre a execução inteira) ou sem tempo padrão no
+  roteiro (`tempo_min` 0), o desempenho **não é medido**: vale 1 e a API
+  devolve `desempenho_medido: false` (em `/oee`, nos postos, na linha e na
+  série). Sem produção nenhuma continua 0. O desempenho da **linha** usa só os
+  postos medidos. No painel, o fator aparece como "—" no cartão do posto e
+  "sem tempo" na série por hora. Na demonstração, a MONT-01 foi de OEE 0 para
+  0,96. +4 casos em `test_oee`.
+- **Quantidade fracionada em unidade contável é recusada** (422 "deve ser
+  inteira"): pedido e OP (`POST /ordens` e `criar_op`) com 12,5 de um produto em
+  `UN`, `PC`, `PÇ`, `CX` ou `PAR`. Frações continuam valendo para KG, M, L etc.
+  Regra em `cadastros::quantidade_invalida`. +casos em `test_pedidos`.
+
 ### Problemas conhecidos (fase 2)
-- OEE: um posto com peças apontadas e **tempo operando zero** (execuções de
-  milissegundos, ou uma parada retroativa que cobre a execução inteira) mostra
-  desempenho 0 e OEE 0. A regra "0 se não operou" precisa considerar o que foi
-  apontado.
-- Pedidos aceitam quantidade fracionada em produto contado em `UN` (ex.: 12,5);
-  a OP gerada arredonda para cima.
 - `/sugestoes` não desconta OPs já abertas nem compras: depois de *Criar OP* a
   sugestão continua até a produção entrar.
 - Todos os componentes saem do endereço do posto da **última** etapa no

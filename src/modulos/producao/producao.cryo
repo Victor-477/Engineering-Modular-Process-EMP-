@@ -229,6 +229,8 @@ fn _validar(string produto, number qtd, string posto) -> string ={
     if (len(posto) > 0 && !cadastros::posto_existe(posto)) { return "posto " + posto + " não cadastrado"; }
     if (cadastros::produto(produto).tipo == "MP") { return "matéria-prima não é produzida"; }
     if (qtd <= 0.0) { return "quantidade deve ser positiva"; }
+    string inteira = cadastros::quantidade_invalida(produto, qtd);
+    if (len(inteira) > 0) { return inteira; }
     return "";
 }
 

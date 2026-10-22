@@ -153,3 +153,50 @@ test fn linha_soma_os_postos() ={
     assert(_perto(l.qualidade, 0.8), "20 / 25");
     assert(_perto(l.oee, 0.75 * (25.0 / 30.0) * 0.8), "produto");
 }
+
+// ── desempenho não medido (correção da fase 2) ────────────
+// Com peças apontadas mas sem tempo operando ou sem tempo padrão, o
+// desempenho não é medido: vale 1 e `desempenho_medido` fica false.
+
+test fn produziu_sem_tempo_operando() ={
+    // Parada retroativa cobrindo a execução inteira (MONT-01 da demo):
+    // só PARADO na janela, mas 469 boas e 4 refugos apontados.
+    oee::Intervalo[] ivs = [_iv("P1", oee::PARADO, T0, T0 + 15 * MIN)];
+    oee::Apontamento[] aps = [_ap("P1", T0 + 5 * MIN, 0.4, 469.0, 4.0)];
+    oee::Oee o = oee::calcular(ivs, aps, "P1", T0, T0 + HORA);
+    assert(o.ms_operando == 0, "nenhum tempo operando");
+    assert(!o.desempenho_medido, "desempenho não medido");
+    assert(_perto(o.desempenho, 1.0), "neutro: 1, não 0");
+    assert(_perto(o.oee, o.disponibilidade * o.qualidade), "OEE = D × Q");
+    assert(o.oee > 0.0, "um posto que produziu não fica com OEE 0");
+}
+
+test fn produziu_sem_tempo_padrao() ={
+    // Operou 10 min, mas o roteiro não tem tempo (tempo_min 0).
+    oee::Intervalo[] ivs = [_iv("P1", oee::OPERANDO, T0, T0 + 10 * MIN)];
+    oee::Oee o = oee::calcular(ivs, [_ap("P1", T0 + MIN, 0.0, 50.0, 0.0)], "P1", T0, T0 + HORA);
+    assert(!o.desempenho_medido, "sem tempo padrão: não medido");
+    assert(_perto(o.desempenho, 1.0), "neutro");
+}
+
+test fn sem_producao_continua_zero() ={
+    // Operou sem produzir: medido e 0. Nem operou nem produziu: 0, não medido.
+    oee::Intervalo[] ivs = [_iv("P1", oee::OPERANDO, T0, T0 + 30 * MIN)];
+    oee::Oee a = oee::calcular(ivs, _nenhum_ap(), "P1", T0, T0 + HORA);
+    assert(a.desempenho_medido && _perto(a.desempenho, 0.0), "operou sem produzir");
+    oee::Oee b = oee::calcular(_nenhum_iv(), _nenhum_ap(), "P1", T0, T0 + HORA);
+    assert(!b.desempenho_medido && _perto(b.desempenho, 0.0), "ocioso sem produção");
+}
+
+test fn linha_ignora_postos_nao_medidos() ={
+    // P1 medido: 10 min operando, 25 × 0,2 = 5 min teóricos -> 0,5.
+    // P2 não medido: 100 peças sem tempo operando — não pode puxar a linha.
+    oee::Intervalo[] ivs = [_iv("P1", oee::OPERANDO, T0, T0 + 10 * MIN)];
+    oee::Apontamento[] aps = [_ap("P1", T0 + MIN, 0.2, 25.0, 0.0), _ap("P2", T0 + MIN, 0.2, 100.0, 0.0)];
+    oee::Oee l = oee::linha(ivs, aps, ["P1", "P2"], T0, T0 + HORA);
+    assert(l.desempenho_medido, "a linha tem um posto medido");
+    assert(_perto(l.desempenho, 0.5), "só P1 conta no desempenho");
+    assert(_perto(l.boas, 125.0), "as peças de P2 contam na qualidade");
+    assert(_perto(l.oee, l.disponibilidade * 0.5 * l.qualidade), "OEE recalculado");
+    assert(contains(oee::fracoes_json(l), "\"desempenho_medido\":true"), "vai no JSON");
+}

@@ -14,7 +14,13 @@
 //  Definições (janela, parado, operando em minutos da janela):
 //    Disponibilidade = (janela − parado) / janela
 //    Desempenho      = Σ(tempo_min × (delta_boas + delta_refugo)) / operando,
-//                      limitado a 1; 0 se não operou
+//                      limitado a 1. Com peças apontadas mas sem tempo
+//                      operando ou sem tempo padrão (tempo_min 0), ele NÃO
+//                      É MEDIDO (desempenho_medido = false) e vale 1:
+//                      execuções de milissegundos, uma parada retroativa
+//                      que cobre a execução ou um roteiro sem tempo não
+//                      podem zerar o OEE de um posto que produziu. Sem
+//                      produção: 0 (medido se operou, não medido se não).
 //    Qualidade       = Σ delta_boas / Σ(delta_boas + delta_refugo); 1 se nada
 //    OEE             = Disponibilidade × Desempenho × Qualidade
 //  A linha usa as mesmas fórmulas sobre as somas de todos os postos.
@@ -65,6 +71,7 @@ pub struct Oee {
     number desempenho;
     number qualidade;
     number oee;
+    bool desempenho_medido; // false = sem tempo operando na janela
 }
 
 // ── janela ────────────────────────────────────────────────
@@ -152,14 +159,25 @@ pub fn fracoes(string posto, int janela_ms, int ms_operando, int ms_parado, int 
                number min_teorico, number boas, number refugo) -> Oee ={
     number disp = 0.0;
     if (janela_ms > 0) { disp = (janela_ms - ms_parado) * 1.0 / janela_ms; }
+    bool produziu = boas + refugo > 0.0;
+    bool medido = ms_operando > 0;
     number desemp = 0.0;
-    if (ms_operando > 0) { desemp = min(1.0, min_teorico / (ms_operando / 60000.0)); }
+    if (produziu && (ms_operando <= 0 || min_teorico <= 0.0)) {
+        // Produziu, mas falta o tempo operando ou o tempo padrão para
+        // comparar: neutro, para não punir o posto pela falta do dado.
+        medido = false;
+        desemp = 1.0;
+    } else if (medido) {
+        // Operou sem produzir dá 0 (medido); produziu com os dois tempos, a razão.
+        desemp = min(1.0, min_teorico / (ms_operando / 60000.0));
+    }
     number qual = 1.0;
     if (boas + refugo > 0.0) { qual = boas / (boas + refugo); }
     return Oee {
         posto: posto, janela_ms: janela_ms, ms_operando: ms_operando, ms_parado: ms_parado,
         ms_ocioso: ms_ocioso, min_teorico: min_teorico, boas: boas, refugo: refugo,
-        disponibilidade: disp, desempenho: desemp, qualidade: qual, oee: disp * desemp * qual
+        disponibilidade: disp, desempenho: desemp, qualidade: qual, oee: disp * desemp * qual,
+        desempenho_medido: medido
     };
 }
 
@@ -186,7 +204,10 @@ pub fn calcular(Intervalo[] ivs, Apontamento[] aps, string posto, int ini, int f
     return fracoes(posto, max(fim - ini, 0), operando, parado, ocioso, teorico, boas, refugo);
 }
 
-// A linha: as mesmas fórmulas sobre as somas de todos os postos.
+// A linha: as mesmas fórmulas sobre as somas de todos os postos. O
+// desempenho da linha usa só os postos com desempenho MEDIDO: um posto
+// sem tempo operando ou sem tempo padrão poria peças no numerador sem
+// tempo no denominador (ou o contrário).
 pub fn agregar(Oee[] itens) -> Oee ={
     int janela = 0;
     int operando = 0;
@@ -195,6 +216,8 @@ pub fn agregar(Oee[] itens) -> Oee ={
     number teorico = 0.0;
     number boas = 0.0;
     number refugo = 0.0;
+    int operando_m = 0;
+    number teorico_m = 0.0;
     for (Oee o in itens) {
         janela = janela + o.janela_ms;
         operando = operando + o.ms_operando;
@@ -203,8 +226,23 @@ pub fn agregar(Oee[] itens) -> Oee ={
         teorico = teorico + o.min_teorico;
         boas = boas + o.boas;
         refugo = refugo + o.refugo;
+        if (o.desempenho_medido) {
+            operando_m = operando_m + o.ms_operando;
+            teorico_m = teorico_m + o.min_teorico;
+        }
     }
-    return fracoes("", janela, operando, parado, ocioso, teorico, boas, refugo);
+    Oee l = fracoes("", janela, operando, parado, ocioso, teorico, boas, refugo);
+    if (operando_m <= 0) {
+        // Nenhum posto medido operou: a linha segue a regra do posto.
+        return l;
+    }
+    number desemp = min(1.0, teorico_m / (operando_m / 60000.0));
+    return Oee {
+        posto: l.posto, janela_ms: l.janela_ms, ms_operando: l.ms_operando, ms_parado: l.ms_parado,
+        ms_ocioso: l.ms_ocioso, min_teorico: l.min_teorico, boas: l.boas, refugo: l.refugo,
+        disponibilidade: l.disponibilidade, desempenho: desemp, qualidade: l.qualidade,
+        oee: l.disponibilidade * desemp * l.qualidade, desempenho_medido: true
+    };
 }
 
 // A linha na janela: um Oee por posto e a agregação.
@@ -240,5 +278,6 @@ pub fn fracoes_json(Oee o) -> string ={
     return "\"disponibilidade\":" + to_string(arred(o.disponibilidade, 10000.0))
         + ",\"desempenho\":" + to_string(arred(o.desempenho, 10000.0))
         + ",\"qualidade\":" + to_string(arred(o.qualidade, 10000.0))
-        + ",\"oee\":" + to_string(arred(o.oee, 10000.0));
+        + ",\"oee\":" + to_string(arred(o.oee, 10000.0))
+        + ",\"desempenho_medido\":" + (o.desempenho_medido ? "true" : "false");
 }

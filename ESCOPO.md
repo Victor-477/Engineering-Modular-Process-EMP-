@@ -467,7 +467,7 @@ Executado nesta máquina (Windows 11, MinGW gcc, VM Pyro em C):
 
 **Fase 2 (comercial, estoque endereçado, OEE)**, conferido pela coordenadora
 no branch combinado, além do que cada frente registrou em `docs/fase2/`:
-- `build.ps1` passa e os 50 testes passam (núcleo 7, eventos 2, etapas 15,
+- `build.ps1` passa e os 54 testes passam (núcleo 7, eventos 2, etapas 15,
   pedidos 5, estoque 10, OEE 11).
 - As quatro cargas de demonstração rodam juntas num só `emp.exe` sem falha na
   ordem `demo → demo_estoque → demo_comercial → demo_oee`; na ordem
@@ -478,8 +478,10 @@ no branch combinado, além do que cada frente registrou em `docs/fase2/`:
   0,862 com valores por posto coerentes com a demonstração.
 - A frente C conferiu o OEE da PRENSA-03 à mão a partir dos eventos
   (D 0,9375 × Desemp 0,8325 × Q 0,8 = 0,6244), igual à API.
-- Problemas conhecidos estão no CHANGELOG (OEE com tempo operando zero,
-  quantidade fracionada em produto UN).
+- Os dois defeitos achados nessa verificação (OEE zerado com tempo operando
+  zero; quantidade fracionada em produto UN) foram corrigidos e conferidos por
+  HTTP: MONT-01 de OEE 0 para 0,96 com `desempenho_medido: false`; 12,5 UN →
+  422 no pedido e na OP. Os limites restantes estão no CHANGELOG.
 
 **Não verificado:** carga/concorrência, execução como serviço Windows, backends
 go/node para o ERP completo (L-17), navegadores além do Chromium/Edge, perfis

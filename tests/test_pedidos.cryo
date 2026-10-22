@@ -195,4 +195,16 @@ test fn fluxo_pedido_completo() ={
     k::Resposta manual = post("/api/producao/ordens", "produto=PA-1&quantidade=3&posto=P1");
     assert(manual.status == 201 && contains(manual.corpo, "\"origem\":\"\""), "OP manual sem origem");
     assert(producao::criar_op("NADA", 1.0, "", "PED-1") == 0, "criar_op em erro -> 0");
+
+    // Quantidade fracionada só em unidade não contável (correção da fase 2):
+    // PA-1 é UN (padrão do cadastro); 12,5 UN não existe, 12,5 KG sim.
+    k::Resposta frac = post("/api/pedidos/pedidos", "cliente=C1&itens=PA-1:12,5");
+    assert(frac.status == 422 && contains(frac.corpo, "inteira"), "pedido com 12,5 UN -> 422");
+    assert(post("/api/producao/ordens", "produto=PA-1&quantidade=2.5").status == 422, "OP com 2,5 UN -> 422");
+    assert(producao::criar_op("PA-1", 2.5, "", "PED-9") == 0, "criar_op com 2,5 UN -> 0");
+    assert(post("/api/pedidos/pedidos", "cliente=C1&itens=PA-1:12").status == 201, "12 UN continua aceito");
+    post("/api/cadastros/produtos", "codigo=PA-KG&descricao=Granel&unidade=KG&tipo=PA");
+    assert(post("/api/pedidos/pedidos", "cliente=C1&itens=PA-KG:12,5").status == 201, "12,5 KG é aceito");
+    assert(post("/api/producao/ordens", "produto=PA-KG&quantidade=2.5").status == 201, "OP com 2,5 KG é aceita");
+    assert(cadastros::unidade_contavel(" pç ") && !cadastros::unidade_contavel("KG"), "unidades contáveis");
 }

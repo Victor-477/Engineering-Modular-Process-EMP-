@@ -22,7 +22,13 @@ Depende de `cadastros`; assina `maquina.*` e `producao.etapa_{iniciada,apontada,
 Estado num instante: **PARADO** se há parada aberta (prevalece) › **OPERANDO** se há etapa EM_EXECUCAO › **OCIOSO**.
 
 - Disponibilidade = (janela − parado) / janela
-- Desempenho = Σ(`tempo_min` × (`delta_boas` + `delta_refugo`)) / min OPERANDO, limitado a 1; 0 se não operou
+- Desempenho = Σ(`tempo_min` × (`delta_boas` + `delta_refugo`)) / min OPERANDO, limitado a 1.
+  **Não medido** (`desempenho_medido: false`, vale 1) quando houve peças apontadas mas falta o tempo
+  operando ou o tempo padrão (`tempo_min` 0); sem produção, 0 (medido se operou). *Correção posterior
+  à fase 2: a regra original "0 se não operou" deixava a MONT-01 da demo com OEE 0 tendo 450 boas;
+  agora 0,96.*
+- Na **linha**, o desempenho usa só os postos medidos (Σ teórico / Σ operando deles); disponibilidade
+  e qualidade continuam somando todos.
 - Qualidade = Σ`delta_boas` / Σ(`delta_boas` + `delta_refugo`); 1 se nada apontado
 - OEE = D × Desemp × Q
 - Linha = as mesmas fórmulas sobre as **somas** de todos os postos cadastrados.
