@@ -16,11 +16,12 @@ linguagem: **[ESCOPO.md](ESCOPO.md)** · Histórico: **[CHANGELOG.md](CHANGELOG.
 | **Produção** | interno | Ordens de produção executadas **etapa por etapa** (copiadas do roteiro na liberação), fila por posto, medições, concorrência por versão, indicadores; recusa trabalhar em posto parado |
 | **Pedidos** | interno | Clientes e pedidos de venda com itens e prazo; gera as OPs da falta (com reserva entre pedidos), fica pronto quando as OPs concluem ou o saldo cobre, expede e avisa atraso |
 | **Estoque** | interno | Saldos **por endereço** (almoxarifado, linha do posto, expedição, quarentena), transferências, ajuste de inventário, **baixa automática por estrutura e etapa** (backflush na linha do posto da etapa), baixa na expedição, **reposição mín./máx.** com sugestões de compra ou produção |
-| **Manutenção** | interno | Paradas de posto por categoria, registro retroativo, disponibilidade na janela de 8 h, MTTR |
+| **Manutenção** | interno | Manutenção corretiva (paradas por categoria, disponibilidade 8 h, MTTR) e **manutenção preventiva** (planos por horas ou ciclos acumulados do chão de fábrica, alertas e histórico de execução) |
 | **Indicadores** | interno | Histórico de estado de cada posto (operando, parado, ocioso) e **OEE** = disponibilidade × desempenho × qualidade, por posto e da linha, com série por hora e alerta de OEE baixo — calculado só a partir dos eventos |
 | **PCP / MRP** | interno | Planejamento de necessidades de materiais: explosão multinível de BOM, cálculo de necessidade líquida cruzando pedidos e reposição mínima com saldo e OPs abertas, geração automática de ordens de produção (`POST /api/mrp/gerar_ordens`) |
 | **Programação (APS)** | interno | Sequenciamento e capacidade finita: carga × capacidade por posto, identificação de gargalos, fila sequenciada por prioridade e EDD (Earliest Due Date), projeção contínua de cronograma e alerta de atraso |
 | **Lotes & Rastreabilidade** | interno | Rastreabilidade e genealogia industrial: controle de lotes (status/validade), árvore genealógica de insumos consumidos em cada etapa da OP, expedição a clientes e rastreamento bidirecional (backward de insumos e forward recall de clientes) |
+| **Custos Industriais** | interno | Apropriação de custos da produção: custo padrão da engenharia (MD + MOD/GGF) vs. custo real da OP, taxas horárias dos postos, custo de refugo, análise de desvio percentual e fechamento contábil |
 | **Qualidade** | **plugin externo** | Não conformidades manuais e automáticas (refugo acima do limite) — processo próprio, sem recompilar o núcleo |
 | **Compras** | **plugin externo** | Gestão de fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas de estoque — processo próprio |
 

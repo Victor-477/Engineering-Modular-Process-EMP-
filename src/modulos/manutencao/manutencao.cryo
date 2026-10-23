@@ -1,25 +1,31 @@
 // ============================================================
-//  manutencao.cryo — Módulo de Manutenção (paradas de posto)
+//  manutencao.cryo — Módulo de Manutenção Industrial (Corretiva e Preventiva)
 //
-//  Registra paradas de máquina por posto de trabalho e calcula a
-//  disponibilidade de cada posto numa janela móvel (padrão: 8 h, um
-//  turno) — o primeiro fator do OEE.
+//  1. MANUTENÇÃO CORRETIVA:
+//     Registra paradas de máquina por posto de trabalho e calcula a
+//     disponibilidade de cada posto numa janela móvel (padrão: 8 h, um
+//     turno) — o primeiro fator do OEE.
+//     Publica `maquina.parada` e `maquina.liberada`.
 //
-//  Integração SÓ por eventos: ao abrir uma parada publica
-//  `maquina.parada`, ao encerrar `maquina.liberada`. A produção
-//  assina esses eventos e recusa apontamento num posto parado — sem
-//  que um módulo importe o outro.
+//  2. MANUTENÇÃO PREVENTIVA:
+//     Planos de manutenção preventiva baseados em HORAS de operação ou
+//     CICLOS de produção (peças fabricadas).
+//     Assina `producao.etapa_apontada` e `producao.apontada` para
+//     acumular o desgaste de cada posto.
+//     Alerta antecipadamente (85% do limite) e publica
+//     `manutencao.preventiva_vencida` ao atingir 100%.
+//     Permite execução com histórico de manutenções e reset de contador.
 //
 //  Rotas (prefixo /api/manutencao):
 //    GET  /paradas[?status=ABERTA|ENCERRADA]
 //    POST /paradas            posto=&categoria=&motivo=[&ha_minutos=N]
-//                             ha_minutos: registro retroativo (0..720) — a
-//                             parada é anotada depois de ter começado
 //    POST /encerrar?id=N      solucao=
 //    GET  /postos             estado e disponibilidade de cada posto
 //    GET  /indicadores        paradas abertas, MTTR, minutos por categoria
-//
-//  Categorias: MECANICA, ELETRICA, SETUP, FALTA_MATERIAL, QUALIDADE, OUTROS
+//    GET  /preventivas[?posto=X]
+//    POST /preventivas        posto=&titulo=&tipo_gatilho=HORAS|CICLOS&limite_gatilho=
+//    POST /preventivas/executar?id=N   tecnico=&observacao=
+//    GET  /preventivas/historico[?posto=X]
 // ============================================================
 
 import "../../nucleo/contrato.cryo"  as k;
@@ -40,14 +46,47 @@ pub struct Parada {
     int fim;                // ms; 0 enquanto aberta
 }
 
+pub struct PlanoPreventiva {
+    int id;
+    string posto;
+    string titulo;
+    string tipo_gatilho;    // "HORAS" | "CICLOS"
+    number limite_gatilho;  // horas ou ciclos
+    number acumulado_atual; // horas ou ciclos desde última execução
+    string status;          // "OK" | "ALERTA" | "VENCIDO"
+    int ultima_execucao;    // ms
+    int total_execucoes;
+}
+
+pub struct HistoricoPreventiva {
+    int id;
+    int plano_id;
+    string posto;
+    string titulo;
+    number acumulado_na_execucao;
+    string tecnico;
+    string observacao;
+    int executado_em;       // ms
+}
+
 const int JANELA_MS = 28800000;      // 8 h
 
 string _dir = "";
 map<string,string> _paradas = {};    // id -> json(Parada)
 int _proximo = 1;
 
-fn _ler(string id) -> Parada ={
+map<string,string> _planos = {};     // id -> json(PlanoPreventiva)
+int _proximo_plano = 1;
+
+map<string,string> _historico = {};  // id -> json(HistoricoPreventiva)
+int _proximo_hist = 1;
+
+fn _ler_parada(string id) -> Parada ={
     return json_decode(_paradas[id]) as Parada;
+}
+
+fn _ler_plano(string id) -> PlanoPreventiva ={
+    return json_decode(_planos[id]) as PlanoPreventiva;
 }
 
 fn _categoria_valida(string c) -> bool ={
@@ -57,7 +96,7 @@ fn _categoria_valida(string c) -> bool ={
 // id da parada aberta do posto, ou "".
 fn _aberta_em(string posto) -> string ={
     for (string id in keys(_paradas)) {
-        Parada p = _ler(id);
+        Parada p = _ler_parada(id);
         if (p.posto == posto && p.status == "ABERTA") { return id; }
     }
     return "";
@@ -68,7 +107,7 @@ fn _parado_na_janela(string posto, int agora) -> int ={
     int ini_janela = agora - JANELA_MS;
     int total = 0;
     for (string id in keys(_paradas)) {
-        Parada p = _ler(id);
+        Parada p = _ler_parada(id);
         if (p.posto != posto) { continue; }
         int fim = p.fim;
         if (p.status == "ABERTA") { fim = agora; }
@@ -79,9 +118,6 @@ fn _parado_na_janela(string posto, int agora) -> int ={
     return total;
 }
 
-// `inicio`/`fim` em ms (fim=0 enquanto aberta): uma parada retroativa
-// (ha_minutos) começa antes do evento, e quem reconstrói o histórico do
-// posto (indicadores/OEE) precisa do início real, não da hora do evento.
 fn _anunciar(string tipo, Parada p) ={
     ev::publicar(tipo, "manutencao", "parada=" + to_string(p.id)
         + "&posto=" + url_encode(p.posto)
@@ -96,20 +132,101 @@ fn iniciar(string dir) -> bool ={
     _dir = dir;
     _paradas = db::carregar(dir, "paradas");
     _proximo = db::maior_id(_paradas) + 1;
-    // Reanuncia as paradas abertas: quem guarda estado derivado delas
-    // (a produção) volta a saber após um reinício.
+
+    _planos = db::carregar(dir, "planos");
+    _proximo_plano = db::maior_id(_planos) + 1;
+
+    _historico = db::carregar(dir, "historico");
+    _proximo_hist = db::maior_id(_historico) + 1;
+
+    // Reanuncia as paradas abertas
     for (string id in keys(_paradas)) {
-        Parada p = _ler(id);
+        Parada p = _ler_parada(id);
         if (p.status == "ABERTA") { _anunciar("maquina.parada", p); }
     }
     return true;
 }
 
+// ── processamento de eventos para preventiva ──────────────
+
+fn _processar_desgaste(string posto, number ciclos, number horas) ={
+    if (len(posto) == 0 || (ciclos <= 0.0 && horas <= 0.0)) { return; }
+    bool alterou = false;
+
+    for (string id in keys(_planos)) {
+        PlanoPreventiva pl = _ler_plano(id);
+        if (pl.posto != posto) { continue; }
+
+        number incremento = 0.0;
+        if (pl.tipo_gatilho == "CICLOS") { incremento = ciclos; }
+        if (pl.tipo_gatilho == "HORAS")  { incremento = horas; }
+
+        number novo_acum = pl.acumulado_atual + incremento;
+        string novo_status = "OK";
+
+        if (novo_acum >= pl.limite_gatilho) {
+            novo_status = "VENCIDO";
+            if (pl.status != "VENCIDO") {
+                ev::publicar("manutencao.preventiva_vencida", "manutencao",
+                    "posto=" + url_encode(pl.posto)
+                    + "&plano=" + to_string(pl.id)
+                    + "&titulo=" + url_encode(pl.titulo)
+                    + "&acumulado=" + to_string(novo_acum)
+                    + "&limite=" + to_string(pl.limite_gatilho));
+            }
+        } else if (novo_acum >= (pl.limite_gatilho * 0.85)) {
+            novo_status = "ALERTA";
+        }
+
+        PlanoPreventiva atualizado = PlanoPreventiva {
+            id: pl.id,
+            posto: pl.posto,
+            titulo: pl.titulo,
+            tipo_gatilho: pl.tipo_gatilho,
+            limite_gatilho: pl.limite_gatilho,
+            acumulado_atual: round(novo_acum * 100.0) / 100.0,
+            status: novo_status,
+            ultima_execucao: pl.ultima_execucao,
+            total_execucoes: pl.total_execucoes
+        };
+
+        _planos[id] = json_encode(atualizado);
+        alterou = true;
+    }
+
+    if (alterou) {
+        db::salvar(_dir, "planos", _planos);
+    }
+}
+
 fn ao_evento(k::Evento e) -> bool ={
+    if (e.tipo == "producao.etapa_apontada") {
+        map<string,string> f = form::ler(e.corpo);
+        string posto = upper(form::campo(f, "posto"));
+        number d_boas = form::numero(f, "delta_boas", 0.0);
+        number d_ref = form::numero(f, "delta_refugo", 0.0);
+        number ciclos = d_boas + d_ref;
+        if (ciclos <= 0.0) {
+            ciclos = form::numero(f, "boas", 0.0) + form::numero(f, "refugo", 0.0);
+        }
+        number t_min = form::numero(f, "tempo_min", 0.0);
+        if (t_min <= 0.0) { t_min = 5.0; }
+        number horas = (ciclos * t_min) / 60.0;
+        _processar_desgaste(posto, ciclos, horas);
+    }
+    if (e.tipo == "producao.apontada") {
+        map<string,string> f = form::ler(e.corpo);
+        string posto = upper(form::campo(f, "posto"));
+        number boa = form::numero(f, "boa", 0.0);
+        number ref = form::numero(f, "refugo", 0.0);
+        number ciclos = boa + ref;
+        number horas = (ciclos * 5.0) / 60.0;
+        _processar_desgaste(posto, ciclos, horas);
+    }
     return true;
 }
 
-// ── handlers ──────────────────────────────────────────────
+// ── handlers corretiva ────────────────────────────────────
 
 fn _abrir(k::Requisicao r) -> k::Resposta ={
     map<string,string> f = form::ler(r.corpo);
@@ -138,10 +255,9 @@ fn _abrir(k::Requisicao r) -> k::Resposta ={
 fn _encerrar(k::Requisicao r) -> k::Resposta ={
     string id = to_string(parse_int(k::param(r, "id")) ?? 0);
     if (!has(_paradas, id)) { return k::erro(404, "parada inexistente"); }
-    Parada p = _ler(id);
+    Parada p = _ler_parada(id);
     if (p.status != "ABERTA") { return k::erro(409, "parada #" + id + " já está encerrada"); }
     map<string,string> f = form::ler(r.corpo);
-    // Sem atribuição a campo de struct (ESCOPO.md, L-07): reconstrói.
     Parada nova = Parada {
         id: p.id, posto: p.posto, categoria: p.categoria, motivo: p.motivo,
         solucao: form::campo(f, "solucao"), status: "ENCERRADA",
@@ -187,7 +303,7 @@ fn _indicadores() -> string ={
     map<string,int> por_categoria = {};
     int agora = now_ms();
     for (string id in keys(_paradas)) {
-        Parada p = _ler(id);
+        Parada p = _ler_parada(id);
         int fim = p.fim;
         if (p.status == "ABERTA") {
             abertas = abertas + 1;
@@ -211,24 +327,134 @@ fn _indicadores() -> string ={
         + ",\"minutos_por_categoria\":" + json_encode(por_categoria) + "}";
 }
 
+// ── handlers preventiva ───────────────────────────────────
+
+fn _listar_preventivas(string posto) -> k::Resposta ={
+    string[] lista = [];
+    for (string id in sort(keys(_planos))) {
+        PlanoPreventiva pl = _ler_plano(id);
+        if (len(posto) == 0 || pl.posto == posto) {
+            lista = concat(lista, [_planos[id]]);
+        }
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn _criar_preventiva(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string posto = upper(form::campo(f, "posto"));
+    string titulo = form::campo(f, "titulo");
+    string gatilho = upper(form::campo_ou(f, "tipo_gatilho", "CICLOS"));
+    number limite = form::numero(f, "limite_gatilho", 0.0);
+
+    if (!cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
+    if (len(titulo) == 0) { return k::erro(422, "título do plano é obrigatório"); }
+    if (gatilho != "HORAS" && gatilho != "CICLOS") { return k::erro(422, "tipo_gatilho deve ser HORAS ou CICLOS"); }
+    if (limite <= 0.0) { return k::erro(422, "limite_gatilho deve ser maior que zero"); }
+
+    PlanoPreventiva novo = PlanoPreventiva {
+        id: _proximo_plano,
+        posto: posto,
+        titulo: titulo,
+        tipo_gatilho: gatilho,
+        limite_gatilho: limite,
+        acumulado_atual: 0.0,
+        status: "OK",
+        ultima_execucao: 0,
+        total_execucoes: 0
+    };
+    string id_str = to_string(_proximo_plano);
+    _proximo_plano = _proximo_plano + 1;
+    _planos[id_str] = json_encode(novo);
+    if (!db::salvar(_dir, "planos", _planos)) { return k::erro(500, "falha ao salvar plano preventivo"); }
+
+    return k::criado(_planos[id_str]);
+}
+
+fn _executar_preventiva(k::Requisicao r) -> k::Resposta ={
+    int id = parse_int(k::param(r, "id")) ?? 0;
+    map<string,string> f = form::ler(r.corpo);
+    if (id <= 0) { id = form::inteiro(f, "id", 0); }
+    string id_str = to_string(id);
+    if (!has(_planos, id_str)) { return k::erro(404, "plano preventivo não encontrado"); }
+
+    PlanoPreventiva pl = _ler_plano(id_str);
+    string tecnico = form::campo_ou(f, "tecnico", r.usuario);
+    string obs = form::campo(f, "observacao");
+
+    HistoricoPreventiva h = HistoricoPreventiva {
+        id: _proximo_hist,
+        plano_id: pl.id,
+        posto: pl.posto,
+        titulo: pl.titulo,
+        acumulado_na_execucao: pl.acumulado_atual,
+        tecnico: tecnico,
+        observacao: obs,
+        executado_em: now_ms()
+    };
+    _historico[to_string(_proximo_hist)] = json_encode(h);
+    _proximo_hist = _proximo_hist + 1;
+    db::salvar(_dir, "historico", _historico);
+
+    PlanoPreventiva resetado = PlanoPreventiva {
+        id: pl.id,
+        posto: pl.posto,
+        titulo: pl.titulo,
+        tipo_gatilho: pl.tipo_gatilho,
+        limite_gatilho: pl.limite_gatilho,
+        acumulado_atual: 0.0,
+        status: "OK",
+        ultima_execucao: now_ms(),
+        total_execucoes: pl.total_execucoes + 1
+    };
+    _planos[id_str] = json_encode(resetado);
+    db::salvar(_dir, "planos", _planos);
+
+    ev::publicar("manutencao.preventiva_executada", "manutencao",
+        "posto=" + url_encode(pl.posto)
+        + "&plano=" + to_string(pl.id)
+        + "&tecnico=" + url_encode(tecnico));
+
+    return k::ok(_planos[id_str]);
+}
+
+fn _listar_historico(string posto) -> k::Resposta ={
+    string[] lista = [];
+    for (string id in sort(keys(_historico))) {
+        HistoricoPreventiva h = json_decode(_historico[id]) as HistoricoPreventiva;
+        if (len(posto) == 0 || h.posto == posto) {
+            lista = concat(lista, [_historico[id]]);
+        }
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
 fn rotear(k::Requisicao r) -> k::Resposta ={
+    // Corretiva
     if (r.rota == "/paradas" && r.metodo == "GET")  { return k::ok(_listar(upper(k::param(r, "status")))); }
     if (r.rota == "/paradas" && r.metodo == "POST") { return _abrir(r); }
     if (r.rota == "/encerrar" && r.metodo == "POST") { return _encerrar(r); }
     if (r.rota == "/postos" && r.metodo == "GET")   { return k::ok(_postos()); }
     if (r.rota == "/indicadores" && r.metodo == "GET") { return k::ok(_indicadores()); }
+
+    // Preventiva
+    if (r.rota == "/preventivas" && r.metodo == "GET") { return _listar_preventivas(upper(k::param(r, "posto"))); }
+    if (r.rota == "/preventivas" && r.metodo == "POST") { return _criar_preventiva(r); }
+    if (r.rota == "/preventivas/executar" && r.metodo == "POST") { return _executar_preventiva(r); }
+    if (r.rota == "/preventivas/historico" && r.metodo == "GET") { return _listar_historico(upper(k::param(r, "posto"))); }
+
     return k::nao_encontrado();
 }
 
 pub fn descritor() -> k::Modulo ={
     return k::Modulo {
         id: "manutencao",
-        nome: "Manutenção e Disponibilidade",
-        versao: "1.0.0",
+        nome: "Manutenção Industrial (Corretiva e Preventiva)",
+        versao: "1.1.0",
         contrato: 1,
         prefixo: "/api/manutencao",
         depende: ["cadastros"],
-        assina: [],
+        assina: ["producao.etapa_apontada", "producao.apontada"],
         perfis_escrita: ["admin", "manutencao", "operador"],
         iniciar: iniciar,
         rotear: rotear,

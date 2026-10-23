@@ -269,6 +269,25 @@ pub fn ordens_ativas() -> OrdemProducao[] ={
     return lista;
 }
 
+pub fn todas_ordens() -> OrdemProducao[] ={
+    OrdemProducao[] lista = [];
+    for (string id in sort(keys(_ordens))) {
+        lista = concat(lista, [_ler(parse_int(id) ?? 0)]);
+    }
+    return lista;
+}
+
+pub fn ordem(int op_id) -> OrdemProducao ={
+    string id = to_string(op_id);
+    if (!has(_ordens, id)) {
+        return OrdemProducao {
+            id: 0, produto: "", quantidade: 0.0, produzido: 0.0, refugo: 0.0,
+            status: "", posto: "", criada_em: 0, atualizada_em: 0, origem: ""
+        };
+    }
+    return _ler(op_id);
+}
+
 pub fn execucao_da_op(int op_id) -> etp::Execucao ={
     string id = to_string(op_id);
     if (!has(_ordens, id)) {

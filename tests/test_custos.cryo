@@ -1,0 +1,249 @@
+// Testes de Custos Industriais e Apropriação com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_custos.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"           as k;
+import "../src/nucleo/eventos.cryo"            as ev;
+import "../src/nucleo/persist.cryo"            as db;
+import "../src/modulos/cadastros/cadastros.cryo" as cadastros;
+import "../src/modulos/roteiros/roteiros.cryo"   as roteiros;
+import "../src/modulos/producao/producao.cryo"   as producao;
+import "../src/modulos/custos/custos.cryo"       as custos;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+
+fn _req(string metodo, string rota, string corpo) -> k::Requisicao ={
+    string r = rota;
+    string q = "";
+    int inter = find(rota, "?");
+    if (inter > 0) {
+        string s_rota = rota;
+        r = s_rota[0..inter];
+        q = s_rota[inter + 1..];
+    }
+    return k::Requisicao {
+        metodo: metodo,
+        caminho: "/api/custos" + r,
+        rota: r,
+        query: q,
+        corpo: corpo,
+        usuario: "admin",
+        perfil: "admin"
+    };
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_custos")) { make_dir("build/test_custos"); }
+    string dir = "build/test_custos/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+    for (string c in ["produtos", "estrutura", "postos", "roteiros", "operacoes", "ordens", "etapas", "precos", "taxas", "fechamentos"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Produtos: CHAPA (MP), PARAF (MP), MOTOR (PA)
+    map<string,string> prods = {};
+    prods["CHAPA"] = json_encode(cadastros::Produto { codigo: "CHAPA", descricao: "Chapa de Aço", unidade: "UN", tipo: "MP" });
+    prods["PARAF"] = json_encode(cadastros::Produto { codigo: "PARAF", descricao: "Parafuso M6", unidade: "UN", tipo: "MP" });
+    prods["MOTOR"] = json_encode(cadastros::Produto { codigo: "MOTOR", descricao: "Motor Elétrico", unidade: "UN", tipo: "PA" });
+    db::salvar(dir, "produtos", prods);
+
+    // Estrutura do MOTOR: 2x CHAPA + 4x PARAF
+    map<string,string> est = {};
+    cadastros::ItemEstrutura[] itens = [
+        cadastros::ItemEstrutura { componente: "CHAPA", quantidade: 2.0, etapa: 1 },
+        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 4.0, etapa: 2 }
+    ];
+    est["MOTOR"] = json_encode(itens);
+    db::salvar(dir, "estrutura", est);
+
+    // Postos
+    map<string,string> pts = {};
+    pts["PRENSA"] = "{\"codigo\":\"PRENSA\",\"descricao\":\"Prensa 100t\",\"capacidade_h\":8.0}";
+    pts["MONTAGEM"] = "{\"codigo\":\"MONTAGEM\",\"descricao\":\"Bancada de Montagem\",\"capacidade_h\":8.0}";
+    db::salvar(dir, "postos", pts);
+
+    // Operações e Roteiro do MOTOR
+    map<string,string> opers = {};
+    roteiros::Parametro[] params = [];
+    opers["ESTAMPAR"] = json_encode(roteiros::Operacao { codigo: "ESTAMPAR", descricao: "Estampagem", tipo: "AUTOMATICA", instrucao: "Estampar", parametros: params });
+    opers["MONTAR"] = json_encode(roteiros::Operacao { codigo: "MONTAR", descricao: "Montagem", tipo: "MANUAL", instrucao: "Montar", parametros: params });
+    db::salvar(dir, "operacoes", opers);
+
+    map<string,string> rot = {};
+    roteiros::Etapa[] etps = [
+        roteiros::Etapa { numero: 1, operacao: "ESTAMPAR", posto: "PRENSA", tempo_min: 3.0, instrucao: "" },
+        roteiros::Etapa { numero: 2, operacao: "MONTAR", posto: "MONTAGEM", tempo_min: 3.0, instrucao: "" }
+    ];
+    rot["MOTOR"] = json_encode(etps);
+    db::salvar(dir, "roteiros", rot);
+
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(roteiros::descritor().iniciar, dir);
+    _iniciar(producao::descritor().iniciar, dir);
+    _iniciar(custos::descritor().iniciar, dir);
+
+    return dir;
+}
+
+test fn configurar_precos_e_taxas() ={
+    string dir = _preparar("cfg");
+
+    // Preço CHAPA: R$ 15.00
+    k::Resposta r1 = _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=CHAPA&preco=15.0"));
+    assert(r1.status == 200, "salvar preco chapa");
+
+    // Preço PARAF: R$ 0.50
+    k::Resposta r2 = _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=PARAF&preco=0.5"));
+    assert(r2.status == 200, "salvar preco parafuso");
+
+    // Taxa horária PRENSA: R$ 90.00/h
+    k::Resposta r3 = _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=PRENSA&taxa_h=90.0"));
+    assert(r3.status == 200, "salvar taxa prensa");
+
+    // Taxa horária MONTAGEM: R$ 30.00/h
+    k::Resposta r4 = _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=MONTAGEM&taxa_h=30.0"));
+    assert(r4.status == 200, "salvar taxa montagem");
+
+    // Consulta preço
+    k::Resposta r_c = _rotear(custos::descritor().rotear, _req("GET", "/precos_materiais?produto=CHAPA", ""));
+    assert(r_c.status == 200, "consultar chapa");
+    assert(contains(r_c.corpo, "\"preco_unitario\":15"), "preco 15 na resposta");
+
+    // Consulta taxa
+    k::Resposta r_tx = _rotear(custos::descritor().rotear, _req("GET", "/taxas_postos?posto=PRENSA", ""));
+    assert(r_tx.status == 200, "consultar prensa");
+    assert(contains(r_tx.corpo, "\"taxa_h\":90"), "taxa 90 na resposta");
+}
+
+test fn custo_padrao_da_engenharia() ={
+    string dir = _preparar("padrao");
+
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=CHAPA&preco=15.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=PARAF&preco=0.5"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=PRENSA&taxa_h=90.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=MONTAGEM&taxa_h=30.0"));
+
+    // Cria OP de 10 unidades de MOTOR
+    int op_id = producao::criar_op("MOTOR", 10.0, "PRENSA", "");
+    assert(op_id > 0, "op criada");
+
+    // Análise de custo
+    custos::AnaliseCustoOp c = custos::analisar_op(op_id);
+    assert(c.op == op_id, "op bate");
+
+    // MD Padrão = 10 * (2 * 15.00 + 4 * 0.50) = 10 * 32.00 = 320.00
+    assert(c.md_padrao == 320.0, "md padrao deve ser 320.00");
+
+    // MOD Padrão:
+    // Etapa 1 PRENSA: 10 un * 3 min = 30 min (0.5 h) * 90.00 = 45.00
+    // Etapa 2 MONTAGEM: 10 un * 3 min = 30 min (0.5 h) * 30.00 = 15.00
+    // Total MOD = 60.00
+    assert(c.mod_padrao == 60.0, "mod padrao deve ser 60.00");
+
+    // Custo Total Padrão = 320 + 60 = 380.00
+    assert(c.total_padrao == 380.0, "total padrao 380.00");
+
+    // Custo Unitário Padrão = 380.00 / 10 = 38.00
+    assert(c.unitario_padrao == 38.0, "unitario padrao 38.00");
+}
+
+test fn custo_real_com_desvio_favoravel() ={
+    string dir = _preparar("fav");
+
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=CHAPA&preco=15.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=PARAF&preco=0.5"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=PRENSA&taxa_h=90.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=MONTAGEM&taxa_h=30.0"));
+
+    int op_id = producao::criar_op("MOTOR", 10.0, "PRENSA", "");
+    _rotear(producao::descritor().rotear, k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/liberar?id=" + to_string(op_id),
+        rota: "/liberar", query: "id=" + to_string(op_id), corpo: "", usuario: "admin", perfil: "admin"
+    });
+
+    // Aponta etapa 1 (10 boas)
+    _rotear(producao::descritor().rotear, k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id),
+        corpo: "boa=10&refugo=0", usuario: "admin", perfil: "admin"
+    });
+    // Aponta etapa 2 (10 boas) -> conclui OP
+    _rotear(producao::descritor().rotear, k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id),
+        corpo: "boa=10&refugo=0", usuario: "admin", perfil: "admin"
+    });
+
+    custos::AnaliseCustoOp c = custos::analisar_op(op_id);
+    assert(c.produzido == 10.0, "produzido 10");
+    assert(c.refugo == 0.0, "refugo 0");
+    assert(c.total_real == 380.0, "total real bate padrao");
+    assert(c.unitario_real == 38.0, "unitario real 38.00");
+    assert(c.desvio_total == 0.0, "desvio zero");
+    assert(c.situacao == "FAVORAVEL", "situacao favoravel");
+}
+
+test fn custo_real_com_refugo_desfavoravel() ={
+    string dir = _preparar("desfav");
+
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=CHAPA&preco=15.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=PARAF&preco=0.5"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=PRENSA&taxa_h=90.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=MONTAGEM&taxa_h=30.0"));
+
+    int op_id = producao::criar_op("MOTOR", 10.0, "PRENSA", "");
+    _rotear(producao::descritor().rotear, k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/liberar?id=" + to_string(op_id),
+        rota: "/liberar", query: "id=" + to_string(op_id), corpo: "", usuario: "admin", perfil: "admin"
+    });
+
+    // Etapa 1: 8 boas, 2 refugo
+    _rotear(producao::descritor().rotear, k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id),
+        corpo: "boa=8&refugo=2", usuario: "admin", perfil: "admin"
+    });
+    // Etapa 2: 8 boas, 0 refugo -> conclui OP
+    _rotear(producao::descritor().rotear, k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id),
+        corpo: "boa=8&refugo=0", usuario: "admin", perfil: "admin"
+    });
+
+    custos::AnaliseCustoOp c = custos::analisar_op(op_id);
+    assert(c.produzido == 8.0, "produzido 8");
+    assert(c.refugo == 2.0, "refugo 2");
+    assert(c.custo_refugo > 0.0, "custo refugo calculado");
+
+    // Como apenas 8 peças boas foram produzidas com o custo de 10, o custo unitário real subiu
+    assert(c.unitario_real > c.unitario_padrao, "custo unitario real subiu com o refugo");
+    assert(c.unitario_real > 45.0, "unitario real acima de 45.00");
+}
+
+test fn fechamento_contabil_e_resumo() ={
+    string dir = _preparar("fech");
+
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=CHAPA&preco=15.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/precos_materiais", "produto=PARAF&preco=0.5"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=PRENSA&taxa_h=90.0"));
+    _rotear(custos::descritor().rotear, _req("POST", "/taxas_postos", "posto=MONTAGEM&taxa_h=30.0"));
+
+    int op_id = producao::criar_op("MOTOR", 5.0, "PRENSA", "");
+
+    // Fechar apropriação
+    k::Resposta r_f = _rotear(custos::descritor().rotear, _req("POST", "/fechar?op=" + to_string(op_id), ""));
+    assert(r_f.status == 200, "fechar op");
+    assert(contains(r_f.corpo, "\"fechada\":true"), "op marcada como fechada");
+
+    // Consulta resumo
+    k::Resposta r_res = _rotear(custos::descritor().rotear, _req("GET", "/resumo", ""));
+    assert(r_res.status == 200, "consultar resumo");
+    assert(contains(r_res.corpo, "\"total_ops\":1"), "total_ops 1");
+    assert(contains(r_res.corpo, "\"ops_fechadas\":1"), "ops_fechadas 1");
+
+    // Consulta lista geral de ordens
+    k::Resposta r_ords = _rotear(custos::descritor().rotear, _req("GET", "/ordens", ""));
+    assert(r_ords.status == 200, "listar ordens");
+    assert(contains(r_ords.corpo, "\"op\":" + to_string(op_id)), "op presente na lista");
+}

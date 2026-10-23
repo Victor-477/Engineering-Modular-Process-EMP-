@@ -2,6 +2,24 @@
 
 ## Não lançado
 
+### Novo — fase 6: Custos Industriais e Manutenção Preventiva por Horas e Ciclos
+- **Módulo de Custos Industriais e Apropriação** (`src/modulos/custos/`, prefixo `/api/custos`, escrita por admin/pcp):
+  - Configuração de tabela de preços de materiais (`POST /api/custos/precos_materiais`) e taxas horárias de postos de trabalho (`POST /api/custos/taxas_postos`).
+  - **Custo Padrão da Engenharia**: apuração exata de Material Direto (MD) a partir da estrutura multinível (BOM) e Mão de Obra e Máquina (MOD/GGF) a partir dos tempos do roteiro operacional e taxas horárias dos postos.
+  - **Apropriação do Custo Real da OP**: consolidação dos insumos consumidos (incluindo sobreconsumo por refugo) e horas reais apontadas nas etapas.
+  - **Análise de Desvio e Refugo**: cálculo da variação de custos (absoluta e percentual), custo financeiro de refugo gerado nas etapas e classificação de situação da OP (`FAVORAVEL` ou `DESFAVORAVEL`).
+  - **Fechamento Contábil de Custos**: rota `POST /api/custos/fechar?op=N` com congelamento de snapshot e publicação do evento `custos.op_fechada`.
+  - **DRE Industrial / Resumo de Custos**: `GET /api/custos/resumo` com visão agregada de custos da fábrica, desvios acumulados e OPs com estouro de custo.
+- **Manutenção Preventiva por Horas e Ciclos** (`src/modulos/manutencao/`, prefixo `/api/manutencao`):
+  - Planos de manutenção preventiva (`PlanoPreventiva`) por posto com gatilhos de `HORAS` de operação ou `CICLOS` de produção (peças fabricadas).
+  - Assinatura automática de `producao.etapa_apontada` e `producao.apontada` para acumular desgaste contínuo de cada máquina sem acoplamento direto.
+  - Alerta antecipado (ao atingir 85% do limite) e marcação de `VENCIDO` com emissão imediata de `manutencao.preventiva_vencida` (ao atingir 100%).
+  - Rota de execução de preventiva `POST /api/manutencao/preventivas/executar?id=N` com técnico, observações, registro de histórico (`HistoricoPreventiva`), publicação de `manutencao.preventiva_executada` e reset automático de acumulador.
+- **Painel Web**:
+  - Nova aba e seção **Custos Industriais** no menu e no dashboard, com KPIs de custo padrão/real/desvio/refugo, formulários de configuração de preços/taxas, tabela de apropriação com ações e modal de detalhamento da OP.
+  - Seção de Manutenção enriquecida com cards visuais de planos preventivos, barras de progresso percentual, badges de estado (`OK`, `ALERTA`, `VENCIDO`), botão de execução rápida e tabela de histórico de preventivas.
+- **Testes**: +10 casos (+5 em `test_custos.cryo` e +5 em `test_manutencao.cryo`), totalizando **81 testes automatizados** passando no `build.ps1`.
+
 ### Novo — fase 5: Rastreabilidade de Lotes e Genealogia Industrial (Recall)
 - **Módulo de Lotes e Rastreabilidade** (`src/modulos/lotes/`, prefixo `/api/lotes`, escrita por admin/qualidade/pcp/estoque):
   - Cadastro e controle de lotes de matéria-prima e produtos acabados com controle de status (`LIBERADO`, `QUARENTENA`, `BLOQUEADO`), data de validade, quantidade inicial, quantidade atual e lote do fornecedor.

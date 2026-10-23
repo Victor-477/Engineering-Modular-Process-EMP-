@@ -1,0 +1,493 @@
+// ============================================================
+//  custos.cryo — Módulo de Custos Industriais e Apropriação
+//
+//  Apurar o Custo Padrão da engenharia e o Custo Real de fabricação
+//  de cada Ordem de Produção (OP), decomposto em:
+//    - Material Direto (MD): matérias-primas e insumos (BOM)
+//    - Mão de Obra e Máquina (MOD / GGF): horas nos postos × taxa horária
+//    - Custo do Refugo: impacto financeiro de perdas e peças refugadas
+//
+//  Calcula a variação de custo (desvio absoluto e percentual),
+//  classificando a OP como FAVORAVEL ou DESFAVORAVEL.
+//
+//  Rotas (prefixo /api/custos):
+//    GET  /precos_materiais[?produto=X]
+//    POST /precos_materiais          produto=&preco=
+//    GET  /taxas_postos[?posto=X]
+//    POST /taxas_postos              posto=&taxa_h=
+//    GET  /op?id=N                   análise detalhada de custo da OP
+//    POST /fechar?op=N               fecha apropriação e publica custos.op_fechada
+//    GET  /resumo                    indicadores agregados de custo da fábrica
+//    GET  /ordens                    lista de análises de todas as OPs
+//
+//  Eventos publicados:
+//    custos.op_fechada               op=&produto=&custo_real=&custo_unitario=&desvio=&situacao=
+//
+//  Eventos assinados:
+//    op.concluida, producao.apontada
+// ============================================================
+
+import "../../nucleo/contrato.cryo"         as k;
+import "../../nucleo/persist.cryo"          as db;
+import "../../nucleo/eventos.cryo"          as ev;
+import "../../nucleo/form.cryo"             as form;
+import "../cadastros/cadastros.cryo"        as cadastros;
+import "../roteiros/roteiros.cryo"          as roteiros;
+import "../producao/producao.cryo"          as producao;
+import "../producao/etapas.cryo"            as etp;
+
+pub struct PrecoMaterial {
+    string produto;
+    number preco_unitario;
+    int atualizado_em;
+}
+
+pub struct TaxaPosto {
+    string posto;
+    number taxa_h;
+    int atualizado_em;
+}
+
+pub struct ComponenteCusto {
+    string componente;
+    number quantidade_padrao;
+    number quantidade_real;
+    number preco_unitario;
+    number total_padrao;
+    number total_real;
+}
+
+pub struct EtapaCusto {
+    int etapa;
+    string operacao;
+    string posto;
+    number horas_padrao;
+    number horas_real;
+    number taxa_h;
+    number total_padrao;
+    number total_real;
+}
+
+pub struct AnaliseCustoOp {
+    int op;
+    string produto;
+    number quantidade_planejada;
+    number produzido;
+    number refugo;
+    string status;
+    number md_padrao;
+    number md_real;
+    number mod_padrao;
+    number mod_real;
+    number custo_refugo;
+    number total_padrao;
+    number total_real;
+    number unitario_padrao;
+    number unitario_real;
+    number desvio_total;
+    number desvio_pct;
+    string situacao;            // "FAVORAVEL" | "DESFAVORAVEL"
+    bool fechada;
+    int fechada_em;
+    ComponenteCusto[] componentes;
+    EtapaCusto[] etapas;
+}
+
+pub struct ResumoCustos {
+    int total_ops;
+    int ops_fechadas;
+    int ops_desfavoraveis;
+    number total_padrao;
+    number total_real;
+    number total_desvio;
+    number total_refugo;
+}
+
+string _dir = "";
+map<string,string> _precos = {};      // produto -> json(PrecoMaterial)
+map<string,string> _taxas = {};       // posto -> json(TaxaPosto)
+map<string,string> _fechamentos = {}; // op -> json(AnaliseCustoOp)
+
+fn _r2(number v) -> number ={
+    return round(v * 100.0) / 100.0;
+}
+
+fn _obter_preco(string produto) -> number ={
+    if (has(_precos, produto)) {
+        PrecoMaterial pm = json_decode(_precos[produto]) as PrecoMaterial;
+        return pm.preco_unitario;
+    }
+    // Preço padrão estimado inicial caso não configurado
+    return 10.0;
+}
+
+fn _obter_taxa(string posto) -> number ={
+    if (has(_taxas, posto)) {
+        TaxaPosto tp = json_decode(_taxas[posto]) as TaxaPosto;
+        return tp.taxa_h;
+    }
+    // Taxa horária padrão estimada inicial (R$ 60/h)
+    return 60.0;
+}
+
+// ── cálculo de apropriação de custo por OP ─────────────────
+
+pub fn analisar_op(int op_id) -> AnaliseCustoOp ={
+    producao::OrdemProducao op = producao::ordem(op_id);
+    if (op.id == 0) {
+        ComponenteCusto[] vazia_c = [];
+        EtapaCusto[] vazia_e = [];
+        return AnaliseCustoOp {
+            op: 0, produto: "", quantidade_planejada: 0.0, produzido: 0.0, refugo: 0.0,
+            status: "", md_padrao: 0.0, md_real: 0.0, mod_padrao: 0.0, mod_real: 0.0,
+            custo_refugo: 0.0, total_padrao: 0.0, total_real: 0.0, unitario_padrao: 0.0,
+            unitario_real: 0.0, desvio_total: 0.0, desvio_pct: 0.0, situacao: "FAVORAVEL",
+            fechada: false, fechada_em: 0, componentes: vazia_c, etapas: vazia_e
+        };
+    }
+
+    number qtd_plan = op.quantidade;
+    number boas = op.produzido;
+    number refugo = op.refugo;
+    number total_fabricado = boas + refugo;
+    if (total_fabricado == 0.0 && (op.status == "PLANEJADA" || op.status == "LIBERADA")) {
+        total_fabricado = qtd_plan;
+    }
+
+    // 1. Material Direto (MD)
+    number md_padrao = 0.0;
+    number md_real = 0.0;
+    number refugo_md = 0.0;
+    ComponenteCusto[] comps = [];
+
+    for (cadastros::ItemEstrutura it in cadastros::estrutura(op.produto)) {
+        number preco = _obter_preco(it.componente);
+        number q_padrao = _r2(it.quantidade * qtd_plan);
+        number c_padrao = _r2(q_padrao * preco);
+        md_padrao = md_padrao + c_padrao;
+
+        number q_real = _r2(it.quantidade * total_fabricado);
+        number c_real = _r2(q_real * preco);
+        md_real = md_real + c_real;
+
+        if (refugo > 0.0) {
+            refugo_md = refugo_md + _r2(it.quantidade * refugo * preco);
+        }
+
+        comps = concat(comps, [ComponenteCusto {
+            componente: it.componente,
+            quantidade_padrao: q_padrao,
+            quantidade_real: q_real,
+            preco_unitario: preco,
+            total_padrao: c_padrao,
+            total_real: c_real
+        }]);
+    }
+
+    // 2. Mão de Obra e Máquina (MOD / GGF)
+    number mod_padrao = 0.0;
+    number mod_real = 0.0;
+    number refugo_mod = 0.0;
+    EtapaCusto[] etps = [];
+
+    etp::Execucao ex = producao::execucao_da_op(op_id);
+    if (len(ex.etapas) > 0) {
+        for (etp::EtapaOP eo in ex.etapas) {
+            number tx = _obter_taxa(eo.posto);
+            number t_min = eo.tempo_min > 0.0 ? eo.tempo_min : 5.0;
+
+            number h_padrao = _r2((qtd_plan * t_min) / 60.0);
+            number c_padrao = _r2(h_padrao * tx);
+            mod_padrao = mod_padrao + c_padrao;
+
+            number h_real = 0.0;
+            if (eo.fim > eo.inicio && eo.inicio > 0) {
+                h_real = _r2((eo.fim - eo.inicio) / 3600000.0);
+            } else {
+                number q_etp = (eo.boas + eo.refugo) > 0.0 ? (eo.boas + eo.refugo) : total_fabricado;
+                h_real = _r2((q_etp * t_min) / 60.0);
+            }
+            number c_real = _r2(h_real * tx);
+            mod_real = mod_real + c_real;
+
+            if (eo.refugo > 0.0) {
+                refugo_mod = refugo_mod + _r2(((eo.refugo * t_min) / 60.0) * tx);
+            }
+
+            etps = concat(etps, [EtapaCusto {
+                etapa: eo.numero,
+                operacao: eo.operacao,
+                posto: eo.posto,
+                horas_padrao: h_padrao,
+                horas_real: h_real,
+                taxa_h: tx,
+                total_padrao: c_padrao,
+                total_real: c_real
+            }]);
+        }
+    } else {
+        for (roteiros::Etapa re in roteiros::etapas(op.produto)) {
+            number tx = _obter_taxa(re.posto);
+            number t_min = re.tempo_min > 0.0 ? re.tempo_min : 5.0;
+
+            number h_padrao = _r2((qtd_plan * t_min) / 60.0);
+            number c_padrao = _r2(h_padrao * tx);
+            mod_padrao = mod_padrao + c_padrao;
+
+            number h_real = _r2((total_fabricado * t_min) / 60.0);
+            number c_real = _r2(h_real * tx);
+            mod_real = mod_real + c_real;
+
+            etps = concat(etps, [EtapaCusto {
+                etapa: re.numero,
+                operacao: re.operacao,
+                posto: re.posto,
+                horas_padrao: h_padrao,
+                horas_real: h_real,
+                taxa_h: tx,
+                total_padrao: c_padrao,
+                total_real: c_real
+            }]);
+        }
+    }
+
+    number total_padrao = _r2(md_padrao + mod_padrao);
+    number total_real = _r2(md_real + mod_real);
+    number custo_refugo = _r2(refugo_md + refugo_mod);
+
+    number unit_padrao = qtd_plan > 0.0 ? _r2(total_padrao / qtd_plan) : 0.0;
+    number unit_real = boas > 0.0 ? _r2(total_real / boas) : (qtd_plan > 0.0 ? _r2(total_real / qtd_plan) : 0.0);
+
+    number desvio = _r2(total_real - total_padrao);
+    number desvio_pct = total_padrao > 0.0 ? _r2((desvio * 100.0) / total_padrao) : 0.0;
+    string situacao = desvio <= 0.01 ? "FAVORAVEL" : "DESFAVORAVEL";
+
+    bool fechada = has(_fechamentos, to_string(op_id));
+    int fechada_em = 0;
+    if (fechada) {
+        AnaliseCustoOp salvo = json_decode(_fechamentos[to_string(op_id)]) as AnaliseCustoOp;
+        fechada_em = salvo.fechada_em;
+    }
+
+    return AnaliseCustoOp {
+        op: op.id,
+        produto: op.produto,
+        quantidade_planejada: qtd_plan,
+        produzido: boas,
+        refugo: refugo,
+        status: op.status,
+        md_padrao: md_padrao,
+        md_real: md_real,
+        mod_padrao: mod_padrao,
+        mod_real: mod_real,
+        custo_refugo: custo_refugo,
+        total_padrao: total_padrao,
+        total_real: total_real,
+        unitario_padrao: unit_padrao,
+        unitario_real: unit_real,
+        desvio_total: desvio,
+        desvio_pct: desvio_pct,
+        situacao: situacao,
+        fechada: fechada,
+        fechada_em: fechada_em,
+        componentes: comps,
+        etapas: etps
+    };
+}
+
+pub fn resumo_custos() -> ResumoCustos ={
+    int total_ops = 0;
+    int fechadas = 0;
+    int desfavoraveis = 0;
+    number tot_padrao = 0.0;
+    number tot_real = 0.0;
+    number tot_desvio = 0.0;
+    number tot_refugo = 0.0;
+
+    for (producao::OrdemProducao op in producao::todas_ordens()) {
+        total_ops = total_ops + 1;
+        AnaliseCustoOp a = analisar_op(op.id);
+        if (a.fechada) { fechadas = fechadas + 1; }
+        if (a.situacao == "DESFAVORAVEL") { desfavoraveis = desfavoraveis + 1; }
+        tot_padrao = tot_padrao + a.total_padrao;
+        tot_real = tot_real + a.total_real;
+        tot_desvio = tot_desvio + a.desvio_total;
+        tot_refugo = tot_refugo + a.custo_refugo;
+    }
+
+    return ResumoCustos {
+        total_ops: total_ops,
+        ops_fechadas: fechadas,
+        ops_desfavoraveis: desfavoraveis,
+        total_padrao: _r2(tot_padrao),
+        total_real: _r2(tot_real),
+        total_desvio: _r2(tot_desvio),
+        total_refugo: _r2(tot_refugo)
+    };
+}
+
+// ── rotas HTTP ────────────────────────────────────────────
+
+fn _listar_precos(string prod) -> k::Resposta ={
+    if (len(prod) > 0) {
+        if (!has(_precos, prod)) {
+            PrecoMaterial padrao = PrecoMaterial { produto: prod, preco_unitario: _obter_preco(prod), atualizado_em: 0 };
+            return k::ok(json_encode(padrao));
+        }
+        return k::ok(_precos[prod]);
+    }
+    string[] lista = [];
+    for (string c in cadastros::produtos_codigos()) {
+        PrecoMaterial pm = PrecoMaterial { produto: c, preco_unitario: _obter_preco(c), atualizado_em: 0 };
+        if (has(_precos, c)) {
+            pm = json_decode(_precos[c]) as PrecoMaterial;
+        }
+        lista = concat(lista, [json_encode(pm)]);
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn _salvar_preco(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string prod = upper(form::campo(f, "produto"));
+    number preco = form::numero(f, "preco", -1.0);
+    if (!cadastros::existe(prod)) { return k::erro(422, "produto " + prod + " não cadastrado"); }
+    if (preco < 0.0) { return k::erro(422, "preço deve ser maior ou igual a zero"); }
+
+    PrecoMaterial pm = PrecoMaterial { produto: prod, preco_unitario: _r2(preco), atualizado_em: now_ms() };
+    _precos[prod] = json_encode(pm);
+    if (!db::salvar(_dir, "precos", _precos)) { return k::erro(500, "falha ao salvar preço"); }
+    return k::ok(_precos[prod]);
+}
+
+fn _listar_taxas(string pt) -> k::Resposta ={
+    if (len(pt) > 0) {
+        if (!has(_taxas, pt)) {
+            TaxaPosto padrao = TaxaPosto { posto: pt, taxa_h: _obter_taxa(pt), atualizado_em: 0 };
+            return k::ok(json_encode(padrao));
+        }
+        return k::ok(_taxas[pt]);
+    }
+    string[] lista = [];
+    for (string c in cadastros::postos_codigos()) {
+        TaxaPosto tp = TaxaPosto { posto: c, taxa_h: _obter_taxa(c), atualizado_em: 0 };
+        if (has(_taxas, c)) {
+            tp = json_decode(_taxas[c]) as TaxaPosto;
+        }
+        lista = concat(lista, [json_encode(tp)]);
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn _salvar_taxa(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string pt = upper(form::campo(f, "posto"));
+    number taxa = form::numero(f, "taxa_h", -1.0);
+    if (!cadastros::posto_existe(pt)) { return k::erro(422, "posto " + pt + " não cadastrado"); }
+    if (taxa < 0.0) { return k::erro(422, "taxa_h deve ser maior ou igual a zero"); }
+
+    TaxaPosto tp = TaxaPosto { posto: pt, taxa_h: _r2(taxa), atualizado_em: now_ms() };
+    _taxas[pt] = json_encode(tp);
+    if (!db::salvar(_dir, "taxas", _taxas)) { return k::erro(500, "falha ao salvar taxa"); }
+    return k::ok(_taxas[pt]);
+}
+
+fn _fechar_op(k::Requisicao r) -> k::Resposta ={
+    int op_id = parse_int(k::param(r, "op")) ?? 0;
+    if (op_id <= 0) {
+        map<string,string> f = form::ler(r.corpo);
+        op_id = form::inteiro(f, "op", 0);
+    }
+    producao::OrdemProducao op = producao::ordem(op_id);
+    if (op.id == 0) { return k::erro(404, "ordem de produção não encontrada"); }
+
+    AnaliseCustoOp a = analisar_op(op_id);
+    AnaliseCustoOp fechada = AnaliseCustoOp {
+        op: a.op, produto: a.produto, quantidade_planejada: a.quantidade_planejada,
+        produzido: a.produzido, refugo: a.refugo, status: a.status,
+        md_padrao: a.md_padrao, md_real: a.md_real, mod_padrao: a.mod_padrao,
+        mod_real: a.mod_real, custo_refugo: a.custo_refugo, total_padrao: a.total_padrao,
+        total_real: a.total_real, unitario_padrao: a.unitario_padrao,
+        unitario_real: a.unitario_real, desvio_total: a.desvio_total,
+        desvio_pct: a.desvio_pct, situacao: a.situacao, fechada: true,
+        fechada_em: now_ms(), componentes: a.componentes, etapas: a.etapas
+    };
+
+    _fechamentos[to_string(op_id)] = json_encode(fechada);
+    if (!db::salvar(_dir, "fechamentos", _fechamentos)) {
+        return k::erro(500, "falha ao registrar fechamento de custo");
+    }
+
+    ev::publicar("custos.op_fechada", "custos", "op=" + to_string(op_id)
+        + "&produto=" + url_encode(fechada.produto)
+        + "&custo_real=" + to_string(fechada.total_real)
+        + "&custo_unitario=" + to_string(fechada.unitario_real)
+        + "&desvio=" + to_string(fechada.desvio_total)
+        + "&situacao=" + fechada.situacao);
+
+    return k::ok(json_encode(fechada));
+}
+
+fn _listar_ordens() -> k::Resposta ={
+    string[] lista = [];
+    for (producao::OrdemProducao op in producao::todas_ordens()) {
+        AnaliseCustoOp a = analisar_op(op.id);
+        lista = concat(lista, [json_encode(a)]);
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/precos_materiais" && r.metodo == "GET") { return _listar_precos(upper(k::param(r, "produto"))); }
+    if (r.rota == "/precos_materiais" && r.metodo == "POST") { return _salvar_preco(r); }
+    if (r.rota == "/taxas_postos" && r.metodo == "GET") { return _listar_taxas(upper(k::param(r, "posto"))); }
+    if (r.rota == "/taxas_postos" && r.metodo == "POST") { return _salvar_taxa(r); }
+    if (r.rota == "/op" && r.metodo == "GET") {
+        int id = parse_int(k::param(r, "id")) ?? 0;
+        AnaliseCustoOp a = analisar_op(id);
+        if (a.op == 0) { return k::erro(404, "ordem de produção não encontrada"); }
+        return k::ok(json_encode(a));
+    }
+    if (r.rota == "/fechar" && r.metodo == "POST") { return _fechar_op(r); }
+    if (r.rota == "/resumo" && r.metodo == "GET") { return k::ok(json_encode(resumo_custos())); }
+    if (r.rota == "/ordens" && r.metodo == "GET") { return _listar_ordens(); }
+    return k::nao_encontrado();
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _precos = db::carregar(dir, "precos");
+    _taxas = db::carregar(dir, "taxas");
+    _fechamentos = db::carregar(dir, "fechamentos");
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    if (e.tipo == "op.concluida") {
+        map<string,string> p = form::ler(e.corpo);
+        int op_id = form::inteiro(p, "op", 0);
+        if (op_id > 0) {
+            // Auto analisa custo e armazena fechamento preliminar
+            AnaliseCustoOp a = analisar_op(op_id);
+            _fechamentos[to_string(op_id)] = json_encode(a);
+            db::salvar(_dir, "fechamentos", _fechamentos);
+        }
+    }
+    return true;
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "custos",
+        nome: "Custos Industriais e Apropriação",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/custos",
+        depende: ["cadastros", "roteiros", "producao"],
+        assina: ["op.concluida", "producao.apontada"],
+        perfis_escrita: ["admin", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

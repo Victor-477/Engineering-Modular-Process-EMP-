@@ -1,0 +1,162 @@
+// Testes de Manutenção Industrial (Corretiva e Preventiva) com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_manutencao.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"               as k;
+import "../src/nucleo/eventos.cryo"                as ev;
+import "../src/nucleo/persist.cryo"                as db;
+import "../src/modulos/cadastros/cadastros.cryo"     as cadastros;
+import "../src/modulos/manutencao/manutencao.cryo"   as manutencao;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _req(string metodo, string rota, string corpo) -> k::Requisicao ={
+    string r = rota;
+    string q = "";
+    int inter = find(rota, "?");
+    if (inter > 0) {
+        string s_rota = rota;
+        r = s_rota[0..inter];
+        q = s_rota[inter + 1..];
+    }
+    return k::Requisicao {
+        metodo: metodo,
+        caminho: "/api/manutencao" + r,
+        rota: r,
+        query: q,
+        corpo: corpo,
+        usuario: "admin",
+        perfil: "admin"
+    };
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_manutencao")) { make_dir("build/test_manutencao"); }
+    string dir = "build/test_manutencao/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+    for (string c in ["postos", "paradas", "planos", "historico"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Postos
+    map<string,string> pts = {};
+    pts["PRENSA"] = "{\"codigo\":\"PRENSA\",\"descricao\":\"Prensa 100t\",\"capacidade_h\":8.0}";
+    pts["TORNO"] = "{\"codigo\":\"TORNO\",\"descricao\":\"Torno CNC\",\"capacidade_h\":8.0}";
+    db::salvar(dir, "postos", pts);
+
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(manutencao::descritor().iniciar, dir);
+
+    return dir;
+}
+
+test fn parada_corretiva_abrir_e_encerrar() ={
+    string dir = _preparar("corretiva");
+
+    // Abre parada na PRENSA
+    k::Resposta r1 = _rotear(manutencao::descritor().rotear,
+        _req("POST", "/paradas", "posto=PRENSA&categoria=MECANICA&motivo=Vazamento+de+oleo"));
+    assert(r1.status == 201, "abrir parada 201");
+    assert(contains(r1.corpo, "\"status\":\"ABERTA\""), "parada aberta");
+
+    // Consulta postos: PRENSA deve estar PARADO
+    k::Resposta r_pts = _rotear(manutencao::descritor().rotear, _req("GET", "/postos", ""));
+    assert(r_pts.status == 200, "consultar postos");
+    assert(contains(r_pts.corpo, "\"estado\":\"PARADO\""), "prensa parada");
+
+    // Encerrar parada
+    k::Resposta r_enc = _rotear(manutencao::descritor().rotear,
+        _req("POST", "/encerrar?id=1", "solucao=Troca+de+retentor+e+reaperto"));
+    assert(r_enc.status == 200, "encerrar parada 200");
+    assert(contains(r_enc.corpo, "\"status\":\"ENCERRADA\""), "parada encerrada");
+
+    // Consulta postos: PRENSA volta a OPERANDO
+    k::Resposta r_pts2 = _rotear(manutencao::descritor().rotear, _req("GET", "/postos", ""));
+    assert(contains(r_pts2.corpo, "\"estado\":\"OPERANDO\""), "prensa operando");
+}
+
+test fn criar_plano_preventiva() ={
+    string dir = _preparar("planos");
+
+    // Plano por CICLOS na PRENSA
+    k::Resposta r1 = _rotear(manutencao::descritor().rotear,
+        _req("POST", "/preventivas", "posto=PRENSA&titulo=Lubrificacao+de+fuso&tipo_gatilho=CICLOS&limite_gatilho=100"));
+    assert(r1.status == 201, "criar plano ciclos 201");
+    assert(contains(r1.corpo, "\"status\":\"OK\""), "status inicial OK");
+
+    // Plano por HORAS no TORNO
+    k::Resposta r2 = _rotear(manutencao::descritor().rotear,
+        _req("POST", "/preventivas", "posto=TORNO&titulo=Troca+de+filtro&tipo_gatilho=HORAS&limite_gatilho=2.5"));
+    assert(r2.status == 201, "criar plano horas 201");
+
+    // Listar todos
+    k::Resposta r_list = _rotear(manutencao::descritor().rotear, _req("GET", "/preventivas", ""));
+    assert(r_list.status == 200, "listar preventivas");
+    assert(contains(r_list.corpo, "Lubrificacao de fuso"), "plano prensa listado");
+    assert(contains(r_list.corpo, "Troca de filtro"), "plano torno listado");
+}
+
+test fn desgaste_por_ciclos_e_alerta() ={
+    string dir = _preparar("alerta");
+
+    _rotear(manutencao::descritor().rotear,
+        _req("POST", "/preventivas", "posto=PRENSA&titulo=Lubrificacao&tipo_gatilho=CICLOS&limite_gatilho=100"));
+
+    // Simula apontamento de 86 ciclos (86 >= 85% de 100 -> ALERTA)
+    _evento(manutencao::descritor().ao_evento, k::Evento {
+        id: 1, tipo: "producao.etapa_apontada", origem: "producao",
+        corpo: "posto=PRENSA&delta_boas=85&delta_refugo=1&tempo_min=2.0", criado_em: now_ms()
+    });
+
+    k::Resposta r = _rotear(manutencao::descritor().rotear, _req("GET", "/preventivas?posto=PRENSA", ""));
+    assert(r.status == 200, "consultar preventivas prensa");
+    assert(contains(r.corpo, "\"acumulado_atual\":86"), "acumulado 86");
+    assert(contains(r.corpo, "\"status\":\"ALERTA\""), "status ALERTA");
+}
+
+test fn desgaste_vencido_e_publica_evento() ={
+    string dir = _preparar("vencido");
+
+    _rotear(manutencao::descritor().rotear,
+        _req("POST", "/preventivas", "posto=PRENSA&titulo=Inspecao&tipo_gatilho=CICLOS&limite_gatilho=100"));
+
+    // Aponta 105 ciclos acumulados (105 >= 100 -> VENCIDO)
+    _evento(manutencao::descritor().ao_evento, k::Evento {
+        id: 1, tipo: "producao.etapa_apontada", origem: "producao",
+        corpo: "posto=PRENSA&delta_boas=100&delta_refugo=5&tempo_min=1.0", criado_em: now_ms()
+    });
+
+    k::Resposta r = _rotear(manutencao::descritor().rotear, _req("GET", "/preventivas?posto=PRENSA", ""));
+    assert(r.status == 200, "consultar preventivas prensa");
+    assert(contains(r.corpo, "\"acumulado_atual\":105"), "acumulado 105");
+    assert(contains(r.corpo, "\"status\":\"VENCIDO\""), "status VENCIDO");
+}
+
+test fn executar_preventiva_e_historico() ={
+    string dir = _preparar("exec");
+
+    _rotear(manutencao::descritor().rotear,
+        _req("POST", "/preventivas", "posto=PRENSA&titulo=Revisao&tipo_gatilho=CICLOS&limite_gatilho=50"));
+
+    // Acumula 60 ciclos (vencido)
+    _evento(manutencao::descritor().ao_evento, k::Evento {
+        id: 1, tipo: "producao.etapa_apontada", origem: "producao",
+        corpo: "posto=PRENSA&delta_boas=60&delta_refugo=0&tempo_min=1.0", criado_em: now_ms()
+    });
+
+    // Técnico executa a manutenção preventiva
+    k::Resposta r_ex = _rotear(manutencao::descritor().rotear,
+        _req("POST", "/preventivas/executar?id=1", "tecnico=carlos&observacao=Revisao+geral+realizada+com+sucesso"));
+    assert(r_ex.status == 200, "executar preventiva 200");
+    assert(contains(r_ex.corpo, "\"acumulado_atual\":0"), "acumulado zerado");
+    assert(contains(r_ex.corpo, "\"status\":\"OK\""), "status voltou para OK");
+    assert(contains(r_ex.corpo, "\"total_execucoes\":1"), "total_execucoes 1");
+
+    // Consulta histórico
+    k::Resposta r_h = _rotear(manutencao::descritor().rotear, _req("GET", "/preventivas/historico?posto=PRENSA", ""));
+    assert(r_h.status == 200, "consultar historico");
+    assert(contains(r_h.corpo, "\"tecnico\":\"carlos\""), "tecnico carlos no historico");
+    assert(contains(r_h.corpo, "\"acumulado_na_execucao\":60"), "acumulado 60 registrado");
+}
