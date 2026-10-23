@@ -225,6 +225,17 @@ fn _ler(int id) -> Pedido ={
     return json_decode(_pedidos[to_string(id)]) as Pedido;
 }
 
+pub fn pedidos_abertos() -> Pedido[] ={
+    Pedido[] lista = [];
+    for (string id in sort(keys(_pedidos))) {
+        Pedido p = _ler(parse_int(id) ?? 0);
+        if (p.status == "ABERTO" || p.status == "EM_PRODUCAO") {
+            lista = concat(lista, [p]);
+        }
+    }
+    return lista;
+}
+
 fn _gravar(Pedido p) -> bool ={
     _pedidos[to_string(p.id)] = json_encode(p);
     return db::salvar(_dir, "pedidos", _pedidos);

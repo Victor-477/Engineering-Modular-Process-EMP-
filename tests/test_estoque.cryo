@@ -101,7 +101,7 @@ fn _preparar(string caso) -> string ={
     if (!is_dir("build/test_estoque")) { make_dir("build/test_estoque"); }
     string dir = "build/test_estoque/" + caso;
     if (!is_dir(dir)) { make_dir(dir); }
-    for (string c in ["saldos", "posicoes", "movimentos", "enderecos", "reposicao", "produtos", "estrutura", "postos"]) {
+    for (string c in ["saldos", "posicoes", "movimentos", "enderecos", "reposicao", "ops_abertas", "produtos", "estrutura", "postos"]) {
         if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
     }
     map<string,string> prods = {};
@@ -211,7 +211,7 @@ test fn reposicao_sugere_e_avisa_ao_cruzar() ={
     // 15 SUP: 30 PARAF -> 70 < 80.
     _entregar("producao.apontada", "op=1&produto=SUP&boa=15&refugo=0&posto=MONT-01&operador=ana");
     assert(_publicados("estoque.abaixo_minimo") == 1, "um aviso ao cruzar");
-    assert(_get("/sugestoes", "") == "[{\"produto\":\"PARAF\",\"saldo\":70,\"minimo\":80,\"maximo\":300,"
+    assert(_get("/sugestoes", "") == "[{\"produto\":\"PARAF\",\"saldo\":70,\"em_producao\":0,\"saldo_projetado\":70,\"minimo\":80,\"maximo\":300,"
         + "\"quantidade_sugerida\":230,\"tipo\":\"COMPRAR\",\"endereco\":\"\"}]", "sugestão até o máximo");
     // Já abaixo: não repete o aviso.
     _entregar("producao.apontada", "op=2&produto=SUP&boa=1&refugo=0&posto=MONT-01&operador=ana");
@@ -244,4 +244,34 @@ test fn pedido_expedido_simulado() ={
     assert(estoque::saldo_em("GERAL", "BASE") == 6.0, "BASE só no GERAL");
     string movs = _get("/movimentos", "");
     assert(contains(movs, "\"tipo\":\"EXPEDICAO\"") && contains(movs, "\"origem\":\"pedido 12\""), "movimento EXPEDICAO");
+}
+
+test fn reposicao_desconta_ops_abertas() ={
+    string dir = _preparar("ops_abertas");
+    _iniciar(estoque::descritor().iniciar, dir);
+    assert(_post("/reposicao", "produto=SUP&minimo=10&maximo=50&tipo=PRODUZIR") == 201, "regra SUP");
+    assert(contains(_get("/sugestoes", ""), "\"produto\":\"SUP\""), "sugestão inicial de SUP");
+    assert(contains(_get("/sugestoes", ""), "\"quantidade_sugerida\":50"), "sugere 50");
+    assert(estoque::em_producao("SUP") == 0.0, "zero em produção");
+
+    // OP criada para 50 unidades cobre a reposição
+    _entregar("op.criada", "op=101&produto=SUP&quantidade=50");
+    assert(estoque::em_producao("SUP") == 50.0, "50 em produção");
+    assert(_get("/sugestoes", "") == "[]", "com OP aberta cobrindo o mínimo, não sugere");
+
+    // OP cancelada faz a sugestão voltar
+    _entregar("op.cancelada", "op=101&produto=SUP&quantidade=50");
+    assert(estoque::em_producao("SUP") == 0.0, "zero após cancelamento");
+    assert(contains(_get("/sugestoes", ""), "\"produto\":\"SUP\""), "voltou a sugerir");
+
+    // OP parcial (5 unidades) deixa saldo projetado 5 < 10, sugerindo 45
+    _entregar("op.liberada", "op=102&produto=SUP&quantidade=5");
+    assert(estoque::em_producao("SUP") == 5.0, "5 em produção");
+    string sug = _get("/sugestoes", "");
+    assert(contains(sug, "\"em_producao\":5") && contains(sug, "\"saldo_projetado\":5"), "mostra em_producao e saldo_projetado");
+    assert(contains(sug, "\"quantidade_sugerida\":45"), "sugere 45 restante");
+
+    // Conclusão da OP remove de ops_abertas
+    _entregar("op.concluida", "op=102&produto=SUP&quantidade=5");
+    assert(estoque::em_producao("SUP") == 0.0, "removida de ops abertas ao concluir");
 }

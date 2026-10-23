@@ -2,6 +2,31 @@
 
 ## Não lançado
 
+### Novo — fase 3: PCP / MRP e compras
+- **Módulo de PCP / MRP** (`src/modulos/mrp/`, prefixo `/api/mrp`, escrita por admin/pcp):
+  - Explosão de estrutura multinível (BOM) combinando demanda de pedidos comerciais abertos (`pedidos`) e regras de reposição mínima (`estoque`).
+  - Cálculo de necessidade líquida: `max(0, demanda_bruta - saldo - em_producao)`.
+  - Ação sugerida: `PRODUZIR` para PA e SA (com roteiro e posto padrão) ou `COMPRAR` para MP.
+  - `GET /api/mrp/plano`: lista de necessidades com nível, demanda bruta, saldo, em produção, necessidade líquida e ação.
+  - `POST /api/mrp/gerar_ordens`: gera automaticamente ordens de produção (`producao::criar_op`) com origem `MRP` para todas as necessidades líquidas de produção.
+  - Publica evento `mrp.ordens_geradas` (`total` e lista de `ops`).
+- **Plugin de Compras** (`plugins_src/compras/`, manifesto `plugins/compras.plugin`, executável `build/compras.exe`):
+  - Cadastro de fornecedores (`GET/POST /api/compras/fornecedores`) com dados de contato e prazo de entrega.
+  - Pedidos de compra (`GET/POST /api/compras/pedidos`) com itens, prazo e status.
+  - Recebimento de compra (`POST /api/compras/pedidos/receber?id=N`): marca o pedido como `RECEBIDO` e efetua a entrada dos produtos no estoque via `POST /api/estoque/entrada`.
+  - Escuta `estoque.abaixo_minimo` e `estoque.falta` gerando sugestões de compra automáticas (`GET /api/compras/sugestoes`).
+- **Painel**:
+  - Nova aba **MRP / PCP** no menu com tabela de necessidades, filtros por ação (PRODUZIR/COMPRAR), badges de status e botão para "Gerar Ordens de Produção (MRP)".
+  - Tabela de Reposição de Estoque enriquecida com colunas "Em Prod." e "Projetado".
+- **Testes**: +5 casos em `test_mrp` e +1 caso em `test_estoque`, totalizando 60 testes automatizados no `build.ps1`.
+
+### Corrigido (fase 3)
+- **/sugestoes desconta OPs já abertas**: o módulo de estoque agora assina `op.*` e rastreia `_ops_abertas`. Se o saldo projetado (`saldo + em_producao`) atingir o mínimo, a sugestão deixa de ser listada; caso contrário, sugere apenas a quantidade complementar (`maximo - saldo_projetado`). A API devolve `em_producao` e `saldo_projetado` no JSON.
+
+### Problemas conhecidos (fase 3)
+- Todos os componentes saem do endereço do posto da **última** etapa no
+  backflush: a estrutura não diz em que etapa cada componente entra.
+
 ### Novo — fase 2: comercial, estoque endereçado e OEE ([docs/FASE2.md](docs/FASE2.md))
 Inspirada no MES4 (`tblCustomer`/`tblOrder`, `tblBuffer`/`tblBufferPos`,
 `tblAutomaticOrder`, `tblMachineReport`). Detalhes, decisões e limites de cada
@@ -63,8 +88,7 @@ frente em [`docs/fase2/`](docs/fase2/).
   Regra em `cadastros::quantidade_invalida`. +casos em `test_pedidos`.
 
 ### Problemas conhecidos (fase 2)
-- `/sugestoes` não desconta OPs já abertas nem compras: depois de *Criar OP* a
-  sugestão continua até a produção entrar.
+- `/sugestoes` não descontava OPs abertas nem compras (corrigido na fase 3).
 - Todos os componentes saem do endereço do posto da **última** etapa no
   backflush: a estrutura não diz em que etapa cada componente entra.
 

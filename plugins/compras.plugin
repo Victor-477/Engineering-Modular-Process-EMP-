@@ -1,0 +1,11 @@
+# Manifesto do plugin externo de Compras e Fornecedores.
+# Copie este arquivo + compras.exe e reinicie o núcleo — nada é recompilado.
+id=compras
+nome=Compras e Fornecedores
+versao=1.0.0
+contrato=1
+prefixo=/api/compras
+url=http://127.0.0.1:8092
+depende=estoque
+assina=estoque.falta,estoque.abaixo_minimo
+perfis_escrita=admin,comprador

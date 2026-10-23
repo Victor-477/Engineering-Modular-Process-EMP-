@@ -1,0 +1,217 @@
+// Testes do MRP / PCP com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_mrp.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"           as k;
+import "../src/nucleo/eventos.cryo"            as ev;
+import "../src/nucleo/persist.cryo"            as db;
+import "../src/modulos/cadastros/cadastros.cryo" as cadastros;
+import "../src/modulos/roteiros/roteiros.cryo"   as roteiros;
+import "../src/modulos/producao/producao.cryo"   as producao;
+import "../src/modulos/estoque/estoque.cryo"     as estoque;
+import "../src/modulos/pedidos/pedidos.cryo"     as pedidos;
+import "../src/modulos/mrp/mrp.cryo"             as mrp;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _produto(map<string,string> m, string codigo, string tipo) ={
+    m[codigo] = json_encode(cadastros::Produto { codigo: codigo, descricao: codigo, unidade: "UN", tipo: tipo });
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_mrp")) { make_dir("build/test_mrp"); }
+    string dir = "build/test_mrp/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+    for (string c in ["saldos", "posicoes", "movimentos", "enderecos", "reposicao", "ops_abertas", "produtos", "estrutura", "postos", "ordens", "etapas", "pedidos", "clientes", "roteiros", "operacoes", "capacidades"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+    // Clientes
+    map<string,string> cls = {};
+    cls["ACME"] = "{\"codigo\":\"ACME\",\"nome\":\"ACME Corp\",\"documento\":\"\",\"contato\":\"\",\"email\":\"\",\"telefone\":\"\",\"endereco\":\"\"}";
+    db::salvar(dir, "clientes", cls);
+    // Cadastros básicos
+    map<string,string> prods = {};
+    _produto(prods, "PARAF", "MP");
+    _produto(prods, "CHAPA", "MP");
+    _produto(prods, "BASE", "SA");
+    _produto(prods, "SUP", "PA");
+    db::salvar(dir, "produtos", prods);
+
+    // Estrutura multinível:
+    // SUP (PA) = 2 PARAF (MP) + 1 BASE (SA)
+    // BASE (SA) = 1 CHAPA (MP)
+    map<string,string> est = {};
+    cadastros::ItemEstrutura[] bom_sup = [
+        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 2.0 },
+        cadastros::ItemEstrutura { componente: "BASE", quantidade: 1.0 }
+    ];
+    est["SUP"] = json_encode(bom_sup);
+    cadastros::ItemEstrutura[] bom_base = [
+        cadastros::ItemEstrutura { componente: "CHAPA", quantidade: 1.0 }
+    ];
+    est["BASE"] = json_encode(bom_base);
+    db::salvar(dir, "estrutura", est);
+
+    // Postos de trabalho
+    map<string,string> postos = {};
+    postos["MONT-01"] = "{\"codigo\":\"MONT-01\",\"descricao\":\"Montagem\",\"capacidade_h\":8}";
+    postos["PREN-01"] = "{\"codigo\":\"PREN-01\",\"descricao\":\"Prensa\",\"capacidade_h\":8}";
+    db::salvar(dir, "postos", postos);
+
+    // Roteiros
+    map<string,string> rots = {};
+    roteiros::Etapa[] r_sup = [
+        roteiros::Etapa { numero: 10, operacao: "MONTAGEM", posto: "MONT-01", tempo_min: 15.0, instrucao: "" }
+    ];
+    rots["SUP"] = json_encode(r_sup);
+    roteiros::Etapa[] r_base = [
+        roteiros::Etapa { numero: 10, operacao: "ESTAMPAGEM", posto: "PREN-01", tempo_min: 5.0, instrucao: "" }
+    ];
+    rots["BASE"] = json_encode(r_base);
+    db::salvar(dir, "roteiros", rots);
+
+    // Inicia os módulos no diretório de teste
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(roteiros::descritor().iniciar, dir);
+    _iniciar(producao::descritor().iniciar, dir);
+    _iniciar(estoque::descritor().iniciar, dir);
+    _iniciar(pedidos::descritor().iniciar, dir);
+    _iniciar(mrp::descritor().iniciar, dir);
+
+    // Limpa fila de eventos
+    ev::retirar();
+    return dir;
+}
+
+test fn plano_vazio_sem_demanda() ={
+    _preparar("vazio");
+    mrp::ItemPlanoMrp[] plano = mrp::calcular_plano();
+    assert(len(plano) == 0, "sem pedidos e sem regras, plano é vazio");
+}
+
+test fn explosao_multinivel_por_pedido() ={
+    string dir = _preparar("pedido");
+    // Cria pedido com 10 SUP
+    k::Requisicao req = k::Requisicao {
+        metodo: "POST", rota: "/pedidos", query: "",
+        corpo: "cliente=ACME&itens=SUP:10&prazo_dias=5",
+        usuario: "teste", perfil: "admin"
+    };
+    k::Resposta resp = _rotear(pedidos::descritor().rotear, req);
+    assert(resp.status == 201, "pedido criado");
+
+    mrp::ItemPlanoMrp[] plano = mrp::calcular_plano();
+    assert(len(plano) == 4, "4 itens no plano (SUP, BASE, PARAF, CHAPA)");
+
+    // Verifica SUP (PA, nível 0)
+    assert(plano[3].produto == "SUP" && plano[3].nivel == 0, "SUP no nível 0");
+    assert(plano[3].demanda_bruta == 10.0 && plano[3].necessidade_liquida == 10.0, "10 SUP necessários");
+    assert(plano[3].acao == "PRODUZIR" && plano[3].posto == "MONT-01", "PRODUZIR no MONT-01");
+
+    // Verifica BASE (SA, nível 1)
+    assert(plano[0].produto == "BASE" && plano[0].nivel == 1, "BASE no nível 1");
+    assert(plano[0].demanda_bruta == 10.0 && plano[0].necessidade_liquida == 10.0, "10 BASE necessárias");
+    assert(plano[0].acao == "PRODUZIR" && plano[0].posto == "PREN-01", "PRODUZIR no PREN-01");
+
+    // Verifica PARAF (MP, nível 1)
+    assert(plano[2].produto == "PARAF" && plano[2].nivel == 1, "PARAF no nível 1");
+    assert(plano[2].demanda_bruta == 20.0 && plano[2].necessidade_liquida == 20.0, "20 PARAF necessários (2 x 10)");
+    assert(plano[2].acao == "COMPRAR", "COMPRAR matéria-prima");
+
+    // Verifica CHAPA (MP, nível 2)
+    assert(plano[1].produto == "CHAPA" && plano[1].nivel == 2, "CHAPA no nível 2");
+    assert(plano[1].demanda_bruta == 10.0 && plano[1].necessidade_liquida == 10.0, "10 CHAPA necessárias (1 x 10 BASE)");
+    assert(plano[1].acao == "COMPRAR", "COMPRAR matéria-prima");
+}
+
+test fn considera_estoque_e_ops_abertas() ={
+    string dir = _preparar("estoque_e_ops");
+    // Cria pedido com 10 SUP
+    k::Requisicao req = k::Requisicao {
+        metodo: "POST", rota: "/pedidos", query: "",
+        corpo: "cliente=ACME&itens=SUP:10&prazo_dias=5",
+        usuario: "teste", perfil: "admin"
+    };
+    _rotear(pedidos::descritor().rotear, req);
+
+    // Entrada de 4 SUP em estoque
+    k::Requisicao rentr = k::Requisicao {
+        metodo: "POST", rota: "/entrada", query: "",
+        corpo: "produto=SUP&quantidade=4",
+        usuario: "teste", perfil: "admin"
+    };
+    _rotear(estoque::descritor().rotear, rentr);
+
+    // OP aberta de 2 SUP (simula evento op.criada)
+    k::Evento ev_op = k::Evento {
+        id: 1, tipo: "op.criada", origem: "producao",
+        dados: "op=1&produto=SUP&quantidade=2&origem=manual", ts: now_ms()
+    };
+    _evento(estoque::descritor().ao_evento, ev_op);
+
+    // Agora para SUP: Demanda 10, Saldo 4, Em Produção 2 -> Necessidade Líquida = 4!
+    mrp::ItemPlanoMrp[] plano = mrp::calcular_plano();
+    assert(plano[3].produto == "SUP", "produto SUP");
+    assert(plano[3].saldo == 4.0 && plano[3].em_producao == 2.0, "saldo 4 e em_producao 2");
+    assert(plano[3].necessidade_liquida == 4.0, "necessidade líquida de 4 SUP");
+
+    // Explosão deve gerar demanda para subcomponentes de apenas 4 SUP:
+    // BASE: 4 unidades (1 x 4)
+    // PARAF: 8 unidades (2 x 4)
+    // CHAPA: 4 unidades (1 x 4)
+    assert(plano[0].produto == "BASE" && plano[0].demanda_bruta == 4.0, "4 BASE");
+    assert(plano[2].produto == "PARAF" && plano[2].demanda_bruta == 8.0, "8 PARAF");
+    assert(plano[1].produto == "CHAPA" && plano[1].demanda_bruta == 4.0, "4 CHAPA");
+}
+
+test fn gerar_ordens_de_producao() ={
+    string dir = _preparar("gerar_ops");
+    // Cria pedido com 5 SUP
+    k::Requisicao req = k::Requisicao {
+        metodo: "POST", rota: "/pedidos", query: "",
+        corpo: "cliente=ACME&itens=SUP:5&prazo_dias=5",
+        usuario: "teste", perfil: "admin"
+    };
+    _rotear(pedidos::descritor().rotear, req);
+
+    // Chama POST /gerar_ordens via contrato do MRP
+    k::Requisicao req_mrp = k::Requisicao {
+        metodo: "POST", rota: "/gerar_ordens", query: "",
+        corpo: "", usuario: "pcp", perfil: "pcp"
+    };
+    k::Resposta resp_mrp = _rotear(mrp::descritor().rotear, req_mrp);
+    assert(resp_mrp.status == 201, "ordens geradas com 201");
+
+    // Deve ter gerado 2 OPs: 1 para BASE e 1 para SUP (MPs são compradas, não geram OP)
+    assert(contains(resp_mrp.corpo, "\"produto\":\"SUP\""), "OP de SUP gerada");
+    assert(contains(resp_mrp.corpo, "\"produto\":\"BASE\""), "OP de BASE gerada");
+    assert(!contains(resp_mrp.corpo, "\"produto\":\"PARAF\""), "PARAF não gera OP");
+
+    // Confere se as OPs foram gravadas com origem MRP
+    k::Requisicao req_ops = k::Requisicao {
+        metodo: "GET", rota: "/ordens", query: "",
+        corpo: "", usuario: "pcp", perfil: "pcp"
+    };
+    k::Resposta resp_ops = _rotear(producao::descritor().rotear, req_ops);
+    assert(contains(resp_ops.corpo, "\"origem\":\"MRP\""), "OPs marcadas com origem MRP");
+}
+
+test fn explosao_por_reposicao_minima() ={
+    string dir = _preparar("reposicao");
+    // Regra de reposição para SUP: mínimo 20, máximo 50
+    k::Requisicao req_rep = k::Requisicao {
+        metodo: "POST", rota: "/reposicao", query: "",
+        corpo: "produto=SUP&minimo=20&maximo=50&tipo=PRODUZIR",
+        usuario: "teste", perfil: "admin"
+    };
+    _rotear(estoque::descritor().rotear, req_rep);
+
+    mrp::ItemPlanoMrp[] plano = mrp::calcular_plano();
+    assert(len(plano) == 4, "4 itens no plano pela reposição mínima");
+    assert(plano[3].produto == "SUP" && plano[3].demanda_bruta == 20.0, "20 SUP pela regra de mínimo");
+    assert(plano[0].produto == "BASE" && plano[0].demanda_bruta == 20.0, "20 BASE demandadas");
+    assert(plano[2].produto == "PARAF" && plano[2].demanda_bruta == 40.0, "40 PARAF demandados (2 x 20)");
+    assert(plano[1].produto == "CHAPA" && plano[1].demanda_bruta == 20.0, "20 CHAPA demandadas (1 x 20)");
+}

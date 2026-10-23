@@ -18,7 +18,9 @@ linguagem: **[ESCOPO.md](ESCOPO.md)** · Histórico: **[CHANGELOG.md](CHANGELOG.
 | **Estoque** | interno | Saldos **por endereço** (almoxarifado, linha do posto, expedição, quarentena), transferências, ajuste de inventário, **baixa automática por estrutura** (backflush, primeiro da linha do posto), baixa na expedição, **reposição mín./máx.** com sugestões de compra ou produção |
 | **Manutenção** | interno | Paradas de posto por categoria, registro retroativo, disponibilidade na janela de 8 h, MTTR |
 | **Indicadores** | interno | Histórico de estado de cada posto (operando, parado, ocioso) e **OEE** = disponibilidade × desempenho × qualidade, por posto e da linha, com série por hora e alerta de OEE baixo — calculado só a partir dos eventos |
+| **PCP / MRP** | interno | Planejamento de necessidades de materiais: explosão multinível de BOM, cálculo de necessidade líquida cruzando pedidos e reposição mínima com saldo e OPs abertas, geração automática de ordens de produção (`POST /api/mrp/gerar_ordens`) |
 | **Qualidade** | **plugin externo** | Não conformidades manuais e automáticas (refugo acima do limite) — processo próprio, sem recompilar o núcleo |
+| **Compras** | **plugin externo** | Gestão de fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas de estoque — processo próprio |
 
 Os módulos não se chamam: reagem a **eventos**. Quando a Manutenção abre uma
 parada, publica `maquina.parada`; a Produção assina esse evento e passa a
@@ -61,7 +63,7 @@ Precisa de Python 3 e do MinGW gcc em `C:\MinGW\bin`.
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-Roda os testes e gera `build\emp.exe` e `build\qualidade.exe` (plugin).
+Roda os testes e gera `build\emp.exe` e os plugins `build\qualidade.exe` e `build\compras.exe`.
 
 Durante o desenvolvimento, sem gerar o `.exe`:
 
@@ -147,7 +149,9 @@ curl -H "$T" $U/api/manutencao/postos
 | `/api/estoque` | `GET /saldos[?produto=]`, `GET /movimentos`, `POST /entrada`, `POST /ajuste`, `GET/POST /enderecos`, `GET /posicoes[?endereco=]`, `POST /transferir`, `GET/POST /reposicao`, `GET /sugestoes` |
 | `/api/manutencao` | `GET/POST /paradas`, `POST /encerrar?id=`, `GET /postos`, `GET /indicadores` |
 | `/api/indicadores` | `GET /estados?posto=&horas=`, `GET /oee?horas=`, `GET /oee/serie?posto=&horas=&passo_min=` |
+| `/api/mrp` | `GET /plano`, `POST /gerar_ordens` |
 | `/api/qualidade` (plugin) | `GET/POST /ncs` |
+| `/api/compras` (plugin) | `GET/POST /fornecedores`, `GET/POST /pedidos`, `POST /pedidos/receber?id=`, `POST /pedidos/cancelar?id=`, `GET /sugestoes` |
 
 ## Testes
 
@@ -158,6 +162,7 @@ python ../Burnout/cryoc.py test tests/test_etapas.cryo --backend pyro
 python ../Burnout/cryoc.py test tests/test_pedidos.cryo --backend pyro
 python ../Burnout/cryoc.py test tests/test_estoque.cryo --backend pyro
 python ../Burnout/cryoc.py test tests/test_oee.cryo --backend pyro
+python ../Burnout/cryoc.py test tests/test_mrp.cryo --backend pyro
 ```
 
 O `build.ps1` roda todos. Detalhes de cada frente da fase 2 (decisões,

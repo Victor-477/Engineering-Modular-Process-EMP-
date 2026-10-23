@@ -1,0 +1,221 @@
+// ============================================================
+//  compras.cryo — PLUGIN EXTERNO de Compras e Fornecedores
+//
+//  Processo separado (compras.exe) anunciado via manifesto
+//  em plugins/compras.plugin.
+//
+//  Regra de negócio:
+//    - Cadastra fornecedores e prazos de entrega padrão;
+//    - Reage a estoque.abaixo_minimo e estoque.falta gerando
+//      sugestões de compra;
+//    - Emite pedidos de compra;
+//    - Recebimento de compra (POST /pedidos/receber) atualiza o
+//      pedido para RECEBIDO e efetua a entrada dos produtos no
+//      estoque do EMP via HTTP POST /api/estoque/entrada.
+//
+//  Protocolo: ver src/nucleo/plugins.cryo
+//    GET  /saude    POST /req    POST /evento
+// ============================================================
+
+import "../../src/nucleo/form.cryo"    as form;
+import "../../src/nucleo/persist.cryo" as db;
+
+string _dir = "dados/compras";
+map<string,string> _fornecedores = {};
+map<string,string> _pedidos = {};
+map<string,string> _sugestoes = {};
+int _prox_pedido = 1;
+int _prox_sugestao = 1;
+
+fn _resp(int status, string corpo) -> string ={
+    return to_string(status) + "|application/json\n" + corpo;
+}
+
+// ── rotas do plugin (/req) ────────────────────────────────
+
+fn _salvar_fornecedor(map<string,string> f) -> string ={
+    string codigo = upper(form::campo(f, "codigo"));
+    string nome = form::campo(f, "nome");
+    if (len(codigo) == 0 || len(nome) == 0) {
+        return _resp(422, "{\"erro\":\"codigo e nome são obrigatórios\"}");
+    }
+    int prazo = form::inteiro(f, "prazo_dias", 3);
+    string json_forn = "{\"codigo\":" + json_encode(codigo)
+        + ",\"nome\":" + json_encode(nome)
+        + ",\"contato\":" + json_encode(form::campo(f, "contato"))
+        + ",\"email\":" + json_encode(form::campo(f, "email"))
+        + ",\"telefone\":" + json_encode(form::campo(f, "telefone"))
+        + ",\"prazo_dias\":" + to_string(prazo) + "}";
+    _fornecedores[codigo] = json_forn;
+    db::salvar(_dir, "fornecedores", _fornecedores);
+    return _resp(201, json_forn);
+}
+
+fn _criar_pedido(map<string,string> f, string usuario) -> string ={
+    string forn = upper(form::campo(f, "fornecedor"));
+    string itens = form::campo(f, "itens");
+    if (len(forn) == 0) { return _resp(422, "{\"erro\":\"fornecedor é obrigatório\"}"); }
+    if (!has(_fornecedores, forn)) { return _resp(422, "{\"erro\":\"fornecedor " + forn + " não cadastrado\"}"); }
+    if (len(itens) == 0) { return _resp(422, "{\"erro\":\"itens são obrigatórios (PRODUTO:qtd;...)\"}"); }
+
+    int id = _prox_pedido;
+    _prox_pedido = _prox_pedido + 1;
+    int agora = now_ms();
+    int prazo_dias = form::inteiro(f, "prazo_dias", 5);
+    int entrega_prevista = agora + (prazo_dias * 86400000);
+
+    string json_ped = "{\"id\":" + to_string(id)
+        + ",\"fornecedor\":" + json_encode(forn)
+        + ",\"itens\":" + json_encode(itens)
+        + ",\"status\":\"ABERTO\""
+        + ",\"criado_em\":" + to_string(agora)
+        + ",\"entrega_prevista\":" + to_string(entrega_prevista)
+        + ",\"recebido_em\":0"
+        + ",\"usuario\":" + json_encode(usuario)
+        + ",\"observacao\":" + json_encode(form::campo(f, "observacao")) + "}";
+
+    _pedidos[to_string(id)] = json_ped;
+    db::salvar(_dir, "pedidos", _pedidos);
+    return _resp(201, json_ped);
+}
+
+fn _receber_pedido(int id, string emp_url) -> string ={
+    string sid = to_string(id);
+    if (!has(_pedidos, sid)) { return _resp(404, "{\"erro\":\"pedido de compra não encontrado\"}"); }
+    map<string,string> ped = json_decode(_pedidos[sid]) as map<string,string>;
+    if (ped["status"] == "RECEBIDO") { return _resp(409, "{\"erro\":\"pedido já foi recebido\"}"); }
+    if (ped["status"] == "CANCELADO") { return _resp(409, "{\"erro\":\"pedido está cancelado\"}"); }
+
+    string itens = ped["itens"];
+    // Registra entrada no estoque do EMP via HTTP POST /api/estoque/entrada
+    for (string pedaco in split(itens, ";")) {
+        string t = trim(pedaco);
+        if (len(t) == 0) { continue; }
+        int dp = find(t, ":");
+        if (dp > 0) {
+            string prod = upper(trim(t[0..dp]));
+            string qtd = trim(t[dp + 1..]);
+            string corpo_entrada = "produto=" + url_encode(prod) + "&quantidade=" + url_encode(qtd)
+                + "&origem=" + url_encode("COMPRA-" + sid);
+            http_post(emp_url + "/api/estoque/entrada", corpo_entrada);
+        }
+    }
+
+    ped["status"] = "RECEBIDO";
+    ped["recebido_em"] = to_string(now_ms());
+    _pedidos[sid] = json_encode(ped);
+    db::salvar(_dir, "pedidos", _pedidos);
+    return _resp(200, _pedidos[sid]);
+}
+
+fn _cancelar_pedido(int id) -> string ={
+    string sid = to_string(id);
+    if (!has(_pedidos, sid)) { return _resp(404, "{\"erro\":\"pedido de compra não encontrado\"}"); }
+    map<string,string> ped = json_decode(_pedidos[sid]) as map<string,string>;
+    if (ped["status"] == "RECEBIDO") { return _resp(409, "{\"erro\":\"pedido já recebido não pode ser cancelado\"}"); }
+    ped["status"] = "CANCELADO";
+    _pedidos[sid] = json_encode(ped);
+    db::salvar(_dir, "pedidos", _pedidos);
+    return _resp(200, _pedidos[sid]);
+}
+
+fn _req(map<string,string> r, string emp_url) -> string ={
+    string metodo = form::campo(r, "metodo");
+    string rota = form::campo(r, "rota");
+    string query = form::campo(r, "query");
+
+    if (rota == "/fornecedores" && metodo == "GET") {
+        string[] itens = [];
+        for (string c in sort(keys(_fornecedores))) { itens = concat(itens, [_fornecedores[c]]); }
+        return _resp(200, "[" + join(itens, ",") + "]");
+    }
+    if (rota == "/fornecedores" && metodo == "POST") {
+        return _salvar_fornecedor(form::ler(form::campo(r, "corpo")));
+    }
+
+    if (rota == "/pedidos" && metodo == "GET") {
+        string[] itens = [];
+        for (string id in sort(keys(_pedidos))) { itens = concat(itens, [_pedidos[id]]); }
+        return _resp(200, "[" + join(itens, ",") + "]");
+    }
+    if (rota == "/pedidos" && metodo == "POST") {
+        return _criar_pedido(form::ler(form::campo(r, "corpo")), form::campo(r, "usuario"));
+    }
+    if (rota == "/pedidos/receber" && metodo == "POST") {
+        map<string,string> q = form::ler(query);
+        int id = form::inteiro(q, "id", 0);
+        return _receber_pedido(id, emp_url);
+    }
+    if (rota == "/pedidos/cancelar" && metodo == "POST") {
+        map<string,string> q = form::ler(query);
+        int id = form::inteiro(q, "id", 0);
+        return _cancelar_pedido(id);
+    }
+
+    if (rota == "/sugestoes" && metodo == "GET") {
+        string[] itens = [];
+        for (string id in sort(keys(_sugestoes))) { itens = concat(itens, [_sugestoes[id]]); }
+        return _resp(200, "[" + join(itens, ",") + "]");
+    }
+
+    return _resp(404, "{\"erro\":\"rota inexistente no plugin compras\"}");
+}
+
+// ── eventos recebidos do núcleo ───────────────────────────
+
+fn _evento(map<string,string> e) -> string ={
+    string tipo = form::campo(e, "tipo");
+    map<string,string> d = form::ler(form::campo(e, "dados"));
+
+    if (tipo == "estoque.abaixo_minimo" || tipo == "estoque.falta") {
+        string prod = upper(form::campo(d, "produto"));
+        if (len(prod) == 0) { prod = upper(form::campo(d, "componente")); }
+        number qtd = form::numero(d, "sugerido", 0.0);
+        if (qtd <= 0.0) { qtd = form::numero(d, "necessario", 0.0); }
+
+        string id = to_string(_prox_sugestao);
+        _prox_sugestao = _prox_sugestao + 1;
+        _sugestoes[id] = "{\"id\":" + id
+            + ",\"produto\":" + json_encode(prod)
+            + ",\"quantidade\":" + to_string(qtd)
+            + ",\"motivo\":" + json_encode(tipo)
+            + ",\"ts\":" + to_string(now_ms()) + "}";
+        db::salvar(_dir, "sugestoes", _sugestoes);
+    }
+    return "ok";
+}
+
+// ── servidor HTTP do plugin ───────────────────────────────
+
+string porta = env("COMPRAS_PORTA");
+if (len(porta) == 0) { porta = "8092"; }
+string emp_url = env("EMP_URL");
+if (len(emp_url) == 0) { emp_url = "http://127.0.0.1:8080"; }
+
+if (!is_dir("dados")) { make_dir("dados"); }
+if (!is_dir(_dir)) { make_dir(_dir); }
+_fornecedores = db::carregar(_dir, "fornecedores");
+_pedidos = db::carregar(_dir, "pedidos");
+_sugestoes = db::carregar(_dir, "sugestoes");
+_prox_pedido = db::maior_id(_pedidos) + 1;
+_prox_sugestao = db::maior_id(_sugestoes) + 1;
+
+if (!http_listen(parse_int(porta) ?? 8092)) {
+    print("compras: porta " + porta + " indisponível");
+} else {
+    print("plugin compras ouvindo em 127.0.0.1:" + porta + " (ERP em " + emp_url + ")");
+    while (true) {
+        map<string,string> req = http_accept();
+        string m = req["method"];
+        if (len(m) == 0) { continue; }
+        if (req["path"] == "/saude") {
+            http_respond(200, "text/plain", "ok");
+        } else if (req["path"] == "/req" && m == "POST") {
+            http_respond(200, "text/plain", _req(form::ler(req["body"]), emp_url));
+        } else if (req["path"] == "/evento" && m == "POST") {
+            http_respond(200, "text/plain", _evento(form::ler(req["body"])));
+        } else {
+            http_respond(404, "text/plain", "");
+        }
+    }
+}

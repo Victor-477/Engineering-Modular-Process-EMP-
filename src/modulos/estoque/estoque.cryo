@@ -49,6 +49,7 @@ map<string,string> _posicoes = {};     // "ENDERECO|PRODUTO" -> saldo (texto)
 map<string,string> _enderecos = {};    // codigo -> json(rg::Endereco)
 map<string,string> _regras = {};       // produto -> json(rg::Regra)
 map<string,string> _movimentos = {};   // id -> json
+map<string,string> _ops_abertas = {};  // op_id -> "PRODUTO:qtd"
 int _proximo = 1;
 
 // ── saldos ────────────────────────────────────────────────
@@ -62,6 +63,21 @@ pub fn saldo_em(string endereco, string produto) -> number ={
     string ch = rg::chave(endereco, produto);
     if (!has(_posicoes, ch)) { return 0.0; }
     return parse_number(_posicoes[ch]) ?? 0.0;
+}
+
+pub fn em_producao(string produto) -> number ={
+    number total = 0.0;
+    for (string id in keys(_ops_abertas)) {
+        string val = _ops_abertas[id];
+        int dp = find(val, ":");
+        if (dp > 0) {
+            string p = val[0..dp];
+            if (p == produto) {
+                total = total + (parse_number(val[dp + 1..]) ?? 0.0);
+            }
+        }
+    }
+    return total;
 }
 
 fn _endereco_existe(string codigo) -> bool ={
@@ -160,6 +176,14 @@ fn _regra(string produto) -> rg::Regra ={
     return json_decode(_regras[produto]) as rg::Regra;
 }
 
+pub fn regras_reposicao() -> rg::Regra[] ={
+    rg::Regra[] lista = [];
+    for (string p in sort(keys(_regras))) {
+        lista = concat(lista, [_regra(p)]);
+    }
+    return lista;
+}
+
 // O saldo que a regra vigia: o do endereço dela, ou o total.
 fn _saldo_regra(rg::Regra r) -> number ={
     if (len(r.endereco) == 0) { return saldo(r.produto); }
@@ -192,12 +216,20 @@ fn _sugestoes() -> string ={
     for (string p in sort(keys(_regras))) {
         rg::Regra r = _regra(p);
         number s = _saldo_regra(r);
-        if (!rg::abaixo(r, s)) { continue; }
+        number em_prod = 0.0;
+        if (r.tipo == "PRODUZIR" && (len(r.endereco) == 0 || r.endereco == rg::GERAL)) {
+            em_prod = em_producao(p);
+        }
+        number s_proj = s + em_prod;
+        if (s_proj >= r.minimo) { continue; }
+        number sugerir = rg::sugerido(r, s_proj);
         itens = concat(itens, ["{\"produto\":" + json_encode(p)
             + ",\"saldo\":" + to_string(s)
+            + ",\"em_producao\":" + to_string(em_prod)
+            + ",\"saldo_projetado\":" + to_string(s_proj)
             + ",\"minimo\":" + to_string(r.minimo)
             + ",\"maximo\":" + to_string(r.maximo)
-            + ",\"quantidade_sugerida\":" + to_string(rg::sugerido(r, s))
+            + ",\"quantidade_sugerida\":" + to_string(sugerir)
             + ",\"tipo\":" + json_encode(r.tipo)
             + ",\"endereco\":" + json_encode(r.endereco) + "}"]);
     }
@@ -212,6 +244,7 @@ fn iniciar(string dir) -> bool ={
     _movimentos = db::carregar(dir, "movimentos");
     _enderecos = db::carregar(dir, "enderecos");
     _regras = db::carregar(dir, "reposicao");
+    _ops_abertas = db::carregar(dir, "ops_abertas");
     _proximo = db::maior_id(_movimentos) + 1;
     if (!has(_enderecos, rg::GERAL)) { _enderecos[rg::GERAL] = json_encode(rg::geral()); }
     if (file_exists(db::caminho(dir, "posicoes"))) {
@@ -288,10 +321,30 @@ fn _expedir(map<string,string> d) ={
     }
 }
 
+fn _registrar_op(map<string,string> d) ={
+    string id = form::campo(d, "op");
+    string produto = upper(form::campo(d, "produto"));
+    number qtd = form::numero(d, "quantidade", 0.0);
+    if (len(id) > 0 && len(produto) > 0 && qtd > 0.0) {
+        _ops_abertas[id] = produto + ":" + to_string(qtd);
+        db::salvar(_dir, "ops_abertas", _ops_abertas);
+    }
+}
+
+fn _encerrar_op(map<string,string> d) ={
+    string id = form::campo(d, "op");
+    if (len(id) > 0 && has(_ops_abertas, id)) {
+        remove(_ops_abertas, id);
+        db::salvar(_dir, "ops_abertas", _ops_abertas);
+    }
+}
+
 fn ao_evento(k::Evento e) -> bool ={
     map<string,string> d = form::ler(e.dados);
     if (e.tipo == "producao.apontada") { _backflush(d); }
     if (e.tipo == "op.liberada") { _conferir(d); }
+    if (e.tipo == "op.criada" || e.tipo == "op.liberada") { _registrar_op(d); }
+    if (e.tipo == "op.concluida" || e.tipo == "op.cancelada") { _encerrar_op(d); }
     if (e.tipo == "pedido.expedido") { _expedir(d); }
     return true;
 }
@@ -482,7 +535,7 @@ pub fn descritor() -> k::Modulo ={
         contrato: 1,
         prefixo: "/api/estoque",
         depende: ["cadastros"],
-        assina: ["producao.apontada", "op.liberada", "pedido.expedido"],
+        assina: ["producao.apontada", "op.*", "pedido.expedido"],
         perfis_escrita: ["admin", "almoxarife"],
         iniciar: iniciar,
         rotear: rotear,

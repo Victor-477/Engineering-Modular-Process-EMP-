@@ -36,10 +36,12 @@ Requisitos que orientaram a arquitetura:
 | **Roteiros** | interno | Operações (tipo, instrução, parâmetros medidos com limites), roteiro de etapas por produto, capacidades posto × operação | `operacao.salva`, `roteiro.alterado`, `capacidade.salva` | — |
 | **Produção** | interno | Ordens de produção (OP) executadas por **etapa** (cópia do roteiro na liberação), fila por posto, medições, concorrência por `versao`, apontamento boa/refugo, `origem` da OP (pedido, reposição), indicadores; recusa trabalhar em posto parado | `op.criada`, `op.liberada`, `op.cancelada`, `op.concluida`, `producao.apontada`, `producao.etapa_iniciada`, `producao.etapa_apontada`, `producao.etapa_concluida`, `producao.etapa_falhou` | `maquina.*` |
 | **Pedidos** | interno | Clientes; pedidos com itens e prazo; OPs da falta com reserva entre pedidos; pronto por OPs concluídas ou saldo; expedição; atraso | `pedido.criado`, `pedido.ops_geradas`, `pedido.pronto`, `pedido.expedido`, `pedido.cancelado` | `op.*`, `producao.apontada`, `estoque.movimentado` |
-| **Estoque** | interno | Saldos por produto × **endereço**, transferências, entrada e ajuste por endereço, **backflush** (primeiro da linha do posto), baixa na expedição, alerta de falta, **reposição mín./máx.** com sugestões | `estoque.movimentado`, `estoque.falta`, `estoque.negativo`, `estoque.abaixo_minimo` | `producao.apontada`, `op.liberada`, `pedido.expedido` |
+| **Estoque** | interno | Saldos por produto × **endereço**, transferências, entrada e ajuste por endereço, **backflush** (primeiro da linha do posto), baixa na expedição, alerta de falta, **reposição mín./máx.** com sugestões (descontando OPs abertas) | `estoque.movimentado`, `estoque.falta`, `estoque.negativo`, `estoque.abaixo_minimo` | `producao.apontada`, `op.*`, `pedido.expedido` |
 | **Manutenção** | interno | Paradas de posto por categoria, registro retroativo, encerramento com solução, disponibilidade na janela de 8 h, MTTR | `maquina.parada`, `maquina.liberada` | — |
 | **Indicadores** | interno, só leitura | Histórico de estado do posto (PARADO > OPERANDO > OCIOSO) e **OEE** por posto e da linha, série por hora, alerta de OEE baixo — só a partir dos eventos | `indicadores.oee_baixo` | `maquina.*`, `producao.etapa_*` |
+| **PCP / MRP** | interno | Explosão de estrutura multinível (BOM), cálculo de necessidade líquida cruzando pedidos e reposição com saldo e produção aberta, geração automática de OPs com origem `MRP` | `mrp.ordens_geradas` | `op.*`, `pedido.*`, `estoque.movimentado` |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
+| **Compras** | **plugin externo** (processo próprio) | Fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas | — | `estoque.falta`, `estoque.abaixo_minimo` |
 | **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
 
 Máquina de estados da OP:
@@ -76,12 +78,10 @@ baixadas do estoque.
 
 | Módulo | Interno/Plugin | Depende de | Observação |
 |---|---|---|---|
-| PCP / MRP (planejamento de necessidades) | interno | cadastros, estoque, produção | Explode estrutura × demanda; precisa de datas de calendário (L-12) |
 | Programação da produção (sequenciamento por posto) | interno | produção, cadastros | Capacidade em horas por posto já existe no cadastro |
 | Manutenção preventiva (planos por horas/ciclos) | interno | manutencao | A corretiva entrou na v0.2; a preventiva precisa de calendário (L-12) |
 | Coleta automática de chão de fábrica | plugin | indicadores | O OEE entrou na fase 2 com apontamento manual; ler contadores do CLP depende de L-19 |
 | Rastreabilidade de lotes | interno | estoque, produção | Lote/série no apontamento e no consumo |
-| Compras | plugin | estoque | Ouve `estoque.falta` e `estoque.abaixo_minimo`; as sugestões COMPRAR da fase 2 viram pedido de compra |
 | Custos de produção | interno | estoque, produção | Exige tipo decimal (L-11) |
 | Relatórios / BI | plugin | todos (leitura) | Exportação CSV; PDF/XLSX dependem de L-20 |
 | Turnos e operadores | interno | — | Calendário (L-12) |

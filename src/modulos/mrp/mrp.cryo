@@ -1,0 +1,247 @@
+// ============================================================
+//  mrp.cryo — Módulo de Planejamento de Necessidades (PCP / MRP)
+//
+//  Explosão de estrutura multinível (BOM) combinando a demanda
+//  de pedidos comerciais abertos e de regras de estoque mínimo.
+//
+//  Calcula:
+//    - Demanda Bruta (pedidos abertos + reposição mínima)
+//    - Saldo em Estoque (físico atual)
+//    - Em Produção (OPs abertas rastreadas pelo estoque)
+//    - Necessidade Líquida (max(0, demanda - saldo - em_producao))
+//    - Ação sugerida (PRODUZIR se PA/SA, COMPRAR se MP)
+//    - Posto de trabalho padrão (obtido do roteiro do produto)
+//
+//  Rotas (prefixo /api/mrp):
+//    GET  /plano          [{produto, descricao, tipo, unidade, nivel,
+//                           demanda_bruta, saldo, em_producao,
+//                           necessidade_liquida, acao, posto}]
+//    POST /gerar_ordens   Gera OPs (origem "MRP") para todas as
+//                         necessidades líquidas de produção
+//
+//  Eventos publicados:
+//    mrp.ordens_geradas   total=N&ops=OP1,OP2,...
+//
+//  Eventos assinados:
+//    op.*, pedido.*, estoque.movimentado
+// ============================================================
+
+import "../../nucleo/contrato.cryo"           as k;
+import "../../nucleo/persist.cryo"            as db;
+import "../../nucleo/eventos.cryo"            as ev;
+import "../../nucleo/form.cryo"               as form;
+import "../cadastros/cadastros.cryo"          as cadastros;
+import "../estoque/estoque.cryo"              as estoque;
+import "../estoque/regras.cryo"               as rg;
+import "../producao/producao.cryo"            as producao;
+import "../pedidos/pedidos.cryo"              as pedidos;
+import "../roteiros/roteiros.cryo"            as roteiros;
+
+pub struct ItemPlanoMrp {
+    string produto;
+    string descricao;
+    string tipo;
+    string unidade;
+    int nivel;
+    number demanda_bruta;
+    number saldo;
+    number em_producao;
+    number necessidade_liquida;
+    string acao;
+    string posto;
+}
+
+pub struct OrdemGeradaMrp {
+    int op;
+    string produto;
+    number quantidade;
+    string posto;
+}
+
+string _dir = "";
+
+// ── cálculo do plano MRP ──────────────────────────────────
+
+pub fn calcular_plano() -> ItemPlanoMrp[] ={
+    map<string,string> demanda_bruta = {};
+    map<string,string> nivel_map = {};
+
+    // 1. Demanda de pedidos de venda abertos (nível 0)
+    for (pedidos::Pedido p in pedidos::pedidos_abertos()) {
+        for (pedidos::ItemPedido it in p.itens) {
+            if (len(it.produto) == 0 || it.quantidade <= 0.0) { continue; }
+            number atual = 0.0;
+            if (has(demanda_bruta, it.produto)) {
+                atual = parse_number(demanda_bruta[it.produto]) ?? 0.0;
+            }
+            demanda_bruta[it.produto] = to_string(atual + it.quantidade);
+            nivel_map[it.produto] = "0";
+        }
+    }
+
+    // 2. Demanda de reposição de estoque mínimo (nível 0)
+    for (rg::Regra r in estoque::regras_reposicao()) {
+        number s = estoque::saldo(r.produto);
+        number ep = estoque::em_producao(r.produto);
+        number proj = s + ep;
+        if (proj < r.minimo) {
+            number falta = r.minimo - proj;
+            number atual = 0.0;
+            if (has(demanda_bruta, r.produto)) {
+                atual = parse_number(demanda_bruta[r.produto]) ?? 0.0;
+            }
+            demanda_bruta[r.produto] = to_string(atual + falta);
+            if (!has(nivel_map, r.produto)) {
+                nivel_map[r.produto] = "0";
+            }
+        }
+    }
+
+    // 3. Explosão da estrutura (BOM) nível por nível (até nível 9)
+    for (int L in 0..10) {
+        string[] prods_no_nivel = [];
+        for (string p in keys(nivel_map)) {
+            int nv = parse_int(nivel_map[p]) ?? 0;
+            if (nv == L) {
+                prods_no_nivel = concat(prods_no_nivel, [p]);
+            }
+        }
+
+        for (string p in prods_no_nivel) {
+            number gross = parse_number(demanda_bruta[p]) ?? 0.0;
+            number s = estoque::saldo(p);
+            number ep = estoque::em_producao(p);
+            number net = max(0.0, gross - s - ep);
+
+            if (net > 0.0) {
+                for (cadastros::ItemEstrutura it in cadastros::estrutura(p)) {
+                    string comp = it.componente;
+                    number qtd_comp = it.quantidade * net;
+                    number prev = 0.0;
+                    if (has(demanda_bruta, comp)) {
+                        prev = parse_number(demanda_bruta[comp]) ?? 0.0;
+                    }
+                    demanda_bruta[comp] = to_string(prev + qtd_comp);
+                    int prev_l = 0;
+                    if (has(nivel_map, comp)) {
+                        prev_l = parse_int(nivel_map[comp]) ?? 0;
+                    }
+                    if (L + 1 > prev_l) {
+                        nivel_map[comp] = to_string(L + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Montar lista do plano
+    ItemPlanoMrp[] plano = [];
+    for (string p in sort(keys(demanda_bruta))) {
+        cadastros::Produto prod = cadastros::produto(p);
+        string tipo = prod.tipo;
+        if (len(tipo) == 0) { tipo = "PA"; }
+        string desc = prod.descricao;
+        if (len(desc) == 0) { desc = p; }
+        string un = prod.unidade;
+        if (len(un) == 0) { un = "UN"; }
+        int nv = parse_int(nivel_map[p]) ?? 0;
+        number gross = parse_number(demanda_bruta[p]) ?? 0.0;
+        number s = estoque::saldo(p);
+        number ep = estoque::em_producao(p);
+        number net = max(0.0, gross - s - ep);
+        string acao = "PRODUZIR";
+        if (tipo == "MP") { acao = "COMPRAR"; }
+        string posto = "";
+        if (acao == "PRODUZIR") {
+            roteiros::Etapa[] ets = roteiros::etapas(p);
+            if (len(ets) > 0) {
+                posto = ets[0].posto;
+            }
+        }
+
+        plano = concat(plano, [ItemPlanoMrp {
+            produto: p,
+            descricao: desc,
+            tipo: tipo,
+            unidade: un,
+            nivel: nv,
+            demanda_bruta: gross,
+            saldo: s,
+            em_producao: ep,
+            necessidade_liquida: net,
+            acao: acao,
+            posto: posto
+        }]);
+    }
+
+    return plano;
+}
+
+pub fn gerar_ordens() -> OrdemGeradaMrp[] ={
+    ItemPlanoMrp[] plano = calcular_plano();
+    OrdemGeradaMrp[] geradas = [];
+    string[] op_ids = [];
+
+    for (ItemPlanoMrp it in plano) {
+        if (it.acao != "PRODUZIR" || it.necessidade_liquida <= 0.0) { continue; }
+        number qtd = it.necessidade_liquida;
+        if (it.unidade == "UN" || it.unidade == "PC" || it.unidade == "PÇ" || it.unidade == "CX" || it.unidade == "PAR") {
+            qtd = ceil(qtd);
+        }
+        int id = producao::criar_op(it.produto, qtd, it.posto, "MRP");
+        if (id > 0) {
+            geradas = concat(geradas, [OrdemGeradaMrp {
+                op: id,
+                produto: it.produto,
+                quantidade: qtd,
+                posto: it.posto
+            }]);
+            op_ids = concat(op_ids, [to_string(id)]);
+        }
+    }
+
+    if (len(geradas) > 0) {
+        ev::publicar("mrp.ordens_geradas", "mrp", "total=" + to_string(len(geradas)) + "&ops=" + join(op_ids, ","));
+    }
+
+    return geradas;
+}
+
+// ── ciclo de vida e rotas ─────────────────────────────────
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    // Reage aos eventos da produção, pedidos e estoque
+    return true;
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/plano" && r.metodo == "GET") {
+        return k::ok(json_encode(calcular_plano()));
+    }
+    if (r.rota == "/gerar_ordens" && r.metodo == "POST") {
+        OrdemGeradaMrp[] geradas = gerar_ordens();
+        return k::criado(json_encode(geradas));
+    }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "mrp",
+        nome: "Planejamento de Necessidades (PCP / MRP)",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/mrp",
+        depende: ["cadastros", "estoque", "producao", "pedidos"],
+        assina: ["op.*", "pedido.*", "estoque.movimentado"],
+        perfis_escrita: ["admin", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}
