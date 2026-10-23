@@ -1,0 +1,825 @@
+// ============================================================
+//  lotes.cryo — Módulo de Rastreabilidade de Lotes e Genealogia
+//
+//  Controle de lotes de matéria-prima, semiacabados e produtos
+//  acabados, genealogia de produção (insumos consumidos por OP)
+//  e rastreamento bidirecional:
+//    - Backward Trace: dado um lote ou OP de produto acabado,
+//      recupera todos os lotes de matérias-primas consumidas,
+//      etapas, postos e pedidos de venda associados.
+//    - Forward Trace (Recall): dado um lote defeituoso de MP,
+//      identifica todas as OPs que o consumiram, produtos gerados,
+//      pedidos de clientes afetados e estoque remanescente.
+//
+//  Rotas (prefixo /api/lotes):
+//    GET  /lotes[?produto=X&status=Y]  [{numero, produto, quantidade, ...}]
+//    GET  /lote?numero=X               detalhes de um lote
+//    POST /criar                       numero=&produto=&quantidade=&lote_fornecedor=&validade=&fabricacao=
+//    POST /bloquear                    numero=&motivo=&status=(BLOQUEADO|QUARENTENA)
+//    POST /liberar                     numero=
+//    GET  /genealogia[?lote=X&op=Y]    registros de genealogia
+//    GET  /expedicoes[?lote=X]         expedições realizadas
+//    GET  /rastrear?lote=X             rastreamento completo (backward + forward)
+//
+//  Eventos publicados:
+//    lote.criado       lote=&produto=&quantidade=&status=
+//    lote.bloqueado    lote=&status=&motivo=
+//    lote.liberado     lote=
+//    lote.consumido    lote_pai=&op=&lote_filho=&componente=&quantidade=
+//
+//  Eventos assinados:
+//    estoque.movimentado, producao.apontada, producao.etapa_apontada, op.*, pedido.expedido
+// ============================================================
+
+import "../../nucleo/contrato.cryo" as k;
+import "../../nucleo/persist.cryo"  as db;
+import "../../nucleo/eventos.cryo"  as ev;
+import "../../nucleo/form.cryo"     as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+import "../producao/producao.cryo"   as producao;
+import "../pedidos/pedidos.cryo"     as pedidos;
+
+pub struct Lote {
+    string numero;
+    string produto;
+    number quantidade;
+    number quantidade_inicial;
+    string lote_fornecedor;
+    string validade;
+    string fabricacao;
+    string status;          // "LIBERADO", "QUARENTENA", "BLOQUEADO"
+    int criado_em;
+    string observacao;
+}
+
+pub struct Genealogia {
+    int id;
+    string lote_pai;
+    int op;
+    string produto;
+    string lote_filho;
+    string componente;
+    number quantidade;
+    int etapa;
+    string posto;
+    int ts;
+}
+
+pub struct ExpedicaoLote {
+    int id;
+    int pedido;
+    string cliente;
+    string produto;
+    string lote;
+    number quantidade;
+    int ts;
+}
+
+pub struct ConsumoItem {
+    string lote_filho;
+    string componente;
+    number quantidade;
+    int etapa;
+    string posto;
+    string lote_fornecedor;
+    string validade;
+    int ts;
+}
+
+pub struct RastreamentoBackward {
+    int op;
+    string produto;
+    number quantidade;
+    string status;
+    string pedido_origem;
+    ConsumoItem[] insumos;
+}
+
+pub struct OPAfetada {
+    int op;
+    string lote_pai;
+    string produto;
+    number quantidade;
+    int etapa;
+    string posto;
+    int ts;
+}
+
+pub struct PedidoAfetado {
+    int pedido;
+    string cliente;
+    string produto;
+    string lote;
+    number quantidade;
+    int ts;
+}
+
+pub struct RastreamentoForward {
+    OPAfetada[] ops_afetadas;
+    PedidoAfetado[] pedidos_afetados;
+    number saldo_remanescente;
+}
+
+pub struct RastreamentoResultado {
+    Lote lote;
+    RastreamentoBackward backward;
+    RastreamentoForward forward;
+}
+
+string _dir = "";
+map<string,string> _lotes = {};       // numero -> json(Lote)
+map<string,string> _genealogia = {};  // id -> json(Genealogia)
+map<string,string> _expedicoes = {};  // id -> json(ExpedicaoLote)
+map<string,string> _op_lote = {};     // op_id -> lote_numero
+int _prox_gen = 1;
+int _prox_exp = 1;
+int _seq_lote = 1;
+
+// ── helpers e desserialização segura ─────────────────────
+
+fn _decodificar_lote(string json_str) -> Lote ={
+    string s = json_str;
+    if (!contains(s, "\"quantidade\":")) { s = replace(s, "}", ",\"quantidade\":0.0}"); }
+    if (!contains(s, "\"quantidade_inicial\":")) { s = replace(s, "}", ",\"quantidade_inicial\":0.0}"); }
+    if (!contains(s, "\"criado_em\":")) { s = replace(s, "}", ",\"criado_em\":0}"); }
+    return json_decode(s) as Lote;
+}
+
+fn _decodificar_gen(string json_str) -> Genealogia ={
+    string s = json_str;
+    if (!contains(s, "\"id\":")) { s = replace(s, "}", ",\"id\":0}"); }
+    if (!contains(s, "\"op\":")) { s = replace(s, "}", ",\"op\":0}"); }
+    if (!contains(s, "\"quantidade\":")) { s = replace(s, "}", ",\"quantidade\":0.0}"); }
+    if (!contains(s, "\"etapa\":")) { s = replace(s, "}", ",\"etapa\":0}"); }
+    if (!contains(s, "\"ts\":")) { s = replace(s, "}", ",\"ts\":0}"); }
+    return json_decode(s) as Genealogia;
+}
+
+fn _decodificar_exp(string json_str) -> ExpedicaoLote ={
+    string s = json_str;
+    if (!contains(s, "\"id\":")) { s = replace(s, "}", ",\"id\":0}"); }
+    if (!contains(s, "\"pedido\":")) { s = replace(s, "}", ",\"pedido\":0}"); }
+    if (!contains(s, "\"quantidade\":")) { s = replace(s, "}", ",\"quantidade\":0.0}"); }
+    if (!contains(s, "\"ts\":")) { s = replace(s, "}", ",\"ts\":0}"); }
+    return json_decode(s) as ExpedicaoLote;
+}
+
+// ── geração e consulta de lote da OP ─────────────────────
+
+pub fn lote_da_op(int op_id, string produto) -> string ={
+    string sop = to_string(op_id);
+    if (has(_op_lote, sop)) {
+        return _op_lote[sop];
+    }
+    string num = "LOT-OP-" + sop;
+    _op_lote[sop] = num;
+    db::salvar(_dir, "op_lote", _op_lote);
+
+    if (!has(_lotes, num)) {
+        Lote l = Lote {
+            numero: num,
+            produto: produto,
+            quantidade: 0.0,
+            quantidade_inicial: 0.0,
+            lote_fornecedor: "",
+            validade: "",
+            fabricacao: "",
+            status: "LIBERADO",
+            criado_em: now_ms(),
+            observacao: "Gerado automaticamente para OP-" + sop
+        };
+        _lotes[num] = json_encode(l);
+        db::salvar(_dir, "lotes", _lotes);
+    }
+    return num;
+}
+
+pub fn obter_lote(string numero) -> Lote ={
+    string num = upper(trim(numero));
+    if (has(_lotes, num)) {
+        return _decodificar_lote(_lotes[num]);
+    }
+    return Lote {
+        numero: num,
+        produto: "",
+        quantidade: 0.0,
+        quantidade_inicial: 0.0,
+        lote_fornecedor: "",
+        validade: "",
+        fabricacao: "",
+        status: "LIBERADO",
+        criado_em: 0,
+        observacao: ""
+    };
+}
+
+// ── seleção FIFO de lotes para consumo ───────────────────
+
+fn _lotes_disponiveis_fifo(string produto) -> Lote[] ={
+    Lote[] candidatos = [];
+    for (string k_num in keys(_lotes)) {
+        Lote l = _decodificar_lote(_lotes[k_num]);
+        if (l.produto == produto && l.status == "LIBERADO" && l.quantidade > 0.0) {
+            candidatos = concat(candidatos, [l]);
+        }
+    }
+    // Ordenação FIFO simples por criado_em crescente
+    Lote[] ordenados = [];
+    for (Lote item in candidatos) {
+        Lote[] nova_lista = [];
+        bool inserido = false;
+        for (Lote x in ordenados) {
+            if (!inserido && item.criado_em < x.criado_em) {
+                nova_lista = concat(nova_lista, [item]);
+                inserido = true;
+            }
+            nova_lista = concat(nova_lista, [x]);
+        }
+        if (!inserido) {
+            nova_lista = concat(nova_lista, [item]);
+        }
+        ordenados = nova_lista;
+    }
+    return ordenados;
+}
+
+// Consome quantidade de insumos registrando o vínculo genealógico
+fn _consumir_insumo(string lote_pai, int op, int etapa, string posto, string componente, number qtd) ={
+    if (qtd <= 0.0) { return; }
+    number restante = qtd;
+    Lote[] disponiveis = _lotes_disponiveis_fifo(componente);
+
+    for (Lote l in disponiveis) {
+        if (restante <= 0.0) { break; }
+        number tira = l.quantidade;
+        if (tira > restante) { tira = restante; }
+
+        // Atualiza saldo do lote consumido
+        Lote atualizado = Lote {
+            numero: l.numero,
+            produto: l.produto,
+            quantidade: l.quantidade - tira,
+            quantidade_inicial: l.quantidade_inicial,
+            lote_fornecedor: l.lote_fornecedor,
+            validade: l.validade,
+            fabricacao: l.fabricacao,
+            status: l.status,
+            criado_em: l.criado_em,
+            observacao: l.observacao
+        };
+        _lotes[l.numero] = json_encode(atualizado);
+
+        // Registra genealogia
+        int id_gen = _prox_gen;
+        _prox_gen = _prox_gen + 1;
+        Genealogia gen = Genealogia {
+            id: id_gen,
+            lote_pai: lote_pai,
+            op: op,
+            produto: cadastros::existe(componente) ? componente : "",
+            lote_filho: l.numero,
+            componente: componente,
+            quantidade: tira,
+            etapa: etapa,
+            posto: posto,
+            ts: now_ms()
+        };
+        _genealogia[to_string(id_gen)] = json_encode(gen);
+
+        ev::publicar("lote.consumido", "lotes",
+            "lote_pai=" + url_encode(lote_pai) + "&op=" + to_string(op)
+            + "&lote_filho=" + url_encode(l.numero) + "&componente=" + url_encode(componente)
+            + "&quantidade=" + to_string(tira));
+
+        restante = restante - tira;
+    }
+
+    // Se sobrou restante não coberto por lotes (legado / sem lote prévio)
+    if (restante > 0.0) {
+        int id_gen = _prox_gen;
+        _prox_gen = _prox_gen + 1;
+        Genealogia gen = Genealogia {
+            id: id_gen,
+            lote_pai: lote_pai,
+            op: op,
+            produto: componente,
+            lote_filho: "GERAL",
+            componente: componente,
+            quantidade: restante,
+            etapa: etapa,
+            posto: posto,
+            ts: now_ms()
+        };
+        _genealogia[to_string(id_gen)] = json_encode(gen);
+    }
+
+    db::salvar(_dir, "lotes", _lotes);
+    db::salvar(_dir, "genealogia", _genealogia);
+}
+
+// ── rastreamento bidirecional (backward & forward) ─────────
+
+pub fn rastrear(string consulta) -> RastreamentoResultado ={
+    string termo = upper(trim(consulta));
+    if (starts_with(termo, "OP-")) {
+        string t = termo;
+        termo = "LOT-OP-" + t[3..];
+    }
+
+    Lote l = obter_lote(termo);
+
+    // 1. Backward Trace: de onde vieram os componentes deste lote
+    ConsumoItem[] insumos = [];
+    int op_alvo = 0;
+    string prod_alvo = l.produto;
+    number qtd_alvo = l.quantidade_inicial;
+    string st_alvo = l.status;
+    string ped_origem = "";
+
+    // Procura na genealogia registros onde este lote é lote_pai
+    for (string k_id in keys(_genealogia)) {
+        Genealogia g = _decodificar_gen(_genealogia[k_id]);
+        if (g.lote_pai == termo) {
+            if (op_alvo == 0) { op_alvo = g.op; }
+            Lote lote_filho_dados = obter_lote(g.lote_filho);
+            insumos = concat(insumos, [ConsumoItem {
+                lote_filho: g.lote_filho,
+                componente: g.componente,
+                quantidade: g.quantidade,
+                etapa: g.etapa,
+                posto: g.posto,
+                lote_fornecedor: lote_filho_dados.lote_fornecedor,
+                validade: lote_filho_dados.validade,
+                ts: g.ts
+            }]);
+        }
+    }
+
+    if (op_alvo > 0) {
+        // Tenta achar pedido de origem da OP
+        for (producao::OrdemProducao op_item in producao::ordens_ativas()) {
+            if (op_item.id == op_alvo) {
+                ped_origem = op_item.origem;
+            }
+        }
+    }
+
+    RastreamentoBackward back = RastreamentoBackward {
+        op: op_alvo,
+        produto: prod_alvo,
+        quantidade: qtd_alvo,
+        status: st_alvo,
+        pedido_origem: ped_origem,
+        insumos: insumos
+    };
+
+    // 2. Forward Trace (Recall): onde este lote foi consumido e para quais clientes foi
+    OPAfetada[] ops_afetadas = [];
+    map<string,bool> lotes_derivados = {};
+    lotes_derivados[termo] = true;
+
+    for (string k_id in keys(_genealogia)) {
+        Genealogia g = _decodificar_gen(_genealogia[k_id]);
+        if (g.lote_filho == termo) {
+            ops_afetadas = concat(ops_afetadas, [OPAfetada {
+                op: g.op,
+                lote_pai: g.lote_pai,
+                produto: cadastros::existe(g.produto) ? g.produto : g.componente,
+                quantidade: g.quantidade,
+                etapa: g.etapa,
+                posto: g.posto,
+                ts: g.ts
+            }]);
+            lotes_derivados[g.lote_pai] = true;
+        }
+    }
+
+    // Busca expedições vinculadas a este lote ou aos lotes derivados das OPs afetadas
+    PedidoAfetado[] pedidos_afetados = [];
+    for (string k_id in keys(_expedicoes)) {
+        ExpedicaoLote exp = _decodificar_exp(_expedicoes[k_id]);
+        if (has(lotes_derivados, exp.lote)) {
+            pedidos_afetados = concat(pedidos_afetados, [PedidoAfetado {
+                pedido: exp.pedido,
+                cliente: exp.cliente,
+                produto: exp.produto,
+                lote: exp.lote,
+                quantidade: exp.quantidade,
+                ts: exp.ts
+            }]);
+        }
+    }
+
+    RastreamentoForward fwd = RastreamentoForward {
+        ops_afetadas: ops_afetadas,
+        pedidos_afetados: pedidos_afetados,
+        saldo_remanescente: l.quantidade
+    };
+
+    return RastreamentoResultado {
+        lote: l,
+        backward: back,
+        forward: fwd
+    };
+}
+
+// ── rotas HTTP ────────────────────────────────────────────
+
+fn _criar_lote(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string num = upper(trim(form::campo(f, "numero")));
+    string prod = upper(trim(form::campo(f, "produto")));
+    number qtd = form::numero(f, "quantidade", 0.0);
+    string lote_forn = trim(form::campo(f, "lote_fornecedor"));
+    string validade = trim(form::campo(f, "validade"));
+    string fabricacao = trim(form::campo(f, "fabricacao"));
+    string status = upper(trim(form::campo_ou(f, "status", "LIBERADO")));
+    string obs = trim(form::campo(f, "observacao"));
+
+    if (len(prod) == 0) { return k::erro(422, "produto é obrigatório"); }
+    if (!cadastros::existe(prod)) { return k::erro(422, "produto " + prod + " não cadastrado"); }
+    if (qtd <= 0.0) { return k::erro(422, "quantidade deve ser maior que zero"); }
+
+    if (len(num) == 0) {
+        num = "L-" + prod + "-" + to_string(_seq_lote);
+        _seq_lote = _seq_lote + 1;
+    }
+
+    if (has(_lotes, num)) {
+        // Se já existe do mesmo produto, incrementa saldo
+        Lote existente = _decodificar_lote(_lotes[num]);
+        if (existente.produto != prod) {
+            return k::erro(409, "lote " + num + " já existe para outro produto: " + existente.produto);
+        }
+        Lote somado = Lote {
+            numero: existente.numero,
+            produto: existente.produto,
+            quantidade: existente.quantidade + qtd,
+            quantidade_inicial: existente.quantidade_inicial + qtd,
+            lote_fornecedor: len(lote_forn) > 0 ? lote_forn : existente.lote_fornecedor,
+            validade: len(validade) > 0 ? validade : existente.validade,
+            fabricacao: len(fabricacao) > 0 ? fabricacao : existente.fabricacao,
+            status: existente.status,
+            criado_em: existente.criado_em,
+            observacao: existente.observacao
+        };
+        _lotes[num] = json_encode(somado);
+        db::salvar(_dir, "lotes", _lotes);
+        return k::ok(_lotes[num]);
+    }
+
+    Lote novo = Lote {
+        numero: num,
+        produto: prod,
+        quantidade: qtd,
+        quantidade_inicial: qtd,
+        lote_fornecedor: lote_forn,
+        validade: validade,
+        fabricacao: fabricacao,
+        status: status,
+        criado_em: now_ms(),
+        observacao: obs
+    };
+    _lotes[num] = json_encode(novo);
+    db::salvar(_dir, "lotes", _lotes);
+
+    ev::publicar("lote.criado", "lotes",
+        "lote=" + url_encode(num) + "&produto=" + url_encode(prod)
+        + "&quantidade=" + to_string(qtd) + "&status=" + url_encode(status));
+
+    return k::criado(_lotes[num]);
+}
+
+fn _bloquear_lote(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string num = upper(trim(form::campo(f, "numero")));
+    string motivo = trim(form::campo(f, "motivo"));
+    string st = upper(trim(form::campo_ou(f, "status", "BLOQUEADO")));
+
+    if (!has(_lotes, num)) { return k::erro(404, "lote " + num + " não encontrado"); }
+    Lote l = _decodificar_lote(_lotes[num]);
+    Lote atualizado = Lote {
+        numero: l.numero,
+        produto: l.produto,
+        quantidade: l.quantidade,
+        quantidade_inicial: l.quantidade_inicial,
+        lote_fornecedor: l.lote_fornecedor,
+        validade: l.validade,
+        fabricacao: l.fabricacao,
+        status: st,
+        criado_em: l.criado_em,
+        observacao: len(motivo) > 0 ? (l.observacao + " [Bloqueio: " + motivo + "]") : l.observacao
+    };
+    _lotes[num] = json_encode(atualizado);
+    db::salvar(_dir, "lotes", _lotes);
+
+    ev::publicar("lote.bloqueado", "lotes",
+        "lote=" + url_encode(num) + "&status=" + url_encode(st) + "&motivo=" + url_encode(motivo));
+
+    return k::ok(_lotes[num]);
+}
+
+fn _liberar_lote(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string num = upper(trim(form::campo(f, "numero")));
+
+    if (!has(_lotes, num)) { return k::erro(404, "lote " + num + " não encontrado"); }
+    Lote l = _decodificar_lote(_lotes[num]);
+    Lote atualizado = Lote {
+        numero: l.numero,
+        produto: l.produto,
+        quantidade: l.quantidade,
+        quantidade_inicial: l.quantidade_inicial,
+        lote_fornecedor: l.lote_fornecedor,
+        validade: l.validade,
+        fabricacao: l.fabricacao,
+        status: "LIBERADO",
+        criado_em: l.criado_em,
+        observacao: l.observacao
+    };
+    _lotes[num] = json_encode(atualizado);
+    db::salvar(_dir, "lotes", _lotes);
+
+    ev::publicar("lote.liberado", "lotes", "lote=" + url_encode(num));
+    return k::ok(_lotes[num]);
+}
+
+fn _listar_lotes(k::Requisicao r) -> k::Resposta ={
+    string prod = upper(trim(k::param(r, "produto")));
+    string st = upper(trim(k::param(r, "status")));
+
+    string[] itens = [];
+    for (string num in sort(keys(_lotes))) {
+        Lote l = _decodificar_lote(_lotes[num]);
+        if (len(prod) > 0 && l.produto != prod) { continue; }
+        if (len(st) > 0 && l.status != st) { continue; }
+        itens = concat(itens, [_lotes[num]]);
+    }
+    return k::ok("[" + join(itens, ",") + "]");
+}
+
+fn _detalhe_lote(k::Requisicao r) -> k::Resposta ={
+    string num = upper(trim(k::param(r, "numero")));
+    if (!has(_lotes, num)) { return k::erro(404, "lote " + num + " não encontrado"); }
+    return k::ok(_lotes[num]);
+}
+
+fn _listar_genealogia(k::Requisicao r) -> k::Resposta ={
+    string lote_filtro = upper(trim(k::param(r, "lote")));
+    int op_filtro = form::inteiro(form::ler(r.rota), "op", 0);
+
+    string[] itens = [];
+    for (string id in sort(keys(_genealogia))) {
+        Genealogia g = _decodificar_gen(_genealogia[id]);
+        if (len(lote_filtro) > 0 && g.lote_pai != lote_filtro && g.lote_filho != lote_filtro) {
+            continue;
+        }
+        if (op_filtro > 0 && g.op != op_filtro) {
+            continue;
+        }
+        itens = concat(itens, [_genealogia[id]]);
+    }
+    return k::ok("[" + join(itens, ",") + "]");
+}
+
+fn _listar_expedicoes(k::Requisicao r) -> k::Resposta ={
+    string lote_filtro = upper(trim(k::param(r, "lote")));
+    string[] itens = [];
+    for (string id in sort(keys(_expedicoes))) {
+        ExpedicaoLote exp = _decodificar_exp(_expedicoes[id]);
+        if (len(lote_filtro) > 0 && exp.lote != lote_filtro) {
+            continue;
+        }
+        itens = concat(itens, [_expedicoes[id]]);
+    }
+    return k::ok("[" + join(itens, ",") + "]");
+}
+
+// ── ciclo de vida e eventos ───────────────────────────────
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _lotes = db::carregar(dir, "lotes");
+    _genealogia = db::carregar(dir, "genealogia");
+    _expedicoes = db::carregar(dir, "expedicoes");
+    _op_lote = db::carregar(dir, "op_lote");
+    _prox_gen = db::maior_id(_genealogia) + 1;
+    _prox_exp = db::maior_id(_expedicoes) + 1;
+    _seq_lote = db::maior_id(_lotes) + 1;
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    map<string,string> d = form::ler(e.dados);
+
+    // Entrada de estoque com lote informado
+    if (e.tipo == "estoque.movimentado") {
+        string lote_param = upper(trim(form::campo(d, "lote")));
+        number qtd = form::numero(d, "quantidade", 0.0);
+        string prod = upper(trim(form::campo(d, "produto")));
+        string orig = form::campo(d, "origem");
+
+        if (len(lote_param) > 0 && qtd > 0.0) {
+            if (!has(_lotes, lote_param)) {
+                Lote novo = Lote {
+                    numero: lote_param,
+                    produto: prod,
+                    quantidade: qtd,
+                    quantidade_inicial: qtd,
+                    lote_fornecedor: orig,
+                    validade: "",
+                    fabricacao: "",
+                    status: "LIBERADO",
+                    criado_em: now_ms(),
+                    observacao: "Entrada de estoque: " + orig
+                };
+                _lotes[lote_param] = json_encode(novo);
+            } else {
+                Lote existente = _decodificar_lote(_lotes[lote_param]);
+                Lote somado = Lote {
+                    numero: existente.numero,
+                    produto: existente.produto,
+                    quantidade: existente.quantidade + qtd,
+                    quantidade_inicial: existente.quantidade_inicial + qtd,
+                    lote_fornecedor: existente.lote_fornecedor,
+                    validade: existente.validade,
+                    fabricacao: existente.fabricacao,
+                    status: existente.status,
+                    criado_em: existente.criado_em,
+                    observacao: existente.observacao
+                };
+                _lotes[lote_param] = json_encode(somado);
+            }
+            db::salvar(_dir, "lotes", _lotes);
+        }
+        return true;
+    }
+
+    // Apontamento de etapa intermediária: consome insumos da etapa
+    if (e.tipo == "producao.etapa_apontada") {
+        int op_id = form::inteiro(d, "op", 0);
+        string prod = upper(trim(form::campo(d, "produto")));
+        int etapa = form::inteiro(d, "etapa", 0);
+        string posto = upper(trim(form::campo(d, "posto")));
+        number boa = form::numero(d, "delta_boas", 0.0);
+        number refugo = form::numero(d, "delta_refugo", 0.0);
+        number consumida = boa + refugo;
+
+        if (op_id > 0 && etapa > 0 && consumida > 0.0) {
+            string lot_pai = lote_da_op(op_id, prod);
+            for (cadastros::ItemEstrutura it in cadastros::estrutura(prod)) {
+                if (it.etapa == etapa) {
+                    _consumir_insumo(lot_pai, op_id, etapa, posto, it.componente, it.quantidade * consumida);
+                }
+            }
+        }
+        return true;
+    }
+
+    // Apontamento final da OP: consome insumos gerais (etapa 0) e gera saldo do produto acabado
+    if (e.tipo == "producao.apontada") {
+        int op_id = form::inteiro(d, "op", 0);
+        string prod = upper(trim(form::campo(d, "produto")));
+        string posto = upper(trim(form::campo(d, "posto")));
+        number boa = form::numero(d, "boa", 0.0);
+        number refugo = form::numero(d, "refugo", 0.0);
+        number consumida = boa + refugo;
+
+        if (op_id > 0) {
+            string lot_pai = lote_da_op(op_id, prod);
+            if (consumida > 0.0) {
+                for (cadastros::ItemEstrutura it in cadastros::estrutura(prod)) {
+                    if (it.etapa == 0) {
+                        _consumir_insumo(lot_pai, op_id, 0, posto, it.componente, it.quantidade * consumida);
+                    }
+                }
+            }
+            if (boa > 0.0) {
+                Lote l = obter_lote(lot_pai);
+                Lote atualizado = Lote {
+                    numero: l.numero,
+                    produto: prod,
+                    quantidade: l.quantidade + boa,
+                    quantidade_inicial: l.quantidade_inicial + boa,
+                    lote_fornecedor: l.lote_fornecedor,
+                    validade: l.validade,
+                    fabricacao: l.fabricacao,
+                    status: "LIBERADO",
+                    criado_em: l.criado_em > 0 ? l.criado_em : now_ms(),
+                    observacao: "Produzido pela OP-" + to_string(op_id)
+                };
+                _lotes[lot_pai] = json_encode(atualizado);
+                db::salvar(_dir, "lotes", _lotes);
+            }
+        }
+        return true;
+    }
+
+    // Expedição de pedido a cliente: baixa lotes e registra expedição
+    if (e.tipo == "pedido.expedido") {
+        int ped_id = form::inteiro(d, "pedido", 0);
+        string cli = form::campo(d, "cliente");
+        string itens = form::campo(d, "itens");
+
+        for (string pedaco in split(itens, ";")) {
+            string t = trim(pedaco);
+            if (len(t) == 0) { continue; }
+            int dp = find(t, ":");
+            if (dp > 0) {
+                string prod = upper(trim(t[0..dp]));
+                number precisa = parse_number(t[dp + 1..]) ?? 0.0;
+                number restante = precisa;
+
+                Lote[] disponiveis = _lotes_disponiveis_fifo(prod);
+                for (Lote l in disponiveis) {
+                    if (restante <= 0.0) { break; }
+                    number tira = l.quantidade;
+                    if (tira > restante) { tira = restante; }
+
+                    // Atualiza saldo do lote
+                    Lote atualizado = Lote {
+                        numero: l.numero,
+                        produto: l.produto,
+                        quantidade: l.quantidade - tira,
+                        quantidade_inicial: l.quantidade_inicial,
+                        lote_fornecedor: l.lote_fornecedor,
+                        validade: l.validade,
+                        fabricacao: l.fabricacao,
+                        status: l.status,
+                        criado_em: l.criado_em,
+                        observacao: l.observacao
+                    };
+                    _lotes[l.numero] = json_encode(atualizado);
+
+                    // Registra expedição
+                    int id_exp = _prox_exp;
+                    _prox_exp = _prox_exp + 1;
+                    ExpedicaoLote exp = ExpedicaoLote {
+                        id: id_exp,
+                        pedido: ped_id,
+                        cliente: cli,
+                        produto: prod,
+                        lote: l.numero,
+                        quantidade: tira,
+                        ts: now_ms()
+                    };
+                    _expedicoes[to_string(id_exp)] = json_encode(exp);
+
+                    restante = restante - tira;
+                }
+
+                // Se restou saldo expedido não loteado
+                if (restante > 0.0) {
+                    int id_exp = _prox_exp;
+                    _prox_exp = _prox_exp + 1;
+                    ExpedicaoLote exp = ExpedicaoLote {
+                        id: id_exp,
+                        pedido: ped_id,
+                        cliente: cli,
+                        produto: prod,
+                        lote: "GERAL",
+                        quantidade: restante,
+                        ts: now_ms()
+                    };
+                    _expedicoes[to_string(id_exp)] = json_encode(exp);
+                }
+            }
+        }
+        db::salvar(_dir, "lotes", _lotes);
+        db::salvar(_dir, "expedicoes", _expedicoes);
+        return true;
+    }
+
+    return true;
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/lotes" && r.metodo == "GET") { return _listar_lotes(r); }
+    if (r.rota == "/lote" && r.metodo == "GET") { return _detalhe_lote(r); }
+    if (r.rota == "/criar" && r.metodo == "POST") { return _criar_lote(r); }
+    if (r.rota == "/bloquear" && r.metodo == "POST") { return _bloquear_lote(r); }
+    if (r.rota == "/liberar" && r.metodo == "POST") { return _liberar_lote(r); }
+    if (r.rota == "/genealogia" && r.metodo == "GET") { return _listar_genealogia(r); }
+    if (r.rota == "/expedicoes" && r.metodo == "GET") { return _listar_expedicoes(r); }
+    if (r.rota == "/rastrear" && r.metodo == "GET") {
+        string l = k::param(r, "lote");
+        return k::ok(json_encode(rastrear(l)));
+    }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "lotes",
+        nome: "Rastreabilidade de Lotes e Genealogia",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/lotes",
+        depende: ["cadastros", "producao", "estoque", "pedidos"],
+        assina: ["estoque.movimentado", "producao.apontada", "producao.etapa_apontada", "op.*", "pedido.expedido"],
+        perfis_escrita: ["admin", "qualidade", "almoxarife", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

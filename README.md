@@ -20,6 +20,7 @@ linguagem: **[ESCOPO.md](ESCOPO.md)** · Histórico: **[CHANGELOG.md](CHANGELOG.
 | **Indicadores** | interno | Histórico de estado de cada posto (operando, parado, ocioso) e **OEE** = disponibilidade × desempenho × qualidade, por posto e da linha, com série por hora e alerta de OEE baixo — calculado só a partir dos eventos |
 | **PCP / MRP** | interno | Planejamento de necessidades de materiais: explosão multinível de BOM, cálculo de necessidade líquida cruzando pedidos e reposição mínima com saldo e OPs abertas, geração automática de ordens de produção (`POST /api/mrp/gerar_ordens`) |
 | **Programação (APS)** | interno | Sequenciamento e capacidade finita: carga × capacidade por posto, identificação de gargalos, fila sequenciada por prioridade e EDD (Earliest Due Date), projeção contínua de cronograma e alerta de atraso |
+| **Lotes & Rastreabilidade** | interno | Rastreabilidade e genealogia industrial: controle de lotes (status/validade), árvore genealógica de insumos consumidos em cada etapa da OP, expedição a clientes e rastreamento bidirecional (backward de insumos e forward recall de clientes) |
 | **Qualidade** | **plugin externo** | Não conformidades manuais e automáticas (refugo acima do limite) — processo próprio, sem recompilar o núcleo |
 | **Compras** | **plugin externo** | Gestão de fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas de estoque — processo próprio |
 

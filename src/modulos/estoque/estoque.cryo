@@ -113,7 +113,7 @@ fn _enderecos_do_tipo(string tipo) -> string[] ={
 //
 // O total é somado incrementalmente (saldo + qtd), exatamente como na
 // v0.2, para que os totais não mudem nem na última casa decimal.
-fn _movimentar(string produto, string endereco, number qtd, string tipo, string origem) -> bool ={
+fn _movimentar_lote(string produto, string endereco, number qtd, string tipo, string origem, string lote) -> bool ={
     number novo_end = saldo_em(endereco, produto) + qtd;
     number novo = saldo(produto) + qtd;
     _posicoes[rg::chave(endereco, produto)] = to_string(novo_end);
@@ -128,13 +128,18 @@ fn _movimentar(string produto, string endereco, number qtd, string tipo, string 
         + ",\"origem\":" + json_encode(origem)
         + ",\"ts\":" + to_string(now_ms())
         + ",\"endereco\":" + json_encode(endereco)
-        + ",\"saldo_endereco\":" + to_string(novo_end) + "}";
+        + ",\"saldo_endereco\":" + to_string(novo_end)
+        + ",\"lote\":" + json_encode(lote) + "}";
     bool ok = db::salvar(_dir, "posicoes", _posicoes)
         && db::salvar(_dir, "saldos", _saldos)
         && db::salvar(_dir, "movimentos", _movimentos);
-    ev::publicar("estoque.movimentado", "estoque",
-        "produto=" + url_encode(produto) + "&quantidade=" + to_string(qtd) + "&saldo=" + to_string(novo)
-        + "&endereco=" + url_encode(endereco) + "&saldo_endereco=" + to_string(novo_end));
+    string dados_ev = "produto=" + url_encode(produto) + "&quantidade=" + to_string(qtd) + "&saldo=" + to_string(novo)
+        + "&endereco=" + url_encode(endereco) + "&saldo_endereco=" + to_string(novo_end)
+        + "&origem=" + url_encode(origem);
+    if (len(lote) > 0) {
+        dados_ev = dados_ev + "&lote=" + url_encode(lote);
+    }
+    ev::publicar("estoque.movimentado", "estoque", dados_ev);
     // `saldo` é o do endereço que ficou negativo (na v0.2, só havia o
     // GERAL, então era o total); `saldo_total` vai junto.
     if (novo_end < 0.0) {
@@ -143,6 +148,10 @@ fn _movimentar(string produto, string endereco, number qtd, string tipo, string 
             + "&endereco=" + url_encode(endereco) + "&saldo_total=" + to_string(novo));
     }
     return ok;
+}
+
+fn _movimentar(string produto, string endereco, number qtd, string tipo, string origem) -> bool ={
+    return _movimentar_lote(produto, endereco, qtd, tipo, origem, "");
 }
 
 // Saída de `precisa` unidades: dos endereços `preferidos`, em ordem,
@@ -458,7 +467,8 @@ fn _entrada(k::Requisicao r) -> k::Resposta ={
     if (q <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
     if (!_endereco_existe(end)) { return k::erro(422, "endereço " + end + " não cadastrado"); }
     number antes = _antes(p);
-    _movimentar(p, end, q, "ENTRADA", form::campo_ou(f, "origem", "manual:" + r.usuario));
+    string lote = upper(trim(form::campo_ou(f, "lote", "")));
+    _movimentar_lote(p, end, q, "ENTRADA", form::campo_ou(f, "origem", "manual:" + r.usuario), lote);
     _conferir_minimo(p, antes);
     return k::criado(_resposta_saldo(p, end));
 }

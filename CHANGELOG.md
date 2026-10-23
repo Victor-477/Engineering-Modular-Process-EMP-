@@ -2,6 +2,28 @@
 
 ## Não lançado
 
+### Novo — fase 5: Rastreabilidade de Lotes e Genealogia Industrial (Recall)
+- **Módulo de Lotes e Rastreabilidade** (`src/modulos/lotes/`, prefixo `/api/lotes`, escrita por admin/qualidade/pcp/estoque):
+  - Cadastro e controle de lotes de matéria-prima e produtos acabados com controle de status (`LIBERADO`, `QUARENTENA`, `BLOQUEADO`), data de validade, quantidade inicial, quantidade atual e lote do fornecedor.
+  - Bloqueio e liberação de lotes (`POST /api/lotes/status`) com publicação imediata de `lote.bloqueado` e `lote.liberado`.
+  - Geração automática de lote na conclusão de OP (`LOT-OP-{id}`) vinculando o produto gerado.
+  - **Genealogia Industrial**:
+    - Gravação contínua dos elos pai-filho (`GenealogiaElo`) registrando insumos consumidos em cada posto/etapa com seus respectivos lotes de origem (`lote_pai`, `lote_filho`, `op`, `componente`, `quantidade`, `posto`).
+    - Registro de expedição para clientes (`ExpedicaoCliente`) mapeando `lote` entregue, `pedido`, `cliente` e `quantidade`.
+  - **Rastreabilidade Bidirecional**:
+    - **Backward Trace (De onde veio)**: inspeciona o lote do produto acabado, identificando a OP produtora, pedido de origem, data de fabricação e a lista completa de insumos utilizados com seus lotes e fornecedores.
+    - **Forward Trace / Recall (Para onde foi)**: a partir de um lote suspeito ou defeituoso (ex: matéria-prima contaminada ou fora de especificação), mapeia o saldo restante em fábrica, todas as OPs intermediárias que o consumiram e todos os clientes e pedidos que receberam o produto final.
+- **Integração com Estoque e Catálogo**:
+  - `catalogo.cryo` registra o módulo `lotes` como interno (`M_INTERNO`).
+  - `estoque.cryo` aceita parâmetro opcional `lote` em `POST /api/estoque/entrada` e o propaga no evento `estoque.movimentado`.
+- **Painel Web**:
+  - Nova aba e seção **Lotes & Rastreio** no menu principal e no dashboard inicial.
+  - Cadastro manual de lotes recebidos de fornecedores com data de validade e status inicial.
+  - Tabela geral de lotes com saldos, datas, botões de ação rápida para Liberar/Bloquear e atalho de rastreamento.
+  - Interface interativa de **Consulta de Rastreabilidade e Genealogia (Recall)** com visualização lado a lado de Origem (Backward) e Destino/Recall (Forward) com alerta visual de clientes afetados.
+  - Integração com o sino de notificações e badge de contagem de lotes bloqueados/quarentena.
+- **Testes**: +5 casos em `test_lotes`, totalizando 71 testes automatizados passando no `build.ps1`.
+
 ### Novo — fase 4: Programação da Produção (APS) e Backflush por Etapa
 - **Módulo de Programação da Produção / APS** (`src/modulos/programacao/`, prefixo `/api/programacao`, escrita por admin/pcp):
   - Cálculo de Carga × Capacidade por posto de trabalho com ocupação percentual e identificação automática do Posto Gargalo (`gargalo: bool`).

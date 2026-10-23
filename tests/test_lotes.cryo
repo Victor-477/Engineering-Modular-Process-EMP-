@@ -1,0 +1,245 @@
+// Testes de Rastreabilidade de Lotes e Genealogia com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_lotes.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"               as k;
+import "../src/nucleo/eventos.cryo"                as ev;
+import "../src/nucleo/persist.cryo"                as db;
+import "../src/modulos/cadastros/cadastros.cryo"     as cadastros;
+import "../src/modulos/producao/producao.cryo"       as producao;
+import "../src/modulos/estoque/estoque.cryo"         as estoque;
+import "../src/modulos/pedidos/pedidos.cryo"         as pedidos;
+import "../src/modulos/lotes/lotes.cryo"             as lotes;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _req(string metodo, string rota, string corpo) -> k::Requisicao ={
+    string r = rota;
+    string q = "";
+    int inter = find(rota, "?");
+    if (inter > 0) {
+        string s_rota = rota;
+        r = s_rota[0..inter];
+        q = s_rota[inter + 1..];
+    }
+    return k::Requisicao {
+        metodo: metodo,
+        caminho: "/api/lotes" + r,
+        rota: r,
+        query: q,
+        corpo: corpo,
+        usuario: "admin",
+        perfil: "admin"
+    };
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_lotes")) { make_dir("build/test_lotes"); }
+    string dir = "build/test_lotes/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+    for (string c in ["produtos", "estrutura", "postos", "ordens", "etapas", "pedidos", "clientes", "lotes", "genealogia", "expedicoes", "op_lote"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Produtos
+    map<string,string> prods = {};
+    prods["CHAPA"] = json_encode(cadastros::Produto { codigo: "CHAPA", descricao: "Chapa de Aço", unidade: "UN", tipo: "MP" });
+    prods["PARAF"] = json_encode(cadastros::Produto { codigo: "PARAF", descricao: "Parafuso M6", unidade: "UN", tipo: "MP" });
+    prods["MOTOR"] = json_encode(cadastros::Produto { codigo: "MOTOR", descricao: "Motor Elétrico", unidade: "UN", tipo: "PA" });
+    db::salvar(dir, "produtos", prods);
+
+    // Estrutura: CHAPA na etapa 1 (qtd 2.0), PARAF na etapa 0 (qtd 4.0)
+    map<string,string> est = {};
+    cadastros::ItemEstrutura[] itens = [
+        cadastros::ItemEstrutura { componente: "CHAPA", quantidade: 2.0, etapa: 1 },
+        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 4.0, etapa: 0 }
+    ];
+    est["MOTOR"] = json_encode(itens);
+    db::salvar(dir, "estrutura", est);
+
+    // Inicia os módulos
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(producao::descritor().iniciar, dir);
+    _iniciar(estoque::descritor().iniciar, dir);
+    _iniciar(pedidos::descritor().iniciar, dir);
+    _iniciar(lotes::descritor().iniciar, dir);
+
+    ev::retirar();
+    return dir;
+}
+
+// ── 1. Criar e consultar lote ─────────────────────────────
+test fn criar_e_consultar_lote() ={
+    string dir = _preparar("criar");
+
+    k::Resposta r_cria = _rotear(lotes::descritor().rotear, _req("POST", "/criar",
+        "numero=L-CHAPA-100&produto=CHAPA&quantidade=50.0&lote_fornecedor=NF-987&validade=2026-12-31&fabricacao=2026-01-10"));
+    assert(r_cria.status == 201, "criou lote");
+
+    k::Resposta r_get = _rotear(lotes::descritor().rotear, _req("GET", "/lote?numero=L-CHAPA-100", ""));
+    assert(r_get.status == 200, "obteve lote");
+    assert(contains(r_get.corpo, "\"numero\":\"L-CHAPA-100\""), "numero correto");
+    assert(contains(r_get.corpo, "\"quantidade\":50"), "quantidade correta");
+    assert(contains(r_get.corpo, "\"status\":\"LIBERADO\""), "status liberado");
+    assert(contains(r_get.corpo, "\"lote_fornecedor\":\"NF-987\""), "lote fornecedor correto");
+
+    k::Resposta r_lista = _rotear(lotes::descritor().rotear, _req("GET", "/lotes?produto=CHAPA", ""));
+    assert(r_lista.status == 200, "listou lotes");
+    assert(contains(r_lista.corpo, "L-CHAPA-100"), "contem lote");
+}
+
+// ── 2. Bloquear e liberar lote ────────────────────────────
+test fn bloquear_e_liberar_lote() ={
+    string dir = _preparar("bloquear");
+
+    _rotear(lotes::descritor().rotear, _req("POST", "/criar",
+        "numero=L-PARAF-50&produto=PARAF&quantidade=100.0"));
+
+    k::Resposta r_bloq = _rotear(lotes::descritor().rotear, _req("POST", "/bloquear",
+        "numero=L-PARAF-50&motivo=Oxidacao&status=BLOQUEADO"));
+    assert(r_bloq.status == 200, "bloqueou lote");
+    assert(contains(r_bloq.corpo, "\"status\":\"BLOQUEADO\""), "status bloqueado");
+
+    lotes::Lote l = lotes::obter_lote("L-PARAF-50");
+    assert(l.status == "BLOQUEADO", "lote bloqueado no storage");
+
+    k::Resposta r_lib = _rotear(lotes::descritor().rotear, _req("POST", "/liberar", "numero=L-PARAF-50"));
+    assert(r_lib.status == 200, "liberou lote");
+    assert(contains(r_lib.corpo, "\"status\":\"LIBERADO\""), "status liberado");
+}
+
+// ── 3. Auto-lote e genealogia na produção ─────────────────
+test fn auto_lote_e_genealogia_producao() ={
+    string dir = _preparar("producao");
+
+    // Cadastra lotes de matérias-primas
+    _rotear(lotes::descritor().rotear, _req("POST", "/criar",
+        "numero=L-CHAPA-01&produto=CHAPA&quantidade=30.0&lote_fornecedor=FORN-A"));
+    _rotear(lotes::descritor().rotear, _req("POST", "/criar",
+        "numero=L-PARAF-01&produto=PARAF&quantidade=50.0&lote_fornecedor=FORN-B"));
+
+    // Simula apontamento etapa 1 da OP 5 (faz 10 unidades -> consome 20 chapas)
+    k::Evento ev1 = k::Evento {
+        tipo: "producao.etapa_apontada",
+        origem: "producao",
+        dados: "op=5&produto=MOTOR&etapa=1&posto=PRENSA-01&delta_boas=10&delta_refugo=0",
+        ts: now_ms()
+    };
+    _evento(lotes::descritor().ao_evento, ev1);
+
+    // Saldo de L-CHAPA-01 deve cair de 30 para 10
+    lotes::Lote chapa = lotes::obter_lote("L-CHAPA-01");
+    assert(chapa.quantidade == 10.0, "chapa consumida");
+
+    // Simula apontamento final da OP 5 (10 unidades boas -> consome 40 parafusos da etapa 0)
+    k::Evento ev2 = k::Evento {
+        tipo: "producao.apontada",
+        origem: "producao",
+        dados: "op=5&produto=MOTOR&posto=MONTAGEM&boa=10&refugo=0",
+        ts: now_ms()
+    };
+    _evento(lotes::descritor().ao_evento, ev2);
+
+    // Saldo de L-PARAF-01 deve cair de 50 para 10
+    lotes::Lote paraf = lotes::obter_lote("L-PARAF-01");
+    assert(paraf.quantidade == 10.0, "parafuso consumido");
+
+    // Lote do produto acabado gerado automaticamente para a OP
+    lotes::Lote motor = lotes::obter_lote("LOT-OP-5");
+    assert(motor.numero == "LOT-OP-5", "numero do lote da OP");
+    assert(motor.produto == "MOTOR", "produto do lote");
+    assert(motor.quantidade == 10.0, "quantidade produzida");
+}
+
+// ── 4. Rastreamento backward e forward ────────────────────
+test fn rastreamento_backward_e_forward() ={
+    string dir = _preparar("rastreio");
+
+    // Lotes de MP
+    _rotear(lotes::descritor().rotear, _req("POST", "/criar",
+        "numero=L-CHAPA-99&produto=CHAPA&quantidade=40.0&lote_fornecedor=USIMINAS-1"));
+    _rotear(lotes::descritor().rotear, _req("POST", "/criar",
+        "numero=L-PARAF-99&produto=PARAF&quantidade=80.0&lote_fornecedor=CISER-2"));
+
+    // Produção de 5 motores na OP 8
+    _evento(lotes::descritor().ao_evento, k::Evento {
+        tipo: "producao.etapa_apontada",
+        origem: "producao",
+        dados: "op=8&produto=MOTOR&etapa=1&posto=PRENSA-01&delta_boas=5&delta_refugo=0",
+        ts: now_ms()
+    });
+    _evento(lotes::descritor().ao_evento, k::Evento {
+        tipo: "producao.apontada",
+        origem: "producao",
+        dados: "op=8&produto=MOTOR&posto=MONTAGEM&boa=5&refugo=0",
+        ts: now_ms()
+    });
+
+    // 1. Backward Trace: partindo do lote do motor acabado LOT-OP-8
+    lotes::RastreamentoResultado r_back = lotes::rastrear("LOT-OP-8");
+    assert(r_back.backward.op == 8, "op alvo backward");
+    assert(r_back.backward.produto == "MOTOR", "produto backward");
+    assert(len(r_back.backward.insumos) == 2, "2 insumos consumidos");
+
+    // Insumos devem conter L-CHAPA-99 e L-PARAF-99 com suas quantidades consumidas
+    bool achou_chapa = false;
+    bool achou_paraf = false;
+    for (lotes::ConsumoItem ci in r_back.backward.insumos) {
+        if (ci.lote_filho == "L-CHAPA-99" && ci.quantidade == 10.0) { achou_chapa = true; }
+        if (ci.lote_filho == "L-PARAF-99" && ci.quantidade == 20.0) { achou_paraf = true; }
+    }
+    assert(achou_chapa, "achou chapa 10 unidades");
+    assert(achou_paraf, "achou parafuso 20 unidades");
+
+    // 2. Forward Trace (Recall): partindo da chapa L-CHAPA-99
+    lotes::RastreamentoResultado r_fwd = lotes::rastrear("L-CHAPA-99");
+    assert(len(r_fwd.forward.ops_afetadas) == 1, "1 op afetada");
+    assert(r_fwd.forward.ops_afetadas[0].op == 8, "op 8 afetada");
+    assert(r_fwd.forward.ops_afetadas[0].lote_pai == "LOT-OP-8", "lote pai LOT-OP-8");
+    assert(r_fwd.forward.saldo_remanescente == 30.0, "saldo remanescente 30");
+}
+
+// ── 5. Expedição e recall de cliente ──────────────────────
+test fn expedicao_e_recall_de_cliente() ={
+    string dir = _preparar("recall");
+
+    // Lote de insumo
+    _rotear(lotes::descritor().rotear, _req("POST", "/criar",
+        "numero=L-CHAPA-DEF&produto=CHAPA&quantidade=20.0&lote_fornecedor=LOTE-DEFEITUOSO"));
+
+    // OP 12 produz 5 motores
+    _evento(lotes::descritor().ao_evento, k::Evento {
+        tipo: "producao.etapa_apontada",
+        origem: "producao",
+        dados: "op=12&produto=MOTOR&etapa=1&posto=PRENSA-01&delta_boas=5&delta_refugo=0",
+        ts: now_ms()
+    });
+    _evento(lotes::descritor().ao_evento, k::Evento {
+        tipo: "producao.apontada",
+        origem: "producao",
+        dados: "op=12&produto=MOTOR&posto=MONTAGEM&boa=5&refugo=0",
+        ts: now_ms()
+    });
+
+    // Pedido 77 é expedido para a montadora VOLTS com 3 motores
+    _evento(lotes::descritor().ao_evento, k::Evento {
+        tipo: "pedido.expedido",
+        origem: "pedidos",
+        dados: "pedido=77&cliente=VOLTS&itens=MOTOR:3",
+        ts: now_ms()
+    });
+
+    // Saldo do lote LOT-OP-12 deve cair de 5 para 2
+    lotes::Lote l_motor = lotes::obter_lote("LOT-OP-12");
+    assert(l_motor.quantidade == 2.0, "saldo lote motor apos expedicao");
+
+    // Rastreio direto do lote de matéria-prima defeituosa para saber clientes afetados!
+    lotes::RastreamentoResultado r = lotes::rastrear("L-CHAPA-DEF");
+    assert(len(r.forward.pedidos_afetados) == 1, "1 pedido afetado no recall");
+    assert(r.forward.pedidos_afetados[0].pedido == 77, "pedido 77 afetado");
+    assert(r.forward.pedidos_afetados[0].cliente == "VOLTS", "cliente VOLTS afetado");
+    assert(r.forward.pedidos_afetados[0].produto == "MOTOR", "produto MOTOR afetado");
+    assert(r.forward.pedidos_afetados[0].quantidade == 3.0, "quantidade 3 afetada");
+}

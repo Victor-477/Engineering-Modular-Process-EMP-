@@ -19,6 +19,7 @@ import "pedidos/pedidos.cryo"          as pedidos;
 import "indicadores/indicadores.cryo"  as indicadores;
 import "mrp/mrp.cryo"                  as mrp;
 import "programacao/programacao.cryo"  as programacao;
+import "lotes/lotes.cryo"              as lotes;
 
 pub fn todos() -> k::Modulo[] ={
     return [
@@ -30,6 +31,7 @@ pub fn todos() -> k::Modulo[] ={
         pedidos::descritor(),
         indicadores::descritor(),
         mrp::descritor(),
-        programacao::descritor()
+        programacao::descritor(),
+        lotes::descritor()
     ];
 }
