@@ -258,6 +258,27 @@ pub fn criar_op(string produto, number quantidade, string posto, string origem) 
     return _nova_op(p, quantidade, pt, trim(origem));
 }
 
+pub fn ordens_ativas() -> OrdemProducao[] ={
+    OrdemProducao[] lista = [];
+    for (string id in sort(keys(_ordens))) {
+        OrdemProducao op = _ler(parse_int(id) ?? 0);
+        if (op.status == "PLANEJADA" || op.status == "LIBERADA" || op.status == "EM_PRODUCAO") {
+            lista = concat(lista, [op]);
+        }
+    }
+    return lista;
+}
+
+pub fn execucao_da_op(int op_id) -> etp::Execucao ={
+    string id = to_string(op_id);
+    if (!has(_ordens, id)) {
+        etp::EtapaOP[] vazia = [];
+        return etp::Execucao { etapas: vazia, refugo_pendente: 0.0 };
+    }
+    OrdemProducao op = _ler(op_id);
+    return _execucao(op);
+}
+
 fn _criar(k::Requisicao r) -> k::Resposta ={
     map<string,string> f = form::ler(r.corpo);
     string produto = upper(form::campo(f, "produto"));

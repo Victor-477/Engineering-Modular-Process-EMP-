@@ -18,6 +18,7 @@ import "manutencao/manutencao.cryo"    as manutencao;
 import "pedidos/pedidos.cryo"          as pedidos;
 import "indicadores/indicadores.cryo"  as indicadores;
 import "mrp/mrp.cryo"                  as mrp;
+import "programacao/programacao.cryo"  as programacao;
 
 pub fn todos() -> k::Modulo[] ={
     return [
@@ -28,6 +29,7 @@ pub fn todos() -> k::Modulo[] ={
         manutencao::descritor(),
         pedidos::descritor(),
         indicadores::descritor(),
-        mrp::descritor()
+        mrp::descritor(),
+        programacao::descritor()
     ];
 }

@@ -1,0 +1,395 @@
+// ============================================================
+//  programacao.cryo — Módulo de Programação da Produção (APS)
+//
+//  Sequenciamento e balanceamento de carga de chão de fábrica:
+//    - Carga × Capacidade por posto de trabalho;
+//    - Identificação automática do Posto Gargalo;
+//    - Fila de trabalho sequenciada por prioridade e prazo do pedido (EDD);
+//    - Projeção de cronograma contínuo (início e fim estimados) e alerta de atraso;
+//    - Priorização manual por ordem do PCP/Admin.
+//
+//  Rotas (prefixo /api/programacao):
+//    GET  /capacidade            [{posto, descricao, capacidade_h, carga_min,
+//                                 carga_h, ocupacao_pct, tarefas_pendentes, gargalo}]
+//    GET  /agenda[?posto=X]      [{op, produto, etapa, operacao, posto, status,
+//                                 quantidade, tempo_unit_min, duracao_min, prioridade,
+//                                 entrega_pedido, inicio_estimado, fim_estimado, atraso_previsto}]
+//    POST /priorizar             op=&prioridade=
+//
+//  Eventos publicados:
+//    programacao.sobrecarga      posto=&ocupacao_pct=
+//
+//  Eventos assinados:
+//    op.*, pedido.*
+// ============================================================
+
+import "../../nucleo/contrato.cryo"           as k;
+import "../../nucleo/persist.cryo"            as db;
+import "../../nucleo/eventos.cryo"            as ev;
+import "../../nucleo/form.cryo"               as form;
+import "../cadastros/cadastros.cryo"          as cadastros;
+import "../producao/producao.cryo"            as producao;
+import "../producao/etapas.cryo"              as etp;
+import "../roteiros/roteiros.cryo"            as roteiros;
+import "../pedidos/pedidos.cryo"              as pedidos;
+
+pub struct PostoCarga {
+    string posto;
+    string descricao;
+    number capacidade_h;
+    number carga_min;
+    number carga_h;
+    number ocupacao_pct;
+    int tarefas_pendentes;
+    bool gargalo;
+}
+
+pub struct ItemAgenda {
+    int op;
+    string produto;
+    int etapa;
+    string operacao;
+    string posto;
+    string status;
+    number quantidade;
+    number tempo_unit_min;
+    number duracao_min;
+    int prioridade;
+    int entrega_pedido;
+    int inicio_estimado;
+    int fim_estimado;
+    bool atraso_previsto;
+}
+
+string _dir = "";
+map<string,string> _prioridades = {};  // op_id -> prioridade
+
+// ── priorização e ordenação ───────────────────────────────
+
+fn _vem_antes(ItemAgenda a, ItemAgenda b) -> bool ={
+    // 1. Quem já está em execução na máquina tem preferência absoluta
+    if (a.status == "EM_EXECUCAO" && b.status != "EM_EXECUCAO") { return true; }
+    if (b.status == "EM_EXECUCAO" && a.status != "EM_EXECUCAO") { return false; }
+
+    // 2. Prioridade manual definida pelo PCP (maior número = mais prioritário)
+    if (a.prioridade != b.prioridade) {
+        return a.prioridade > b.prioridade;
+    }
+
+    // 3. Regra EDD (Earliest Due Date): pedidos com entrega prometida mais cedo
+    if (a.entrega_pedido > 0 && b.entrega_pedido > 0) {
+        if (a.entrega_pedido != b.entrega_pedido) {
+            return a.entrega_pedido < b.entrega_pedido;
+        }
+    } else if (a.entrega_pedido > 0 && b.entrega_pedido == 0) {
+        return true;
+    } else if (b.entrega_pedido > 0 && a.entrega_pedido == 0) {
+        return false;
+    }
+
+    // 4. Desempate por FIFO (menor ID da OP)
+    return a.op < b.op;
+}
+
+fn _inserir_ordenado(ItemAgenda[] lista, ItemAgenda item) -> ItemAgenda[] ={
+    ItemAgenda[] res = [];
+    bool inserido = false;
+    for (ItemAgenda x in lista) {
+        if (!inserido && _vem_antes(item, x)) {
+            res = concat(res, [item]);
+            inserido = true;
+        }
+        res = concat(res, [x]);
+    }
+    if (!inserido) {
+        res = concat(res, [item]);
+    }
+    return res;
+}
+
+// ── coleta de tarefas ativas ───────────────────────────────
+
+fn _tarefas_ativas(string posto_filtro) -> ItemAgenda[] ={
+    ItemAgenda[] lista = [];
+    int agora = now_ms();
+
+    for (producao::OrdemProducao op in producao::ordens_ativas()) {
+        int prioridade = 0;
+        if (has(_prioridades, to_string(op.id))) {
+            prioridade = parse_int(_prioridades[to_string(op.id)]) ?? 0;
+        }
+
+        int entrega_pedido = 0;
+        if (starts_with(op.origem, "PED-")) {
+            string orig = op.origem;
+            int ped_id = parse_int(orig[4..]) ?? 0;
+            if (ped_id > 0) {
+                pedidos::Pedido ped = pedidos::pedido(ped_id);
+                entrega_pedido = ped.entrega_prevista;
+            }
+        }
+
+        etp::Execucao ex = producao::execucao_da_op(op.id);
+        if (len(ex.etapas) > 0) {
+            for (etp::EtapaOP e in ex.etapas) {
+                if (e.status == "CONCLUIDA" || e.status == "PULADA") { continue; }
+                if (len(posto_filtro) > 0 && e.posto != posto_filtro) { continue; }
+
+                number restante = max(0.0, e.entrada - e.boas);
+                if (restante <= 0.0 && e.status != "EM_EXECUCAO") { continue; }
+                if (restante <= 0.0) { restante = 1.0; }
+
+                number tempo_unit = e.tempo_min;
+                if (tempo_unit <= 0.0) { tempo_unit = roteiros::tempo_capacidade(e.posto, e.operacao); }
+                if (tempo_unit <= 0.0) { tempo_unit = 1.0; }
+
+                number dur_min = restante * tempo_unit;
+                lista = _inserir_ordenado(lista, ItemAgenda {
+                    op: op.id,
+                    produto: op.produto,
+                    etapa: e.numero,
+                    operacao: e.operacao,
+                    posto: e.posto,
+                    status: e.status,
+                    quantidade: restante,
+                    tempo_unit_min: tempo_unit,
+                    duracao_min: dur_min,
+                    prioridade: prioridade,
+                    entrega_pedido: entrega_pedido,
+                    inicio_estimado: 0,
+                    fim_estimado: 0,
+                    atraso_previsto: false
+                });
+            }
+        } else {
+            // OP planejada sem etapas geradas ainda: consulta o roteiro
+            roteiros::Etapa[] rots = roteiros::etapas(op.produto);
+            if (len(rots) > 0) {
+                for (roteiros::Etapa r in rots) {
+                    if (len(posto_filtro) > 0 && r.posto != posto_filtro) { continue; }
+                    number tempo_unit = r.tempo_min;
+                    if (tempo_unit <= 0.0) { tempo_unit = roteiros::tempo_capacidade(r.posto, r.operacao); }
+                    if (tempo_unit <= 0.0) { tempo_unit = 1.0; }
+                    number dur_min = op.quantidade * tempo_unit;
+
+                    lista = _inserir_ordenado(lista, ItemAgenda {
+                        op: op.id,
+                        produto: op.produto,
+                        etapa: r.numero,
+                        operacao: r.operacao,
+                        posto: r.posto,
+                        status: "PLANEJADA",
+                        quantidade: op.quantidade,
+                        tempo_unit_min: tempo_unit,
+                        duracao_min: dur_min,
+                        prioridade: prioridade,
+                        entrega_pedido: entrega_pedido,
+                        inicio_estimado: 0,
+                        fim_estimado: 0,
+                        atraso_previsto: false
+                    });
+                }
+            } else {
+                // Sem roteiro: etapa única no posto da OP
+                string pt = op.posto;
+                if (len(posto_filtro) == 0 || pt == posto_filtro) {
+                    number dur_min = op.quantidade * 1.0;
+                    lista = _inserir_ordenado(lista, ItemAgenda {
+                        op: op.id,
+                        produto: op.produto,
+                        etapa: 10,
+                        operacao: "APONTAMENTO",
+                        posto: pt,
+                        status: "PLANEJADA",
+                        quantidade: op.quantidade,
+                        tempo_unit_min: 1.0,
+                        duracao_min: dur_min,
+                        prioridade: prioridade,
+                        entrega_pedido: entrega_pedido,
+                        inicio_estimado: 0,
+                        fim_estimado: 0,
+                        atraso_previsto: false
+                    });
+                }
+            }
+        }
+    }
+    return lista;
+}
+
+// ── agenda sequenciada com cronograma contínuo ────────────
+
+pub fn calcular_agenda(string posto_filtro) -> ItemAgenda[] ={
+    ItemAgenda[] ordenadas = _tarefas_ativas(posto_filtro);
+    ItemAgenda[] cronograma = [];
+
+    // Rastreia o tempo final acumulado por posto
+    map<string,int> cursor_posto = {};
+    int agora = now_ms();
+
+    for (ItemAgenda t in ordenadas) {
+        int cursor = agora;
+        if (has(cursor_posto, t.posto)) {
+            cursor = cursor_posto[t.posto];
+        }
+
+        int dur_ms = parse_int(to_string(round(t.duracao_min * 60000.0))) ?? 60000;
+        int fim = cursor + dur_ms;
+        bool atraso = (t.entrega_pedido > 0 && fim > t.entrega_pedido);
+
+        cursor_posto[t.posto] = fim;
+
+        cronograma = concat(cronograma, [ItemAgenda {
+            op: t.op,
+            produto: t.produto,
+            etapa: t.etapa,
+            operacao: t.operacao,
+            posto: t.posto,
+            status: t.status,
+            quantidade: t.quantidade,
+            tempo_unit_min: t.tempo_unit_min,
+            duracao_min: t.duracao_min,
+            prioridade: t.prioridade,
+            entrega_pedido: t.entrega_pedido,
+            inicio_estimado: cursor,
+            fim_estimado: fim,
+            atraso_previsto: atraso
+        }]);
+    }
+    return cronograma;
+}
+
+// ── carga × capacidade e detecção de gargalo ───────────────
+
+pub fn calcular_capacidade() -> PostoCarga[] ={
+    ItemAgenda[] todas = _tarefas_ativas("");
+
+    // Agrupa carga por posto
+    map<string,number> carga_por_posto = {};
+    map<string,int> count_por_posto = {};
+
+    for (ItemAgenda t in todas) {
+        number atual = 0.0;
+        if (has(carga_por_posto, t.posto)) {
+            atual = carga_por_posto[t.posto];
+        }
+        carga_por_posto[t.posto] = atual + t.duracao_min;
+
+        int n = 0;
+        if (has(count_por_posto, t.posto)) {
+            n = count_por_posto[t.posto];
+        }
+        count_por_posto[t.posto] = n + 1;
+    }
+
+    // Calcula taxas e encontra a maior ocupação
+    number max_ocup = 0.0;
+    string[] postos = cadastros::postos_codigos();
+
+    // Primeira passada: calcula carga_h e ocupacao_pct
+    PostoCarga[] preliminar = [];
+    for (string pt in postos) {
+        string p_json = cadastros::posto_json(pt);
+        map<string,string> p_map = json_decode(p_json) as map<string,string>;
+        number cap_h = parse_number(p_map["capacidade_h"]) ?? 8.0;
+        if (cap_h <= 0.0) { cap_h = 8.0; }
+        string desc = p_map["descricao"];
+
+        number c_min = 0.0;
+        if (has(carga_por_posto, pt)) { c_min = carga_por_posto[pt]; }
+        number c_h = round(c_min * 10.0 / 60.0) / 10.0;
+        number ocup = round(c_h * 1000.0 / cap_h) / 10.0;
+
+        int tarefas = 0;
+        if (has(count_por_posto, pt)) { tarefas = count_por_posto[pt]; }
+
+        if (ocup > max_ocup) { max_ocup = ocup; }
+
+        if (ocup > 100.0) {
+            ev::publicar("programacao.sobrecarga", "programacao",
+                "posto=" + url_encode(pt) + "&ocupacao_pct=" + to_string(ocup));
+        }
+
+        preliminar = concat(preliminar, [PostoCarga {
+            posto: pt,
+            descricao: desc,
+            capacidade_h: cap_h,
+            carga_min: c_min,
+            carga_h: c_h,
+            ocupacao_pct: ocup,
+            tarefas_pendentes: tarefas,
+            gargalo: false
+        }]);
+    }
+
+    // Segunda passada: marca o posto gargalo
+    PostoCarga[] resultado = [];
+    for (PostoCarga pc in preliminar) {
+        bool eh_gargalo = (max_ocup > 0.0 && pc.ocupacao_pct == max_ocup);
+        resultado = concat(resultado, [PostoCarga {
+            posto: pc.posto,
+            descricao: pc.descricao,
+            capacidade_h: pc.capacidade_h,
+            carga_min: pc.carga_min,
+            carga_h: pc.carga_h,
+            ocupacao_pct: pc.ocupacao_pct,
+            tarefas_pendentes: pc.tarefas_pendentes,
+            gargalo: eh_gargalo
+        }]);
+    }
+
+    return resultado;
+}
+
+// ── rotas e ciclo de vida ─────────────────────────────────
+
+fn _priorizar(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    int op_id = form::inteiro(f, "op", 0);
+    int prioridade = form::inteiro(f, "prioridade", 0);
+    if (op_id <= 0) { return k::erro(422, "op é obrigatório"); }
+
+    _prioridades[to_string(op_id)] = to_string(prioridade);
+    db::salvar(_dir, "prioridades", _prioridades);
+    return k::ok("{\"op\":" + to_string(op_id) + ",\"prioridade\":" + to_string(prioridade) + "}");
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _prioridades = db::carregar(dir, "prioridades");
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    return true;
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/capacidade" && r.metodo == "GET") {
+        return k::ok(json_encode(calcular_capacidade()));
+    }
+    if (r.rota == "/agenda" && r.metodo == "GET") {
+        string pt = upper(k::param(r, "posto"));
+        return k::ok(json_encode(calcular_agenda(pt)));
+    }
+    if (r.rota == "/priorizar" && r.metodo == "POST") {
+        return _priorizar(r);
+    }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "programacao",
+        nome: "Programação e Sequenciamento da Produção (APS)",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/programacao",
+        depende: ["cadastros", "producao", "roteiros", "pedidos"],
+        assina: ["op.*", "pedido.*"],
+        perfis_escrita: ["admin", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

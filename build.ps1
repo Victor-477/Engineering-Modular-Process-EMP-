@@ -36,7 +36,7 @@ Write-Host "== testes de etapas e roteiros (cryoc test)"
 python $cryoc test tests/test_etapas.cryo --backend pyro
 if ($LASTEXITCODE -ne 0) { throw "testes de etapas falharam" }
 
-foreach ($t in @("pedidos", "estoque", "oee", "mrp")) {
+foreach ($t in @("pedidos", "estoque", "oee", "mrp", "programacao")) {
     Write-Host "== testes de $t (cryoc test)"
     python $cryoc test "tests/test_$t.cryo" --backend pyro
     if ($LASTEXITCODE -ne 0) { throw "testes de $t falharam" }

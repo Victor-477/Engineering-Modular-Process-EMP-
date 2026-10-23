@@ -1,0 +1,177 @@
+// Testes de Programação da Produção (APS) com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_programacao.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"               as k;
+import "../src/nucleo/eventos.cryo"                as ev;
+import "../src/nucleo/persist.cryo"                as db;
+import "../src/modulos/cadastros/cadastros.cryo"     as cadastros;
+import "../src/modulos/roteiros/roteiros.cryo"       as roteiros;
+import "../src/modulos/producao/producao.cryo"       as producao;
+import "../src/modulos/pedidos/pedidos.cryo"         as pedidos;
+import "../src/modulos/programacao/programacao.cryo" as prog;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_prog")) { make_dir("build/test_prog"); }
+    string dir = "build/test_prog/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+    for (string c in ["produtos", "estrutura", "postos", "ordens", "etapas", "pedidos", "clientes", "roteiros", "operacoes", "capacidades", "prioridades"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Produtos
+    map<string,string> prods = {};
+    prods["SUP"] = json_encode(cadastros::Produto { codigo: "SUP", descricao: "Suporte", unidade: "UN", tipo: "PA" });
+    db::salvar(dir, "produtos", prods);
+
+    // Postos
+    map<string,string> postos = {};
+    postos["PREN-01"] = "{\"codigo\":\"PREN-01\",\"descricao\":\"Prensa 80t\",\"capacidade_h\":2.0}";
+    postos["MONT-01"] = "{\"codigo\":\"MONT-01\",\"descricao\":\"Montagem\",\"capacidade_h\":8.0}";
+    db::salvar(dir, "postos", postos);
+
+    // Roteiros
+    map<string,string> rots = {};
+    roteiros::Etapa[] r_sup = [
+        roteiros::Etapa { numero: 10, operacao: "ESTAMPAGEM", posto: "PREN-01", tempo_min: 10.0, instrucao: "" },
+        roteiros::Etapa { numero: 20, operacao: "MONTAGEM", posto: "MONT-01", tempo_min: 5.0, instrucao: "" }
+    ];
+    rots["SUP"] = json_encode(r_sup);
+    db::salvar(dir, "roteiros", rots);
+
+    // Clientes
+    map<string,string> cls = {};
+    cls["CLI1"] = "{\"codigo\":\"CLI1\",\"nome\":\"Cliente 1\",\"documento\":\"\",\"contato\":\"\",\"email\":\"\",\"telefone\":\"\",\"endereco\":\"\"}";
+    cls["ACME"] = "{\"codigo\":\"ACME\",\"nome\":\"ACME\",\"documento\":\"\",\"contato\":\"\",\"email\":\"\",\"telefone\":\"\",\"endereco\":\"\"}";
+    db::salvar(dir, "clientes", cls);
+
+    // Inicia os módulos
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(roteiros::descritor().iniciar, dir);
+    _iniciar(producao::descritor().iniciar, dir);
+    _iniciar(pedidos::descritor().iniciar, dir);
+    _iniciar(prog::descritor().iniciar, dir);
+
+    ev::retirar();
+    return dir;
+}
+
+test fn capacidade_vazia_sem_ordens() ={
+    _preparar("vazia");
+    prog::PostoCarga[] caps = prog::calcular_capacidade();
+    assert(len(caps) == 2, "2 postos cadastrados");
+    assert(caps[0].posto == "MONT-01" && caps[0].carga_min == 0.0, "MONT-01 zerado");
+    assert(caps[1].posto == "PREN-01" && caps[1].carga_min == 0.0, "PREN-01 zerado");
+    assert(!caps[0].gargalo && !caps[1].gargalo, "nenhum gargalo com linha vazia");
+}
+
+test fn carga_e_gargalo_com_roteiros() ={
+    string dir = _preparar("gargalo");
+    // Cria OP de 10 SUP (100 min na PREN-01 e 50 min na MONT-01)
+    k::Requisicao req = k::Requisicao {
+        metodo: "POST", rota: "/ordens", query: "",
+        corpo: "produto=SUP&quantidade=10&posto=PREN-01",
+        usuario: "teste", perfil: "admin"
+    };
+    k::Resposta resp = _rotear(producao::descritor().rotear, req);
+    assert(resp.status == 201, "OP criada");
+
+    // Libera a OP para que copie as etapas do roteiro
+    k::Requisicao rlib = k::Requisicao {
+        metodo: "POST", rota: "/liberar", query: "id=1", corpo: "",
+        usuario: "teste", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, rlib);
+
+    prog::PostoCarga[] caps = prog::calcular_capacidade();
+    // caps vem ordenado por código: MONT-01 primeiro, PREN-01 segundo
+    prog::PostoCarga c_mont = caps[0];
+    prog::PostoCarga c_pren = caps[1];
+
+    assert(c_pren.posto == "PREN-01", "PREN-01");
+    assert(c_pren.carga_min == 100.0, "100 min de prensa");
+    assert(c_pren.carga_h == 1.7, "1.7 horas de prensa");
+    assert(c_pren.ocupacao_pct == 85.0, "85% de ocupacao na prensa (1.7/2.0)");
+    assert(c_pren.gargalo == true, "PREN-01 detectada como gargalo da linha");
+
+    assert(c_mont.posto == "MONT-01", "MONT-01");
+    assert(c_mont.carga_min == 50.0, "50 min de montagem");
+    assert(c_mont.carga_h == 0.8, "0.8 horas de montagem");
+    assert(c_mont.gargalo == false, "MONT-01 não é gargalo");
+}
+
+test fn sequenciamento_por_edd_e_prioridade() ={
+    string dir = _preparar("sequenciamento");
+    // Pedido 1: entrega em 3 dias
+    k::Requisicao rped = k::Requisicao {
+        metodo: "POST", rota: "/pedidos", query: "",
+        corpo: "cliente=CLI1&itens=SUP:5&prazo_dias=3",
+        usuario: "teste", perfil: "admin"
+    };
+    k::Resposta resp_ped = _rotear(pedidos::descritor().rotear, rped);
+    assert(resp_ped.status == 201, "pedido 1 criado");
+
+    // OP 1 manual (sem pedido)
+    producao::criar_op("SUP", 5.0, "PREN-01", "");
+
+    // OP 2 do Pedido 1 (origem PED-1)
+    producao::criar_op("SUP", 5.0, "PREN-01", "PED-1");
+
+    // Agenda da PREN-01: OP 2 (com pedido/prazo) deve vir na frente da OP 1 manual
+    prog::ItemAgenda[] ag = prog::calcular_agenda("PREN-01");
+    assert(len(ag) == 2, "2 tarefas na fila da prensa");
+    assert(ag[0].op == 2 && ag[1].op == 1, "OP 2 com prazo de entrega vem antes da OP 1 manual");
+
+    // Agora PCP prioriza manualmente a OP 1
+    k::Requisicao rpri = k::Requisicao {
+        metodo: "POST", rota: "/priorizar", query: "",
+        corpo: "op=1&prioridade=10",
+        usuario: "pcp", perfil: "pcp"
+    };
+    k::Resposta resp_pri = _rotear(prog::descritor().rotear, rpri);
+    assert(resp_pri.status == 200, "priorizada");
+
+    // Fila reordenada: OP 1 agora passa na frente!
+    prog::ItemAgenda[] ag_reord = prog::calcular_agenda("PREN-01");
+    assert(ag_reord[0].op == 1 && ag_reord[1].op == 2, "OP 1 priorizada manualmente passa para primeiro");
+}
+
+test fn cronograma_e_alerta_de_atraso() ={
+    string dir = _preparar("atraso");
+    // Pedido com prazo zero (vence agora)
+    k::Requisicao rped = k::Requisicao {
+        metodo: "POST", rota: "/pedidos", query: "",
+        corpo: "cliente=ACME&itens=SUP:10&prazo_dias=0",
+        usuario: "teste", perfil: "admin"
+    };
+    k::Resposta resp_ped = _rotear(pedidos::descritor().rotear, rped);
+    assert(resp_ped.status == 201, "pedido criado");
+
+    producao::criar_op("SUP", 10.0, "PREN-01", "PED-1");
+
+    prog::ItemAgenda[] ag = prog::calcular_agenda("PREN-01");
+    assert(len(ag) == 1, "1 tarefa");
+    assert(ag[0].inicio_estimado > 0, "início estimado projetado");
+    assert(ag[0].fim_estimado > ag[0].inicio_estimado, "fim estimado posterior ao início");
+    assert(ag[0].atraso_previsto == true, "alerta de atraso ativo devido à entrega vencida");
+}
+
+test fn sobrecarga_publica_evento() ={
+    string dir = _preparar("sobrecarga");
+    // OP de 20 SUP: 200 min de prensa na PREN-01 (capacidade 2h = 120 min -> 166.7% de ocupação)
+    producao::criar_op("SUP", 20.0, "PREN-01", "");
+    ev::retirar(); // descarta op.criada
+
+    prog::PostoCarga[] caps = prog::calcular_capacidade();
+    prog::PostoCarga c_pren = caps[1];
+    assert(c_pren.posto == "PREN-01" && c_pren.ocupacao_pct > 100.0, "ocupação > 100%");
+
+    // Confere evento de sobrecarga
+    assert(ev::pendentes() >= 1, "publicou evento");
+    k::Evento[] evs = ev::retirar();
+    assert(evs[0].tipo == "programacao.sobrecarga", "tipo do evento");
+    assert(contains(evs[0].dados, "posto=PREN-01"), "posto PREN-01");
+}

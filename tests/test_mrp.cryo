@@ -44,12 +44,12 @@ fn _preparar(string caso) -> string ={
     // BASE (SA) = 1 CHAPA (MP)
     map<string,string> est = {};
     cadastros::ItemEstrutura[] bom_sup = [
-        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 2.0 },
-        cadastros::ItemEstrutura { componente: "BASE", quantidade: 1.0 }
+        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 2.0, etapa: 0 },
+        cadastros::ItemEstrutura { componente: "BASE", quantidade: 1.0, etapa: 0 }
     ];
     est["SUP"] = json_encode(bom_sup);
     cadastros::ItemEstrutura[] bom_base = [
-        cadastros::ItemEstrutura { componente: "CHAPA", quantidade: 1.0 }
+        cadastros::ItemEstrutura { componente: "CHAPA", quantidade: 1.0, etapa: 0 }
     ];
     est["BASE"] = json_encode(bom_base);
     db::salvar(dir, "estrutura", est);

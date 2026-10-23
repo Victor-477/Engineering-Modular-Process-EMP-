@@ -111,8 +111,8 @@ fn _preparar(string caso) -> string ={
     db::salvar(dir, "produtos", prods);
     map<string,string> est = {};
     cadastros::ItemEstrutura[] bom = [
-        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 2.0 },
-        cadastros::ItemEstrutura { componente: "BASE", quantidade: 1.0 }
+        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 2.0, etapa: 0 },
+        cadastros::ItemEstrutura { componente: "BASE", quantidade: 1.0, etapa: 0 }
     ];
     est["SUP"] = json_encode(bom);
     db::salvar(dir, "estrutura", est);
@@ -274,4 +274,43 @@ test fn reposicao_desconta_ops_abertas() ={
     // Conclusão da OP remove de ops_abertas
     _entregar("op.concluida", "op=102&produto=SUP&quantidade=5");
     assert(estoque::em_producao("SUP") == 0.0, "removida de ops abertas ao concluir");
+}
+
+test fn backflush_por_etapa() ={
+    string dir = _preparar("backflush_etapa");
+    // Cadastra estrutura com etapas de consumo específicas:
+    // SUP = 1 BASE na etapa 10 (Prensa) + 2 PARAF na etapa 20 (Montagem)
+    map<string,string> est = {};
+    cadastros::ItemEstrutura[] bom = [
+        cadastros::ItemEstrutura { componente: "BASE", quantidade: 1.0, etapa: 10 },
+        cadastros::ItemEstrutura { componente: "PARAF", quantidade: 2.0, etapa: 20 }
+    ];
+    est["SUP"] = json_encode(bom);
+    db::salvar(dir, "estrutura", est);
+
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(estoque::descritor().iniciar, dir);
+
+    // Endereços de linha dos postos
+    _post("/enderecos", "codigo=LIN-PREN&tipo=LINHA&posto=MONT-01"); // reusa MONT-01 ou cria outro
+    _post("/enderecos", "codigo=LIN-MONT&tipo=LINHA&posto=MONT-01"); // se falhar, usa GERAL
+
+    _post("/entrada", "produto=BASE&quantidade=10");
+    _post("/entrada", "produto=PARAF&quantidade=20");
+
+    // Aponta etapa 10 (consome só BASE)
+    _entregar("producao.etapa_apontada", "op=1&produto=SUP&etapa=10&posto=MONT-01&delta_boas=5&delta_refugo=0");
+    assert(estoque::saldo("BASE") == 5.0, "5 BASE consumidas na etapa 10");
+    assert(estoque::saldo("PARAF") == 20.0, "PARAF intacto na etapa 10");
+
+    // Aponta etapa 20 (consome só PARAF: 5 x 2 = 10)
+    _entregar("producao.etapa_apontada", "op=1&produto=SUP&etapa=20&posto=MONT-01&delta_boas=5&delta_refugo=0");
+    assert(estoque::saldo("BASE") == 5.0, "BASE intacta na etapa 20");
+    assert(estoque::saldo("PARAF") == 10.0, "10 PARAF consumidos na etapa 20");
+
+    // Conclusão da OP (producao.apontada): entra SUP, mas componentes com etapa > 0 não são re-consumidos
+    _entregar("producao.apontada", "op=1&produto=SUP&posto=MONT-01&boa=5&refugo=0");
+    assert(estoque::saldo("SUP") == 5.0, "5 SUP entraram no estoque");
+    assert(estoque::saldo("BASE") == 5.0, "BASE não duplicada no término");
+    assert(estoque::saldo("PARAF") == 10.0, "PARAF não duplicado no término");
 }

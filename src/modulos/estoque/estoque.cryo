@@ -291,9 +291,33 @@ fn _backflush(map<string,string> d) ={
         _conferir_minimo(produto, antes);
     }
     for (cadastros::ItemEstrutura it in cadastros::estrutura(produto)) {
-        number antes = _antes(it.componente);
-        _consumir(it.componente, preferidos, it.quantidade * consumida, "CONSUMO", origem);
-        _conferir_minimo(it.componente, antes);
+        if (it.etapa == 0) {
+            number antes = _antes(it.componente);
+            _consumir(it.componente, preferidos, it.quantidade * consumida, "CONSUMO", origem);
+            _conferir_minimo(it.componente, antes);
+        }
+    }
+}
+
+fn _backflush_etapa(map<string,string> d) ={
+    string produto = form::campo(d, "produto");
+    int etapa = form::inteiro(d, "etapa", 0);
+    number boa = form::numero(d, "delta_boas", 0.0);
+    number refugo = form::numero(d, "delta_refugo", 0.0);
+    number consumida = boa + refugo;
+    if (etapa <= 0 || consumida <= 0.0) { return; }
+
+    string origem = "OP " + form::campo(d, "op") + " etapa " + to_string(etapa);
+    string linha = _linha_do_posto(form::campo(d, "posto"));
+    string[] preferidos = [];
+    if (len(linha) > 0) { preferidos = [linha]; }
+
+    for (cadastros::ItemEstrutura it in cadastros::estrutura(produto)) {
+        if (it.etapa > 0 && it.etapa == etapa) {
+            number antes = _antes(it.componente);
+            _consumir(it.componente, preferidos, it.quantidade * consumida, "CONSUMO", origem);
+            _conferir_minimo(it.componente, antes);
+        }
     }
 }
 
@@ -342,6 +366,7 @@ fn _encerrar_op(map<string,string> d) ={
 fn ao_evento(k::Evento e) -> bool ={
     map<string,string> d = form::ler(e.dados);
     if (e.tipo == "producao.apontada") { _backflush(d); }
+    if (e.tipo == "producao.etapa_apontada") { _backflush_etapa(d); }
     if (e.tipo == "op.liberada") { _conferir(d); }
     if (e.tipo == "op.criada" || e.tipo == "op.liberada") { _registrar_op(d); }
     if (e.tipo == "op.concluida" || e.tipo == "op.cancelada") { _encerrar_op(d); }
@@ -535,7 +560,7 @@ pub fn descritor() -> k::Modulo ={
         contrato: 1,
         prefixo: "/api/estoque",
         depende: ["cadastros"],
-        assina: ["producao.apontada", "op.*", "pedido.expedido"],
+        assina: ["producao.apontada", "producao.etapa_apontada", "op.*", "pedido.expedido"],
         perfis_escrita: ["admin", "almoxarife"],
         iniciar: iniciar,
         rotear: rotear,

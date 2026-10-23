@@ -34,6 +34,7 @@ pub struct Produto {
 pub struct ItemEstrutura {
     string componente;
     number quantidade;      // por 1 unidade do pai
+    int etapa;              // etapa do roteiro em que entra (0 = final/legado)
 }
 
 string _dir = "";
@@ -73,7 +74,11 @@ pub fn estrutura(string codigo) -> ItemEstrutura[] ={
         ItemEstrutura[] vazia = [];
         return vazia;
     }
-    return json_decode(_estrutura[codigo]) as ItemEstrutura[];
+    string bruto = _estrutura[codigo];
+    if (!contains(bruto, "\"etapa\":")) {
+        bruto = replace(bruto, "}", ",\"etapa\":0}");
+    }
+    return json_decode(bruto) as ItemEstrutura[];
 }
 
 pub fn posto_existe(string codigo) -> bool ={
@@ -145,12 +150,13 @@ fn _salvar_componente(k::Requisicao r) -> k::Resposta ={
     if (pai == comp) { return k::erro(422, "um produto não pode conter a si mesmo"); }
     if (qtd <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
 
+    int etapa = form::inteiro(f, "etapa", 0);
     ItemEstrutura[] atual = estrutura(pai);
     ItemEstrutura[] nova = [];
     for (ItemEstrutura it in atual) {
         if (it.componente != comp) { nova = concat(nova, [it]); }
     }
-    nova = concat(nova, [ItemEstrutura { componente: comp, quantidade: qtd }]);
+    nova = concat(nova, [ItemEstrutura { componente: comp, quantidade: qtd, etapa: etapa }]);
     _estrutura[pai] = json_encode(nova);
     if (!db::salvar(_dir, "estrutura", _estrutura)) {
         return k::erro(500, "falha ao gravar estrutura");

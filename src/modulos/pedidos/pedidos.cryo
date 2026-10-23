@@ -225,6 +225,14 @@ fn _ler(int id) -> Pedido ={
     return json_decode(_pedidos[to_string(id)]) as Pedido;
 }
 
+pub fn pedido(int id) -> Pedido ={
+    if (!has(_pedidos, to_string(id))) {
+        ItemPedido[] nenhum = [];
+        return Pedido { id: 0, cliente: "", itens: nenhum, status: "", criado_em: 0, entrega_prevista: 0, expedido_em: 0, observacao: "", motivo: "", atualizado_em: 0 };
+    }
+    return _ler(id);
+}
+
 pub fn pedidos_abertos() -> Pedido[] ={
     Pedido[] lista = [];
     for (string id in sort(keys(_pedidos))) {
