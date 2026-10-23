@@ -2,6 +2,29 @@
 
 ## Não lançado
 
+### Novo — fase 4: Programação da Produção (APS) e Backflush por Etapa
+- **Módulo de Programação da Produção / APS** (`src/modulos/programacao/`, prefixo `/api/programacao`, escrita por admin/pcp):
+  - Cálculo de Carga × Capacidade por posto de trabalho com ocupação percentual e identificação automática do Posto Gargalo (`gargalo: bool`).
+  - Sequenciamento inteligente por prioridade do PCP, Earliest Due Date (EDD - prazo prometido do pedido comercial) e desempate FIFO.
+  - Projeção de cronograma contínuo (início e fim estimados) considerando tempos unitários de roteiro ou capacidade do posto e apontamento atual.
+  - Alerta antecipado de atraso previsto (`atraso_previsto: bool`) quando o fim estimado ultrapassa a entrega prometida ao cliente.
+  - Rota de priorização manual `POST /api/programacao/priorizar` (`op` e `prioridade`) persistida em `dados/programacao/prioridades.json`.
+  - Publica evento `programacao.sobrecarga` com `posto` e `ocupacao_pct` quando a ocupação ultrapassa 100%.
+- **Backflush com Etapa de Consumo**:
+  - `cadastros::ItemEstrutura` agora possui campo `etapa: int` (0 = início/geral, 1..N = etapa específica do roteiro).
+  - `estoque.cryo` assina `producao.etapa_apontada` e consome no momento do apontamento os componentes vinculados àquela etapa específica diretamente do endereço `LINHA` do posto correspondente.
+  - No encerramento da OP (ou apontamento de etapa única/legada), realiza a baixa final dos componentes de etapa 0 ou remanescentes.
+  - Resolve o problema conhecido da fase 3.
+- **Painel**:
+  - Nova aba e seção **Programação (APS)** com visualização de cards de capacidade por posto, barra de ocupação, badges de `GARGALO` e `SOBRECARGA`.
+  - Tabela de fila de sequenciamento com ordenação por prioridade/EDD, filtro por posto, situação (`NO PRAZO`, `EM EXECUÇÃO`, `ATRASO PREVISTO`) e edição rápida de prioridade.
+  - Em Cadastros, formulário e tabela de estrutura (BOM) atualizados com campo de etapa de consumo.
+  - Indicador de alerta de sobrecargas de postos no sino e badge na navegação.
+- **Testes**: +5 casos em `test_programacao` e +1 caso em `test_estoque`, totalizando 66 testes automatizados no `build.ps1`.
+
+### Corrigido (fase 4)
+- **Consumo de componentes por etapa no chão de fábrica**: componentes agora saem dos postos onde são efetivamente consumidos durante o fluxo de etapas da OP, e não todos acumulados no posto da última etapa.
+
 ### Novo — fase 3: PCP / MRP e compras
 - **Módulo de PCP / MRP** (`src/modulos/mrp/`, prefixo `/api/mrp`, escrita por admin/pcp):
   - Explosão de estrutura multinível (BOM) combinando demanda de pedidos comerciais abertos (`pedidos`) e regras de reposição mínima (`estoque`).
@@ -23,9 +46,9 @@
 ### Corrigido (fase 3)
 - **/sugestoes desconta OPs já abertas**: o módulo de estoque agora assina `op.*` e rastreia `_ops_abertas`. Se o saldo projetado (`saldo + em_producao`) atingir o mínimo, a sugestão deixa de ser listada; caso contrário, sugere apenas a quantidade complementar (`maximo - saldo_projetado`). A API devolve `em_producao` e `saldo_projetado` no JSON.
 
-### Problemas conhecidos (fase 3)
-- Todos os componentes saem do endereço do posto da **última** etapa no
-  backflush: a estrutura não diz em que etapa cada componente entra.
+### Problemas conhecidos (resolvidos na fase 4)
+- Todos os componentes saíam do endereço do posto da **última** etapa no
+  backflush: resolvido na fase 4 com o campo `etapa` na estrutura do produto e consumo imediato a cada etapa apontada.
 
 ### Novo — fase 2: comercial, estoque endereçado e OEE ([docs/FASE2.md](docs/FASE2.md))
 Inspirada no MES4 (`tblCustomer`/`tblOrder`, `tblBuffer`/`tblBufferPos`,

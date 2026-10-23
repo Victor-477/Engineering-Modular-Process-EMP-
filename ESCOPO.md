@@ -245,18 +245,24 @@ Engineering-Modular-Process-EMP-/
 │       ├── estoque/regras.cryo      regras puras do estoque (repartição, mínimo, sugestão)
 │       ├── manutencao/manutencao.cryo
 │       ├── indicadores/indicadores.cryo  eventos → histórico do posto, rotas de OEE
-│       └── indicadores/oee.cryo     cálculo puro do OEE
+│       ├── indicadores/oee.cryo     cálculo puro do OEE
+│       ├── mrp/mrp.cryo             planejamento de necessidades (BOM, pedidos, ordens)
+│       └── programacao/programacao.cryo  sequenciamento e capacidade finita (APS, EDD, gargalos)
 ├── plugins/                   manifestos lidos em tempo de execução
-│   └── qualidade.plugin
+│   ├── qualidade.plugin
+│   └── compras.plugin
 ├── plugins_src/
-│   └── qualidade/qualidade.cryo
+│   ├── qualidade/qualidade.cryo
+│   └── compras/compras.cryo
 ├── tests/
 │   ├── test_nucleo.cryo       harness em programa comum
 │   ├── test_eventos.cryo      `test fn` rodado por `cryoc test`
 │   ├── test_etapas.cryo       `test fn`: etapas, versão/409, medições, roteiros
 │   ├── test_pedidos.cryo      pedidos, reserva, falta, expedição, OP antiga
-│   ├── test_estoque.cryo      endereços, migração, backflush, reposição, expedição
-│   └── test_oee.cryo          janela, sobreposição, limites do OEE
+│   ├── test_estoque.cryo      endereços, migração, backflush por etapa, reposição, expedição
+│   ├── test_oee.cryo          janela, sobreposição, limites do OEE
+│   ├── test_mrp.cryo          plano multinível, cobertura, ordens automáticas
+│   └── test_programacao.cryo  capacidade, gargalo, fila EDD, projeção de cronograma
 ├── tools/                     cargas de demonstração (via HTTP, modo dev), nesta ordem:
 │   ├── demo.cryo              linha base: produtos, roteiros, OPs, paradas
 │   ├── demo_estoque.cryo      endereços, transferências, reposição
@@ -268,7 +274,7 @@ Engineering-Modular-Process-EMP-/
 │   ├── fase2/                 decisões, verificação e limites de cada frente
 │   ├── DESIGN_SYSTEM.md       sistema de design Forja
 │   └── screenshots/           capturas do painel e do terminal
-└── build/                     emp.exe, qualidade.exe (gerados)
+└── build/                     emp.exe, compras.exe, qualidade.exe (gerados)
 ```
 
 Instalação no servidor:
@@ -276,16 +282,21 @@ Instalação no servidor:
 ```
 C:\EMP\
 ├── emp.exe
+├── compras.exe
 ├── qualidade.exe
-├── plugins\qualidade.plugin
+├── plugins\
+│   ├── compras.plugin
+│   └── qualidade.plugin
 └── dados\                     criado na primeira execução
     ├── cadastros\produtos.json  estrutura.json  postos.json
     ├── roteiros\operacoes.json  roteiros.json  capacidades.json
     ├── producao\ordens.json  etapas.json
     ├── pedidos\clientes.json  pedidos.json  ops.json
-    ├── estoque\saldos.json  posicoes.json  enderecos.json  movimentos.json  reposicao.json
+    ├── estoque\saldos.json  posicoes.json  enderecos.json  movimentos.json  reposicao.json  ops_abertas.json
     ├── manutencao\paradas.json
     ├── indicadores\intervalos.json  apontamentos.json  estado.json
+    ├── programacao\prioridades.json
+    ├── compras\fornecedores.json  pedidos.json
     ├── qualidade\ncs.json
     └── auditoria\<ms>-<seq>.log
 ```
