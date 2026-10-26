@@ -24,6 +24,17 @@
 //                       resposta: "<status>|<content-type>\n<corpo>"
 //    POST <url>/evento  corpo: id=&tipo=&origem=&dados=&ts=
 //
+//  Eventos do plugin: a resposta do /req pode trazer, entre o cabeçalho
+//  e o corpo, linhas "@evento <tipo>|<dados>". O núcleo as publica no
+//  barramento (origem = id do plugin), entregues depois da resposta como
+//  as de qualquer módulo. É o ÚNICO jeito de um plugin avisar o ERP de um
+//  fato: ele não pode chamar a API do EMP no meio de um /req, porque o
+//  servidor atende uma requisição por vez e está esperando justamente
+//  esse /req — a chamada de volta só termina no tempo-limite (o
+//  recebimento de compra fazia isso e perdia a entrada no estoque). Por
+//  segurança o tipo precisa começar com "<id>.": um plugin não publica
+//  maquina.parada nem producao.apontada; os demais são descartados.
+//
 //  O descritor do plugin é um k::Modulo comum cujas funções são
 //  CLOSURES que capturam a URL — para o registro, um plugin é
 //  indistinguível de um módulo interno.
@@ -31,6 +42,53 @@
 
 import "contrato.cryo" as k;
 import "form.cryo"     as form;
+import "eventos.cryo"  as ev;
+
+// A resposta de um /req já separada: o que vai ao cliente e os eventos
+// que o plugin pediu para publicar ("tipo|dados", já filtrados).
+pub struct RespostaPlugin {
+    k::Resposta resposta;
+    string[] eventos;
+    int recusados;
+}
+
+// Lê "<status>|<tipo>\n[@evento tipo|dados\n]*<corpo>". Puro, testável.
+// Status 0 quando falta o cabeçalho.
+pub fn ler_resposta(string id, string bruto) -> RespostaPlugin ={
+    string[] nenhum = [];
+    k::Resposta ruim = k::Resposta { status: 0, tipo: "", corpo: "" };
+    int nl = find(bruto, "\n");
+    if (nl <= 0) { return RespostaPlugin { resposta: ruim, eventos: nenhum, recusados: 0 }; }
+    string cab = bruto[0..nl];
+    int bar = find(cab, "|");
+    if (bar <= 0) { return RespostaPlugin { resposta: ruim, eventos: nenhum, recusados: 0 }; }
+    string resto = bruto[nl + 1..];
+    string[] eventos = [];
+    int recusados = 0;
+    while (starts_with(resto, "@evento ")) {
+        int fim = find(resto, "\n");
+        string linha = resto;
+        if (fim >= 0) {
+            linha = resto[0..fim];
+            resto = resto[fim + 1..];
+        } else {
+            resto = "";
+        }
+        string ev_txt = trim(linha[8..]);
+        int sep = find(ev_txt, "|");
+        string tipo = ev_txt;
+        if (sep >= 0) { tipo = ev_txt[0..sep]; }
+        if (len(id) > 0 && starts_with(tipo, id + ".") && len(tipo) > len(id) + 1) {
+            eventos = concat(eventos, [ev_txt]);
+        } else {
+            recusados = recusados + 1;
+        }
+    }
+    return RespostaPlugin {
+        resposta: k::Resposta { status: parse_int(cab[0..bar]) ?? 502, tipo: cab[bar + 1..], corpo: resto },
+        eventos: eventos, recusados: recusados
+    };
+}
 
 fn _lista(string s) -> string[] ={
     string[] out = [];
@@ -82,22 +140,33 @@ fn _saude(string url) -> bool ={
     return trim(http_get(url + "/saude")) == "ok";
 }
 
-fn _proxy(string url, k::Requisicao r) -> k::Resposta ={
+fn _proxy(string id, string url, k::Requisicao r) -> k::Resposta ={
     string env = "metodo=" + url_encode(r.metodo)
         + "&rota=" + url_encode(r.rota)
         + "&query=" + url_encode(r.query)
         + "&corpo=" + url_encode(r.corpo)
         + "&usuario=" + url_encode(r.usuario)
         + "&perfil=" + url_encode(r.perfil);
+    if (!_disponivel(url)) {
+        return k::erro(503, "plugin em " + url + " suspenso após falhas repetidas");
+    }
     string bruto = http_post(url + "/req", env);
     int nl = find(bruto, "\n");
+    _resultado(url, nl > 0);
     if (nl <= 0) {
         return k::erro(502, "plugin em " + url + " não respondeu");
     }
-    string cab = bruto[0..nl];
-    int bar = find(cab, "|");
-    if (bar <= 0) { return k::erro(502, "resposta de plugin malformada"); }
-    return k::Resposta { status: parse_int(cab[0..bar]) ?? 502, tipo: cab[bar + 1..], corpo: bruto[nl + 1..] };
+    RespostaPlugin rp = ler_resposta(id, bruto);
+    if (rp.resposta.status == 0) { return k::erro(502, "resposta de plugin malformada"); }
+    for (string e in rp.eventos) {
+        int sep = find(e, "|");
+        if (sep < 0) { ev::publicar(e, id, ""); } else { ev::publicar(e[0..sep], id, e[sep + 1..]); }
+    }
+    if (rp.recusados > 0) {
+        print("  [plugin " + id + "] " + to_string(rp.recusados)
+            + " evento(s) recusado(s): o tipo precisa começar com " + id + ".");
+    }
+    return rp.resposta;
 }
 
 fn _evento(string url, k::Evento e) -> bool ={
@@ -122,7 +191,7 @@ fn _fabricar(map<string,string> m) -> k::Modulo ={
         assina: _lista(form::campo(m, "assina")),
         perfis_escrita: _lista(form::campo_ou(m, "perfis_escrita", "admin")),
         iniciar: (string dir) => _saude(url),
-        rotear: (k::Requisicao r) => _proxy(url, r),
+        rotear: (k::Requisicao r) => _proxy(m["id"], url, r),
         ao_evento: (k::Evento e) => _evento(url, e)
     };
 }

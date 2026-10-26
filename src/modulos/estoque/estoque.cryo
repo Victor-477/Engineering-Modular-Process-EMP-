@@ -11,6 +11,9 @@
 //                         componentes e publica estoque.falta se faltar
 //    pedido.expedido   -> saída EXPEDICAO de cada item: dos endereços
 //                         EXPEDICAO até o saldo deles; o resto do GERAL
+//    compras.pedido_*  -> (plugin de compras) criado/cancelado mantêm o
+//                         que está "em compra"; recebido dá a ENTRADA
+//                         de cada item no GERAL (ENTRADA_COMPRA)
 //
 //  Saldo por produto × endereço (tblBuffer/tblBufferPos do MES4). O
 //  endereço GERAL existe sempre; dados da v0.2 (saldo só por produto)
@@ -33,7 +36,8 @@
 //    GET  /sugestoes             regras com saldo < mínimo
 //
 //  Eventos publicados: estoque.movimentado, estoque.falta,
-//                      estoque.negativo, estoque.abaixo_minimo
+//                      estoque.negativo, estoque.abaixo_minimo,
+//                      estoque.compra_item_rejeitado
 // ============================================================
 
 import "../../nucleo/contrato.cryo" as k;
@@ -49,7 +53,8 @@ map<string,string> _posicoes = {};     // "ENDERECO|PRODUTO" -> saldo (texto)
 map<string,string> _enderecos = {};    // codigo -> json(rg::Endereco)
 map<string,string> _regras = {};       // produto -> json(rg::Regra)
 map<string,string> _movimentos = {};   // id -> json
-map<string,string> _ops_abertas = {};  // op_id -> "PRODUTO:qtd"
+map<string,string> _ops_abertas = {};  // op_id -> "PRODUTO:qtd:produzido" (formato antigo: "PRODUTO:qtd")
+map<string,string> _compras_abertas = {};  // pedido de compra -> "PRODUTO:qtd;..."
 int _proximo = 1;
 
 // ── saldos ────────────────────────────────────────────────
@@ -65,19 +70,47 @@ pub fn saldo_em(string endereco, string produto) -> number ={
     return parse_number(_posicoes[ch]) ?? 0.0;
 }
 
+// O que AINDA vai entrar das OPs abertas do produto: quantidade da OP
+// menos as boas já apontadas. As boas já apontadas estão no saldo; somar
+// a OP inteira contaria essas peças duas vezes (saldo + em produção) e
+// deixaria a reposição e o MRP sugerirem de menos.
 pub fn em_producao(string produto) -> number ={
     number total = 0.0;
     for (string id in keys(_ops_abertas)) {
-        string val = _ops_abertas[id];
-        int dp = find(val, ":");
-        if (dp > 0) {
-            string p = val[0..dp];
-            if (p == produto) {
-                total = total + (parse_number(val[dp + 1..]) ?? 0.0);
-            }
+        string[] partes = split(_ops_abertas[id], ":");
+        if (len(partes) >= 2 && partes[0] == produto) {
+            number qtd = parse_number(partes[1]) ?? 0.0;
+            number feito = 0.0;
+            if (len(partes) >= 3) { feito = parse_number(partes[2]) ?? 0.0; }
+            if (qtd > feito) { total = total + (qtd - feito); }
         }
     }
     return total;
+}
+
+// O que está "em compra" do produto: itens dos pedidos de compra
+// criados e ainda não recebidos nem cancelados (plugin de compras).
+pub fn em_compra(string produto) -> number ={
+    number total = 0.0;
+    for (string id in keys(_compras_abertas)) {
+        for (rg::ItemPedido it in rg::ler_itens(_compras_abertas[id])) {
+            if (it.produto == produto) { total = total + it.quantidade; }
+        }
+    }
+    return total;
+}
+
+// Soma `boa` ao produzido da OP aberta (producao.apontada).
+fn _apontar_op(map<string,string> d) ={
+    string id = form::campo(d, "op");
+    number boa = form::numero(d, "boa", 0.0);
+    if (len(id) == 0 || boa <= 0.0 || !has(_ops_abertas, id)) { return; }
+    string[] partes = split(_ops_abertas[id], ":");
+    if (len(partes) < 2) { return; }
+    number feito = 0.0;
+    if (len(partes) >= 3) { feito = parse_number(partes[2]) ?? 0.0; }
+    _ops_abertas[id] = partes[0] + ":" + partes[1] + ":" + to_string(feito + boa);
+    db::salvar(_dir, "ops_abertas", _ops_abertas);
 }
 
 fn _endereco_existe(string codigo) -> bool ={
@@ -229,12 +262,17 @@ fn _sugestoes() -> string ={
         if (r.tipo == "PRODUZIR" && (len(r.endereco) == 0 || r.endereco == rg::GERAL)) {
             em_prod = em_producao(p);
         }
-        number s_proj = s + em_prod;
+        number em_comp = 0.0;
+        if (r.tipo == "COMPRAR" && (len(r.endereco) == 0 || r.endereco == rg::GERAL)) {
+            em_comp = em_compra(p);
+        }
+        number s_proj = s + em_prod + em_comp;
         if (s_proj >= r.minimo) { continue; }
         number sugerir = rg::sugerido(r, s_proj);
         itens = concat(itens, ["{\"produto\":" + json_encode(p)
             + ",\"saldo\":" + to_string(s)
             + ",\"em_producao\":" + to_string(em_prod)
+            + ",\"em_compra\":" + to_string(em_comp)
             + ",\"saldo_projetado\":" + to_string(s_proj)
             + ",\"minimo\":" + to_string(r.minimo)
             + ",\"maximo\":" + to_string(r.maximo)
@@ -254,6 +292,7 @@ fn iniciar(string dir) -> bool ={
     _enderecos = db::carregar(dir, "enderecos");
     _regras = db::carregar(dir, "reposicao");
     _ops_abertas = db::carregar(dir, "ops_abertas");
+    _compras_abertas = db::carregar(dir, "compras_abertas");
     _proximo = db::maior_id(_movimentos) + 1;
     if (!has(_enderecos, rg::GERAL)) { _enderecos[rg::GERAL] = json_encode(rg::geral()); }
     if (file_exists(db::caminho(dir, "posicoes"))) {
@@ -354,12 +393,60 @@ fn _expedir(map<string,string> d) ={
     }
 }
 
+// ── compras (plugin) ──────────────────────────────────────
+
+fn _compra_aberta(map<string,string> d) ={
+    string id = form::campo(d, "pedido");
+    if (len(id) == 0) { return; }
+    _compras_abertas[id] = form::campo(d, "itens");
+    db::salvar(_dir, "compras_abertas", _compras_abertas);
+}
+
+fn _compra_encerrada(string id) ={
+    if (len(id) > 0 && has(_compras_abertas, id)) {
+        remove(_compras_abertas, id);
+        db::salvar(_dir, "compras_abertas", _compras_abertas);
+    }
+}
+
+// Entrada de cada item recebido no GERAL. Item de produto inexistente ou
+// com fração em unidade contável não entra: vira o evento
+// estoque.compra_item_rejeitado (o plugin não consegue validar — ele não
+// pode consultar o EMP no meio de um /req).
+fn _compra_recebida(map<string,string> d) ={
+    string id = form::campo(d, "pedido");
+    string origem = "COMPRA-" + id;
+    for (rg::ItemPedido it in rg::ler_itens(form::campo(d, "itens"))) {
+        string motivo = "";
+        if (!cadastros::existe(it.produto)) {
+            motivo = "produto não cadastrado";
+        } else {
+            motivo = cadastros::quantidade_invalida(it.produto, it.quantidade);
+        }
+        if (len(motivo) > 0) {
+            ev::publicar("estoque.compra_item_rejeitado", "estoque", "pedido=" + id
+                + "&produto=" + url_encode(it.produto) + "&quantidade=" + to_string(it.quantidade)
+                + "&motivo=" + url_encode(motivo));
+            continue;
+        }
+        number antes = _antes(it.produto);
+        _movimentar(it.produto, rg::GERAL, it.quantidade, "ENTRADA_COMPRA", origem);
+        _conferir_minimo(it.produto, antes);
+    }
+    _compra_encerrada(id);
+}
+
 fn _registrar_op(map<string,string> d) ={
     string id = form::campo(d, "op");
     string produto = upper(form::campo(d, "produto"));
     number qtd = form::numero(d, "quantidade", 0.0);
     if (len(id) > 0 && len(produto) > 0 && qtd > 0.0) {
-        _ops_abertas[id] = produto + ":" + to_string(qtd);
+        string feito = "0";
+        if (has(_ops_abertas, id)) {
+            string[] partes = split(_ops_abertas[id], ":");
+            if (len(partes) >= 3) { feito = partes[2]; }
+        }
+        _ops_abertas[id] = produto + ":" + to_string(qtd) + ":" + feito;
         db::salvar(_dir, "ops_abertas", _ops_abertas);
     }
 }
@@ -374,12 +461,15 @@ fn _encerrar_op(map<string,string> d) ={
 
 fn ao_evento(k::Evento e) -> bool ={
     map<string,string> d = form::ler(e.dados);
-    if (e.tipo == "producao.apontada") { _backflush(d); }
+    if (e.tipo == "producao.apontada") { _backflush(d); _apontar_op(d); }
     if (e.tipo == "producao.etapa_apontada") { _backflush_etapa(d); }
     if (e.tipo == "op.liberada") { _conferir(d); }
     if (e.tipo == "op.criada" || e.tipo == "op.liberada") { _registrar_op(d); }
     if (e.tipo == "op.concluida" || e.tipo == "op.cancelada") { _encerrar_op(d); }
     if (e.tipo == "pedido.expedido") { _expedir(d); }
+    if (e.tipo == "compras.pedido_criado") { _compra_aberta(d); }
+    if (e.tipo == "compras.pedido_recebido") { _compra_recebida(d); }
+    if (e.tipo == "compras.pedido_cancelado") { _compra_encerrada(form::campo(d, "pedido")); }
     return true;
 }
 
@@ -465,6 +555,8 @@ fn _entrada(k::Requisicao r) -> k::Resposta ={
     string end = upper(form::campo_ou(f, "endereco", rg::GERAL));
     if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
     if (q <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
+    string inteira = cadastros::quantidade_invalida(p, q);
+    if (len(inteira) > 0) { return k::erro(422, inteira); }
     if (!_endereco_existe(end)) { return k::erro(422, "endereço " + end + " não cadastrado"); }
     number antes = _antes(p);
     string lote = upper(trim(form::campo_ou(f, "lote", "")));
@@ -480,6 +572,8 @@ fn _ajuste(k::Requisicao r) -> k::Resposta ={
     if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
     if (!_endereco_existe(end)) { return k::erro(422, "endereço " + end + " não cadastrado"); }
     number alvo = form::numero(f, "saldo", saldo_em(end, p));
+    string inteira = cadastros::quantidade_invalida(p, alvo);
+    if (len(inteira) > 0) { return k::erro(422, "saldo contado: " + inteira); }
     number antes = _antes(p);
     _movimentar(p, end, alvo - saldo_em(end, p), "AJUSTE", "ajuste:" + r.usuario + ":" + form::campo(f, "motivo"));
     _conferir_minimo(p, antes);
@@ -494,6 +588,8 @@ fn _transferir(k::Requisicao r) -> k::Resposta ={
     number q = form::numero(f, "quantidade", 0.0);
     if (!cadastros::existe(p)) { return k::erro(422, "produto " + p + " não cadastrado"); }
     if (q <= 0.0) { return k::erro(422, "quantidade deve ser positiva"); }
+    string inteira = cadastros::quantidade_invalida(p, q);
+    if (len(inteira) > 0) { return k::erro(422, inteira); }
     if (!_endereco_existe(de)) { return k::erro(422, "endereço " + de + " não cadastrado"); }
     if (!_endereco_existe(para)) { return k::erro(422, "endereço " + para + " não cadastrado"); }
     if (de == para) { return k::erro(422, "origem e destino iguais"); }
@@ -570,7 +666,7 @@ pub fn descritor() -> k::Modulo ={
         contrato: 1,
         prefixo: "/api/estoque",
         depende: ["cadastros"],
-        assina: ["producao.apontada", "producao.etapa_apontada", "op.*", "pedido.expedido"],
+        assina: ["producao.apontada", "producao.etapa_apontada", "op.*", "pedido.expedido", "compras.*"],
         perfis_escrita: ["admin", "almoxarife"],
         iniciar: iniciar,
         rotear: rotear,

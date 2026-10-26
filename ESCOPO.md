@@ -47,6 +47,7 @@ Requisitos que orientaram a arquitetura:
 | **Relatórios e BI** | interno | Painel analítico executivo, nível de serviço de pedidos (OTIF), ranking de perdas/refugos, desempenho e custo de postos e exportações analíticas em CSV | `relatorios.alerta_gerencial` | `pedido.expedido`, `producao.apontada`, `custos.op_fechada` |
 | **Coleta Automática & IoT** | interno | Contadores de pulsos de CLP, telemetria de sensores (temperatura/pressão), intertravamento de segurança com parada automática e apontamento automático de chão de fábrica | `coleta.pulso_registrado`, `coleta.alerta_critico`, `coleta.estado_alterado`, `maquina.parada` | `maquina.parada`, `maquina.liberada` |
 | **Arquivamento e Histórico** | interno | Expurgar/congelar OPs concluídas antigas em arquivo histórico permanente (`tblFinOrder`, `tblFinStep`) com retenção temporal, reversibilidade total para auditoria e garantia de alta performance operacional | `arquivamento.op_arquivada`, `arquivamento.lote_concluido`, `arquivamento.op_desarquivada` | `op.concluida` |
+| **Landing & Prompt** | servidor web (:8088) | Showcase interativo das 10 fases e console cognitivo com interpretação de linguagem natural para agentes LLM e operadores | — | — |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
 | **Compras** | **plugin externo** (processo próprio) | Fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas | — | `estoque.falta`, `estoque.abaixo_minimo` |
 | **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
@@ -188,7 +189,16 @@ Catálogo de eventos:
 | `estoque.negativo` | estoque | `produto`, `saldo` (do endereço), `endereco`, `saldo_total` |
 | `estoque.abaixo_minimo` | estoque | `produto`, `saldo`, `minimo`, `maximo`, `sugerido`, `tipo`, `endereco` |
 | `maquina.parada` / `maquina.liberada` | manutenção | `parada`, `posto`, `categoria`, `motivo`, `inicio`, `fim`, `minutos` |
+| `manutencao.preventiva_vencida` / `_executada` | manutenção | `plano`, `posto`, `tipo`, `ciclos`, `horas` |
 | `indicadores.oee_baixo` | indicadores | `oee`, `limite`, `horas`, `disponibilidade`, `desempenho`, `qualidade` |
+| `mrp.ordens_geradas` | mrp | `quantidade`, `ops` |
+| `programacao.sobrecarga` | programacao | `posto`, `ocupacao`, `limite` |
+| `lote.criado` / `lote.bloqueado` / `lote.liberado` / `lote.consumido` | lotes | `lote`, `produto`, `quantidade`, `op`, `status` |
+| `custos.op_fechada` | custos | `op`, `custo_total`, `desvio_pct`, `status` |
+| `turnos.alocacao_alterada` / `turnos.atual_alterado` | turnos | `posto`, `operador`, `turno` |
+| `relatorios.alerta_gerencial` | relatorios | `tipo`, `metrica`, `valor`, `meta` |
+| `coleta.pulso_registrado` / `coleta.alerta_critico` / `coleta.estado_alterado` | coleta | `dispositivo`, `posto`, `valor`, `limite`, `estado` |
+| `arquivamento.op_arquivada` / `arquivamento.lote_concluido` / `arquivamento.op_desarquivada` | arquivamento | `op`, `produto`, `quantidade`, `custo_total_real` |
 
 ## 4. Contrato de módulo (ABI) — `src/nucleo/contrato.cryo`
 
@@ -251,7 +261,14 @@ Engineering-Modular-Process-EMP-/
 │       ├── indicadores/indicadores.cryo  eventos → histórico do posto, rotas de OEE
 │       ├── indicadores/oee.cryo     cálculo puro do OEE
 │       ├── mrp/mrp.cryo             planejamento de necessidades (BOM, pedidos, ordens)
-│       └── programacao/programacao.cryo  sequenciamento e capacidade finita (APS, EDD, gargalos)
+│       ├── programacao/programacao.cryo  sequenciamento e capacidade finita (APS, EDD, gargalos)
+│       ├── lotes/lotes.cryo         rastreabilidade, genealogia e recall
+│       ├── custos/custos.cryo       custo padrão, taxas horárias, desvios e fechamento
+│       ├── turnos/turnos.cryo       turnos, alocação de operadores e eficiência
+│       ├── relatorios/relatorios.cryo BI analítico, OTIF, ranking de perdas e CSV
+│       ├── coleta/coleta.cryo       sensores IoT, pulsos de CLP e intertravamento
+│       └── arquivamento/arquivamento.cryo fechamento permanente de OPs (tblFin*)
+│   └── landing.cryo           servidor web da landing page e prompt do agente (:8088)
 ├── plugins/                   manifestos lidos em tempo de execução
 │   ├── qualidade.plugin
 │   └── compras.plugin
@@ -266,7 +283,15 @@ Engineering-Modular-Process-EMP-/
 │   ├── test_estoque.cryo      endereços, migração, backflush por etapa, reposição, expedição
 │   ├── test_oee.cryo          janela, sobreposição, limites do OEE
 │   ├── test_mrp.cryo          plano multinível, cobertura, ordens automáticas
-│   └── test_programacao.cryo  capacidade, gargalo, fila EDD, projeção de cronograma
+│   ├── test_programacao.cryo  capacidade, gargalo, fila EDD, projeção de cronograma
+│   ├── test_lotes.cryo        genealogia, bloqueio, consumo e recall
+│   ├── test_custos.cryo       custo padrão, real, taxa horária e desvios
+│   ├── test_turnos.cryo       escala de turnos, alocação e produtividade
+│   ├── test_relatorios.cryo   kpis, OTIF, postos e exportações analíticas
+│   ├── test_coleta.cryo       pulsos de CLP, telemetria analógica e parada crítica
+│   ├── test_arquivamento.cryo arquivamento histórico, retenção e desarquivamento
+│   ├── test_landing_http.py   testes HTTP da landing page e console de prompt
+│   └── test_realtime_llm.py   testes cognitivos em tempo real do agente com ERP
 ├── tools/                     cargas de demonstração (via HTTP, modo dev), nesta ordem:
 │   ├── demo.cryo              linha base: produtos, roteiros, OPs, paradas
 │   ├── demo_estoque.cryo      endereços, transferências, reposição
@@ -275,19 +300,22 @@ Engineering-Modular-Process-EMP-/
 ├── docs/
 │   ├── ANALISE_FACTORYVIEWS.md  análise do MES4 e fase 1
 │   ├── FASE2.md               contrato da fase 2
+│   ├── FASE10_ARQUIVAMENTO.md arquitetura de histórico e fechamento tblFin*
+│   ├── LANDING_PAGE_E_PROMPT.md documentação do servidor web e prompt cognitivo
 │   ├── fase2/                 decisões, verificação e limites de cada frente
 │   ├── DESIGN_SYSTEM.md       sistema de design Forja
 │   └── screenshots/           capturas do painel e do terminal
-└── build/                     emp.exe, compras.exe, qualidade.exe (gerados)
+└── build/                     emp.exe, landing.exe, compras.exe, qualidade.exe, landing.html
 ```
 
 Instalação no servidor:
 
 ```
 C:\EMP\
-├── emp.exe
-├── compras.exe
-├── qualidade.exe
+├── emp.exe                    núcleo do ERP (porta 8080)
+├── landing.exe                landing page e terminal de prompt (porta 8088)
+├── compras.exe                plugin de compras (porta 8092)
+├── qualidade.exe              plugin de qualidade (porta 8091)
 ├── plugins\
 │   ├── compras.plugin
 │   └── qualidade.plugin
@@ -297,9 +325,15 @@ C:\EMP\
     ├── producao\ordens.json  etapas.json
     ├── pedidos\clientes.json  pedidos.json  ops.json
     ├── estoque\saldos.json  posicoes.json  enderecos.json  movimentos.json  reposicao.json  ops_abertas.json
-    ├── manutencao\paradas.json
+    ├── manutencao\paradas.json  preventivas.json
     ├── indicadores\intervalos.json  apontamentos.json  estado.json
     ├── programacao\prioridades.json
+    ├── lotes\lotes.json  genealogia.json  expedicoes.json
+    ├── custos\padrao.json  taxas.json  fechamentos.json
+    ├── turnos\turnos.json  operadores.json  alocacoes.json
+    ├── relatorios\historico.json
+    ├── coleta\dispositivos.json  leituras.json
+    ├── arquivamento\ordens_arquivadas.json  etapas_arquivadas.json  config.json
     ├── compras\fornecedores.json  pedidos.json
     ├── qualidade\ncs.json
     └── auditoria\<ms>-<seq>.log

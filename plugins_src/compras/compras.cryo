@@ -10,8 +10,21 @@
 //      sugestões de compra;
 //    - Emite pedidos de compra;
 //    - Recebimento de compra (POST /pedidos/receber) atualiza o
-//      pedido para RECEBIDO e efetua a entrada dos produtos no
-//      estoque do EMP via HTTP POST /api/estoque/entrada.
+//      pedido para RECEBIDO e publica compras.pedido_recebido; o
+//      ESTOQUE do EMP assina esse evento e dá a entrada.
+//
+//  Eventos publicados (linhas "@evento" na resposta do /req, ver
+//  src/nucleo/plugins.cryo), com dados pedido, fornecedor e
+//  itens="PRODUTO:qtd;...":
+//    compras.pedido_criado (+ entrega_prevista), compras.pedido_recebido,
+//    compras.pedido_cancelado
+//  O estoque usa os três para saber o que está "em compra" e descontar
+//  das sugestões de reposição COMPRAR.
+//
+//  Por que eventos e não uma chamada HTTP ao EMP: o servidor do EMP
+//  atende uma requisição por vez e está esperando ESTE /req; chamar
+//  /api/estoque/entrada daqui só terminava no tempo-limite, o pedido
+//  ficava RECEBIDO e a entrada no estoque se perdia.
 //
 //  Protocolo: ver src/nucleo/plugins.cryo
 //    GET  /saude    POST /req    POST /evento
@@ -29,6 +42,16 @@ int _prox_sugestao = 1;
 
 fn _resp(int status, string corpo) -> string ={
     return to_string(status) + "|application/json\n" + corpo;
+}
+
+// Resposta com um evento para o núcleo publicar (tipo começa com "compras.").
+fn _resp_ev(int status, string tipo, string dados, string corpo) -> string ={
+    return to_string(status) + "|application/json\n@evento " + tipo + "|" + dados + "\n" + corpo;
+}
+
+fn _dados_pedido(string id, map<string,string> ped) -> string ={
+    return "pedido=" + id + "&fornecedor=" + url_encode(ped["fornecedor"])
+        + "&itens=" + url_encode(ped["itens"]);
 }
 
 // ── rotas do plugin (/req) ────────────────────────────────
@@ -76,36 +99,24 @@ fn _criar_pedido(map<string,string> f, string usuario) -> string ={
 
     _pedidos[to_string(id)] = json_ped;
     db::salvar(_dir, "pedidos", _pedidos);
-    return _resp(201, json_ped);
+    return _resp_ev(201, "compras.pedido_criado", "pedido=" + to_string(id)
+        + "&fornecedor=" + url_encode(forn) + "&itens=" + url_encode(itens)
+        + "&entrega_prevista=" + to_string(entrega_prevista), json_ped);
 }
 
-fn _receber_pedido(int id, string emp_url) -> string ={
+fn _receber_pedido(int id) -> string ={
     string sid = to_string(id);
     if (!has(_pedidos, sid)) { return _resp(404, "{\"erro\":\"pedido de compra não encontrado\"}"); }
     map<string,string> ped = json_decode(_pedidos[sid]) as map<string,string>;
     if (ped["status"] == "RECEBIDO") { return _resp(409, "{\"erro\":\"pedido já foi recebido\"}"); }
     if (ped["status"] == "CANCELADO") { return _resp(409, "{\"erro\":\"pedido está cancelado\"}"); }
 
-    string itens = ped["itens"];
-    // Registra entrada no estoque do EMP via HTTP POST /api/estoque/entrada
-    for (string pedaco in split(itens, ";")) {
-        string t = trim(pedaco);
-        if (len(t) == 0) { continue; }
-        int dp = find(t, ":");
-        if (dp > 0) {
-            string prod = upper(trim(t[0..dp]));
-            string qtd = trim(t[dp + 1..]);
-            string corpo_entrada = "produto=" + url_encode(prod) + "&quantidade=" + url_encode(qtd)
-                + "&origem=" + url_encode("COMPRA-" + sid);
-            http_post(emp_url + "/api/estoque/entrada", corpo_entrada);
-        }
-    }
-
+    // A entrada no estoque é do módulo de estoque do EMP, pelo evento.
     ped["status"] = "RECEBIDO";
     ped["recebido_em"] = to_string(now_ms());
     _pedidos[sid] = json_encode(ped);
     db::salvar(_dir, "pedidos", _pedidos);
-    return _resp(200, _pedidos[sid]);
+    return _resp_ev(200, "compras.pedido_recebido", _dados_pedido(sid, ped), _pedidos[sid]);
 }
 
 fn _cancelar_pedido(int id) -> string ={
@@ -116,10 +127,10 @@ fn _cancelar_pedido(int id) -> string ={
     ped["status"] = "CANCELADO";
     _pedidos[sid] = json_encode(ped);
     db::salvar(_dir, "pedidos", _pedidos);
-    return _resp(200, _pedidos[sid]);
+    return _resp_ev(200, "compras.pedido_cancelado", _dados_pedido(sid, ped), _pedidos[sid]);
 }
 
-fn _req(map<string,string> r, string emp_url) -> string ={
+fn _req(map<string,string> r) -> string ={
     string metodo = form::campo(r, "metodo");
     string rota = form::campo(r, "rota");
     string query = form::campo(r, "query");
@@ -144,7 +155,7 @@ fn _req(map<string,string> r, string emp_url) -> string ={
     if (rota == "/pedidos/receber" && metodo == "POST") {
         map<string,string> q = form::ler(query);
         int id = form::inteiro(q, "id", 0);
-        return _receber_pedido(id, emp_url);
+        return _receber_pedido(id);
     }
     if (rota == "/pedidos/cancelar" && metodo == "POST") {
         map<string,string> q = form::ler(query);
@@ -189,8 +200,6 @@ fn _evento(map<string,string> e) -> string ={
 
 string porta = env("COMPRAS_PORTA");
 if (len(porta) == 0) { porta = "8092"; }
-string emp_url = env("EMP_URL");
-if (len(emp_url) == 0) { emp_url = "http://127.0.0.1:8080"; }
 
 if (!is_dir("dados")) { make_dir("dados"); }
 if (!is_dir(_dir)) { make_dir(_dir); }
@@ -203,7 +212,7 @@ _prox_sugestao = db::maior_id(_sugestoes) + 1;
 if (!http_listen(parse_int(porta) ?? 8092)) {
     print("compras: porta " + porta + " indisponível");
 } else {
-    print("plugin compras ouvindo em 127.0.0.1:" + porta + " (ERP em " + emp_url + ")");
+    print("plugin compras ouvindo em 127.0.0.1:" + porta);
     while (true) {
         map<string,string> req = http_accept();
         string m = req["method"];
@@ -211,7 +220,7 @@ if (!http_listen(parse_int(porta) ?? 8092)) {
         if (req["path"] == "/saude") {
             http_respond(200, "text/plain", "ok");
         } else if (req["path"] == "/req" && m == "POST") {
-            http_respond(200, "text/plain", _req(form::ler(req["body"]), emp_url));
+            http_respond(200, "text/plain", _req(form::ler(req["body"])));
         } else if (req["path"] == "/evento" && m == "POST") {
             http_respond(200, "text/plain", _evento(form::ler(req["body"])));
         } else {

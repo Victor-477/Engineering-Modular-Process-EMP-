@@ -5,6 +5,7 @@
 
 import "../src/nucleo/eventos.cryo"  as ev;
 import "../src/nucleo/contrato.cryo" as k;
+import "../src/nucleo/plugins.cryo"  as plugins;
 
 test fn assinatura_por_padrao() ={
     assert(ev::casa("op.liberada", "op.liberada"), "exato casa");
@@ -22,4 +23,34 @@ test fn fila_enfileira_e_retira() ={
     assert(len(lote) == 2, "lote com dois");
     assert(ev::pendentes() == 0, "fila vazia");
     assert(lote[1].id > lote[0].id, "ids crescentes");
+}
+
+// Resposta de plugin com linhas "@evento" (protocolo em src/nucleo/plugins.cryo).
+test fn resposta_de_plugin_com_eventos() ={
+    string bruto = "201|application/json
+"
+        + "@evento compras.pedido_criado|pedido=3&itens=ACO%3A10
+"
+        + "@evento maquina.parada|posto=P1
+"
+        + "@evento compras|sem-ponto
+"
+        + "{\"id\":3}";
+    plugins::RespostaPlugin rp = plugins::ler_resposta("compras", bruto);
+    assert(rp.resposta.status == 201 && rp.resposta.tipo == "application/json", "cabeçalho");
+    assert(rp.resposta.corpo == "{\"id\":3}", "o corpo não leva as linhas @evento");
+    assert(len(rp.eventos) == 1, "só o evento do próprio prefixo");
+    assert(rp.eventos[0] == "compras.pedido_criado|pedido=3&itens=ACO%3A10", "tipo|dados intactos");
+    assert(rp.recusados == 2, "maquina.parada e 'compras' sem ponto recusados");
+}
+
+test fn resposta_de_plugin_sem_eventos_e_malformada() ={
+    plugins::RespostaPlugin a = plugins::ler_resposta("qualidade", "200|text/plain
+ok");
+    assert(a.resposta.status == 200 && a.resposta.corpo == "ok" && len(a.eventos) == 0, "plugin antigo continua igual");
+    plugins::RespostaPlugin b = plugins::ler_resposta("qualidade", "sem cabeçalho");
+    assert(b.resposta.status == 0, "sem quebra de linha -> malformada");
+    plugins::RespostaPlugin c = plugins::ler_resposta("qualidade", "abc
+corpo");
+    assert(c.resposta.status == 0, "cabeçalho sem | -> malformada");
 }

@@ -101,7 +101,7 @@ fn _preparar(string caso) -> string ={
     if (!is_dir("build/test_estoque")) { make_dir("build/test_estoque"); }
     string dir = "build/test_estoque/" + caso;
     if (!is_dir(dir)) { make_dir(dir); }
-    for (string c in ["saldos", "posicoes", "movimentos", "enderecos", "reposicao", "ops_abertas", "produtos", "estrutura", "postos"]) {
+    for (string c in ["saldos", "posicoes", "movimentos", "enderecos", "reposicao", "ops_abertas", "compras_abertas", "produtos", "estrutura", "postos"]) {
         if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
     }
     map<string,string> prods = {};
@@ -211,7 +211,7 @@ test fn reposicao_sugere_e_avisa_ao_cruzar() ={
     // 15 SUP: 30 PARAF -> 70 < 80.
     _entregar("producao.apontada", "op=1&produto=SUP&boa=15&refugo=0&posto=MONT-01&operador=ana");
     assert(_publicados("estoque.abaixo_minimo") == 1, "um aviso ao cruzar");
-    assert(_get("/sugestoes", "") == "[{\"produto\":\"PARAF\",\"saldo\":70,\"em_producao\":0,\"saldo_projetado\":70,\"minimo\":80,\"maximo\":300,"
+    assert(_get("/sugestoes", "") == "[{\"produto\":\"PARAF\",\"saldo\":70,\"em_producao\":0,\"em_compra\":0,\"saldo_projetado\":70,\"minimo\":80,\"maximo\":300,"
         + "\"quantidade_sugerida\":230,\"tipo\":\"COMPRAR\",\"endereco\":\"\"}]", "sugestão até o máximo");
     // Já abaixo: não repete o aviso.
     _entregar("producao.apontada", "op=2&produto=SUP&boa=1&refugo=0&posto=MONT-01&operador=ana");
@@ -313,4 +313,69 @@ test fn backflush_por_etapa() ={
     assert(estoque::saldo("SUP") == 5.0, "5 SUP entraram no estoque");
     assert(estoque::saldo("BASE") == 5.0, "BASE não duplicada no término");
     assert(estoque::saldo("PARAF") == 10.0, "PARAF não duplicado no término");
+}
+
+// ── o que ficou de fora da fase 2 ─────────────────────────
+
+test fn em_producao_desconta_o_ja_produzido() ={
+    // Boas já apontadas estão no saldo: contar a OP inteira como "em
+    // produção" contaria essas peças duas vezes.
+    string dir = _preparar("em_producao_produzido");
+    _iniciar(estoque::descritor().iniciar, dir);
+    _entregar("op.criada", "op=201&produto=SUP&quantidade=100");
+    _entregar("producao.apontada", "op=201&produto=SUP&boa=40&refugo=0&posto=MONT-01");
+    assert(estoque::em_producao("SUP") == 60.0, "100 da OP − 40 já produzidas");
+    assert(estoque::saldo("SUP") == 40.0, "as 40 estão no saldo");
+    // op.liberada depois de apontamentos não zera o produzido.
+    _entregar("op.liberada", "op=201&produto=SUP&quantidade=100");
+    assert(estoque::em_producao("SUP") == 60.0, "liberada mantém o produzido");
+    // Produzir além da OP não deixa "em produção" negativo.
+    _entregar("producao.apontada", "op=201&produto=SUP&boa=70&refugo=0&posto=MONT-01");
+    assert(estoque::em_producao("SUP") == 0.0, "nunca negativo");
+}
+
+test fn compras_em_aberto_e_recebimento_por_evento() ={
+    string dir = _preparar("compras");
+    _iniciar(estoque::descritor().iniciar, dir);
+    assert(_post("/reposicao", "produto=PARAF&minimo=100&maximo=400&tipo=COMPRAR") == 201, "regra PARAF");
+    assert(contains(_get("/sugestoes", ""), "\"quantidade_sugerida\":400"), "sugere 400 sem compra");
+
+    // Pedido de compra criado no plugin: 300 a caminho.
+    _entregar("compras.pedido_criado", "pedido=7&fornecedor=CISER&itens=" + url_encode("PARAF:300"));
+    assert(estoque::em_compra("PARAF") == 300.0, "300 em compra");
+    string sug = _get("/sugestoes", "");
+    assert(sug == "[]", "a compra cobre o mínimo: sem sugestão");
+
+    // Recebido: entra no GERAL e sai do "em compra".
+    _entregar("compras.pedido_recebido", "pedido=7&fornecedor=CISER&itens=" + url_encode("PARAF:300;NADA:5;BASE:2,5"));
+    assert(estoque::saldo("PARAF") == 300.0, "entrada de 300");
+    assert(estoque::em_compra("PARAF") == 0.0, "não está mais em compra");
+    assert(contains(_get("/movimentos", ""), "\"tipo\":\"ENTRADA_COMPRA\"")
+        && contains(_get("/movimentos", ""), "COMPRA-7"), "movimento ENTRADA_COMPRA com origem");
+    // Produto inexistente e fração em UN não entram e são avisados.
+    assert(estoque::saldo("BASE") == 0.0, "2,5 UN de BASE recusado");
+    assert(_publicados("estoque.compra_item_rejeitado") == 2, "dois itens rejeitados");
+
+    // Pedido cancelado sai do "em compra" sem entrada.
+    _entregar("compras.pedido_criado", "pedido=8&fornecedor=CISER&itens=" + url_encode("PARAF:50"));
+    assert(estoque::em_compra("PARAF") == 50.0, "50 em compra");
+    _entregar("compras.pedido_cancelado", "pedido=8&fornecedor=CISER&itens=" + url_encode("PARAF:50"));
+    assert(estoque::em_compra("PARAF") == 0.0, "cancelado sai");
+    assert(estoque::saldo("PARAF") == 300.0, "sem entrada no cancelamento");
+
+    // Compras em aberto sobrevivem ao reinício.
+    _entregar("compras.pedido_criado", "pedido=9&fornecedor=CISER&itens=" + url_encode("PARAF:20"));
+    _iniciar(estoque::descritor().iniciar, dir);
+    assert(estoque::em_compra("PARAF") == 20.0, "em compra recarregado");
+}
+
+test fn fracao_em_unidade_contavel_recusada() ={
+    string dir = _preparar("fracao_un");
+    _iniciar(estoque::descritor().iniciar, dir);
+    assert(_post("/entrada", "produto=PARAF&quantidade=2.5") == 422, "entrada 2,5 UN");
+    assert(_post("/entrada", "produto=PARAF&quantidade=10") == 201, "entrada 10 UN");
+    assert(_post("/ajuste", "produto=PARAF&saldo=7.5&motivo=contagem") == 422, "ajuste para 7,5 UN");
+    assert(contains(_req("POST", "/transferir", "", "produto=PARAF&de=GERAL&para=GERAL2&quantidade=1.5").corpo, "inteira"),
+        "transferência 1,5 UN recusada pela fração");
+    assert(estoque::saldo("PARAF") == 10.0, "nada mudou com as recusas");
 }

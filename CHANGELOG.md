@@ -2,6 +2,23 @@
 
 ## Não lançado
 
+### Novo — Testes de Interação Cognitiva em Tempo Real do Agente LLM & Documentação Completa
+- **Suíte de Testes Fim a Fim em Tempo Real** (`tests/test_realtime_llm.py`):
+  - **Validação Concorrente Multi-Serviço**: 12 etapas automáticas cruzando simultaneamente o ERP Core (`emp.exe`, porta 8080) e o servidor da Landing Page (`landing.exe`, porta 8088).
+  - **Healthcheck Duplo**: Verificação de disponibilidade e prontidão dos dois servidores nativos compilados em Cryo (latências de 3 ms a 11 ms).
+  - **Despacho Cognitivo via Prompt**: Envio e interpretação semântica de comandos em linguagem natural pelo console interativo (`POST /api/prompt`), validando diagnósticos operacionais, KPIs analíticos e governança.
+  - **Telemetria Crítica e Intertravamento de Segurança**: Injeção de leitura analógica extrema (98°C) em sensor IoT gerando alarme imediato `coleta.alerta_critico` e parada automática do posto (`maquina.parada`).
+  - **Bloqueio Concorrente de Chão de Fábrica**: Validação de segurança garantindo que apontamentos em postos parados sejam categoricamente rejeitados com HTTP 409 (Conflito).
+  - **Apontamento Automático via CLP**: Criação de Ordem de Produção dedicada e envio de pulsos de contagem de peças boas e refugo, avançando etapas automaticamente no chão.
+  - **Apropriação Contábil e Custos**: Fechamento de custos reais vs. padrão com apuração de materiais, mão de obra, taxas horárias e desvio percentual.
+  - **Arquivamento Histórico Definitivo**: Migração da OP concluída para as tabelas imutáveis `tblFinOrder` e `tblFinStep`, validando a imutabilidade e a presença íntegra na consulta de arquivo.
+  - **Resultado**: 12/12 etapas aprovadas com 0 falhas e latências ultra-baixas (3 ms a 99 ms).
+- **Documentação Técnica Consolidada**:
+  - Criação de [`docs/LANDING_PAGE_E_PROMPT.md`](docs/LANDING_PAGE_E_PROMPT.md): Arquitetura do binário `landing.exe`, design tokens Forja, rotas HTTP, dicionário semântico de prompts e suite de testes.
+  - Criação de [`docs/FASE10_ARQUIVAMENTO.md`](docs/FASE10_ARQUIVAMENTO.md): Arquitetura de separação ativa/histórica, garantia de IDs monotônicos anti-colisão, reversibilidade total (desarquivamento) e persistência.
+  - Atualização de [`README.md`](README.md): Tabela de 10 módulos internos + 2 plugins + landing/prompt, guia de compilação multi-binário, catálogo completo de rotas da API e instruções de execução.
+  - Atualização de [`ESCOPO.md`](ESCOPO.md): Árvore completa do repositório, diretórios de persistência JSON por módulo, catálogo unificado de eventos do barramento pub/sub.
+
 ### Novo — Landing Page e Terminal Interativo de Prompt do Agente em Cryo
 - **Servidor Web e Landing Page Nativa** (`src/landing.cryo`, binário `build/landing.exe` de 422 KB):
   - **Showcase Completo do EMP**: Apresentação visual ultra-moderna (Design System Forja) de todas as 10 fases modulares do ERP, arquitetura de eventos desacoplada, compilador nativo Pyro e métricas industriais de alta performance.
