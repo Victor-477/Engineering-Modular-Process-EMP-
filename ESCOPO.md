@@ -43,6 +43,7 @@ Requisitos que orientaram a arquitetura:
 | **Programação (APS)** | interno | Carga × capacidade por posto, ocupação percentual, detecção de gargalo, sequenciamento inteligente por prioridade/EDD, cronograma contínuo e alerta de atraso | `programacao.sobrecarga` | `op.*`, `producao.etapa_*` |
 | **Lotes & Rastreabilidade** | interno | Controle de lotes (status/validade), árvore genealógica industrial pai-filho no consumo de etapas, geração de lote em OP, expedição a clientes e rastreamento bidirecional (backward e forward recall) | `lote.criado`, `lote.bloqueado`, `lote.liberado`, `lote.consumido` | `op.concluida`, `producao.etapa_apontada`, `pedido.expedido`, `estoque.movimentado` |
 | **Custos Industriais** | interno | Custo padrão da engenharia (MD + MOD/GGF) vs. custo real da OP, apropriação de materiais e horas, taxa de refugo, análise de desvio e fechamento contábil | `custos.op_fechada` | `op.concluida`, `producao.apontada` |
+| **Turnos & Operadores** | interno | Gestão de escalas de turnos, alocação de operadores aos postos, turno ativo, acumulação de métricas por apontamento, eficiência e qualidade por operador | `turnos.alocacao_alterada`, `turnos.atual_alterado` | `producao.etapa_apontada`, `producao.apontada` |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
 | **Compras** | **plugin externo** (processo próprio) | Fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas | — | `estoque.falta`, `estoque.abaixo_minimo` |
 | **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
@@ -81,13 +82,8 @@ baixadas do estoque.
 
 | Módulo | Interno/Plugin | Depende de | Observação |
 |---|---|---|---|
-| Programação da produção (sequenciamento por posto) | interno | produção, cadastros | Capacidade em horas por posto já existe no cadastro |
-| Manutenção preventiva (planos por horas/ciclos) | interno | manutencao | A corretiva entrou na v0.2; a preventiva precisa de calendário (L-12) |
 | Coleta automática de chão de fábrica | plugin | indicadores | O OEE entrou na fase 2 com apontamento manual; ler contadores do CLP depende de L-19 |
-| Rastreabilidade de lotes | interno | estoque, produção | Lote/série no apontamento e no consumo |
-| Custos de produção | interno | estoque, produção | Exige tipo decimal (L-11) |
-| Relatórios / BI | plugin | todos (leitura) | Exportação CSV; PDF/XLSX dependem de L-20 |
-| Turnos e operadores | interno | — | Calendário (L-12) |
+| Relatórios / BI | plugin / interno | todos (leitura) | Exportação CSV e consolidação gerencial para tomada de decisão |
 
 ### 2.3 Fora do escopo
 

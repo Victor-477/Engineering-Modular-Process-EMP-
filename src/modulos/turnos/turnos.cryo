@@ -1,0 +1,458 @@
+// ============================================================
+//  turnos.cryo — Módulo de Gestão de Turnos e Operadores
+//
+//  Controla:
+//    - Cadastro de turnos industriais (1º, 2º e 3º turno / horas produtivas)
+//    - Cadastro de operadores (matrícula, nome, turno de trabalho, posto padrão)
+//    - Alocação ativa de operadores por posto de trabalho
+//    - Rastreamento de produtividade e eficiência individual:
+//      - Peças boas e refugo acumulados
+//      - Eficiência operacional: tempo padrão / tempo real apontado
+//      - Taxa de qualidade (% peças boas)
+//    - Comparativo de desempenho entre turnos
+//
+//  Rotas (prefixo /api/turnos):
+//    GET  /turnos
+//    POST /turnos                     codigo=&descricao=&inicio=&fim=&horas_produtivas=
+//    GET  /operadores[?turno=X]
+//    POST /operadores                 matricula=&nome=&turno=&posto_padrao=[&ativo=true]
+//    GET  /alocacoes
+//    POST /alocacoes                  posto=&matricula=
+//    GET  /painel                     painel consolidado (turno ativo, turnos, operadores, alocações)
+//    GET  /operador?matricula=X       análise detalhada de um operador
+//    POST /definir_atual              turno=
+//
+//  Eventos publicados:
+//    turnos.turno_definido            turno=
+//    turnos.operador_alocado          posto=&matricula=&operador=
+//
+//  Eventos assinados:
+//    producao.etapa_apontada, producao.apontada
+// ============================================================
+
+import "../../nucleo/contrato.cryo"         as k;
+import "../../nucleo/persist.cryo"          as db;
+import "../../nucleo/eventos.cryo"          as ev;
+import "../../nucleo/form.cryo"             as form;
+import "../cadastros/cadastros.cryo"        as cadastros;
+
+pub struct Turno {
+    string codigo;
+    string descricao;
+    string inicio;
+    string fim;
+    number horas_produtivas;
+}
+
+pub struct Operador {
+    string matricula;
+    string nome;
+    string turno;
+    string posto_padrao;
+    bool ativo;
+}
+
+pub struct AlocacaoPosto {
+    string posto;
+    string matricula;
+    string operador_nome;
+    string turno;
+    int alocado_em;
+}
+
+pub struct MetricaOperador {
+    string matricula;
+    string nome;
+    string turno;
+    number pecas_boas;
+    number pecas_refugo;
+    number total_pecas;
+    number horas_apontadas;
+    number horas_padrao;
+    number eficiencia_pct;
+    number qualidade_pct;
+}
+
+pub struct MetricaTurno {
+    string turno;
+    string descricao;
+    number total_boas;
+    number total_refugo;
+    number total_pecas;
+    number taxa_qualidade_pct;
+    int operadores_cadastrados;
+}
+
+pub struct PainelTurnos {
+    string turno_atual;
+    Turno[] turnos;
+    AlocacaoPosto[] alocacoes;
+    MetricaTurno[] metricas_turnos;
+    MetricaOperador[] metricas_operadores;
+}
+
+string _dir = "";
+string _turno_ativo = "TURNO-1";
+map<string,string> _turnos = {};       // codigo -> json(Turno)
+map<string,string> _operadores = {};   // matricula -> json(Operador)
+map<string,string> _alocacoes = {};    // posto -> json(AlocacaoPosto)
+map<string,string> _metricas = {};     // matricula -> json(MetricaOperador)
+
+fn _r1(number v) -> number ={
+    return round(v * 10.0) / 10.0;
+}
+
+fn _r2(number v) -> number ={
+    return round(v * 100.0) / 100.0;
+}
+
+fn _ler_turno(string c) -> Turno ={
+    return json_decode(_turnos[c]) as Turno;
+}
+
+fn _ler_operador(string m) -> Operador ={
+    return json_decode(_operadores[m]) as Operador;
+}
+
+fn _ler_metrica(string m) -> MetricaOperador ={
+    return json_decode(_metricas[m]) as MetricaOperador;
+}
+
+// ── inicialização e dados padrão ──────────────────────────
+
+fn _inicializar_padroes() ={
+    if (len(keys(_turnos)) == 0) {
+        Turno t1 = Turno { codigo: "TURNO-1", descricao: "1º Turno (06:00 - 14:00)", inicio: "06:00", fim: "14:00", horas_produtivas: 7.5 };
+        Turno t2 = Turno { codigo: "TURNO-2", descricao: "2º Turno (14:00 - 22:00)", inicio: "14:00", fim: "22:00", horas_produtivas: 7.5 };
+        Turno t3 = Turno { codigo: "TURNO-3", descricao: "3º Turno (22:00 - 06:00)", inicio: "22:00", fim: "06:00", horas_produtivas: 7.0 };
+        _turnos[t1.codigo] = json_encode(t1);
+        _turnos[t2.codigo] = json_encode(t2);
+        _turnos[t3.codigo] = json_encode(t3);
+        db::salvar(_dir, "turnos", _turnos);
+    }
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _turnos = db::carregar(dir, "turnos");
+    _operadores = db::carregar(dir, "operadores");
+    _alocacoes = db::carregar(dir, "alocacoes");
+    _metricas = db::carregar(dir, "metricas");
+    _inicializar_padroes();
+
+    map<string,string> cfg = db::carregar(dir, "config");
+    if (has(cfg, "turno_ativo")) {
+        _turno_ativo = cfg["turno_ativo"];
+    }
+    return true;
+}
+
+// ── processamento de eventos do chão de fábrica ───────────
+
+fn _obter_ou_criar_metrica(string op_ref) -> MetricaOperador ={
+    string id = upper(trim(op_ref));
+    if (has(_metricas, id)) {
+        return _ler_metrica(id);
+    }
+    string nome = id;
+    string turno = _turno_ativo;
+    if (has(_operadores, id)) {
+        Operador o = _ler_operador(id);
+        nome = o.nome;
+        turno = o.turno;
+    }
+    return MetricaOperador {
+        matricula: id,
+        nome: nome,
+        turno: turno,
+        pecas_boas: 0.0,
+        pecas_refugo: 0.0,
+        total_pecas: 0.0,
+        horas_apontadas: 0.0,
+        horas_padrao: 0.0,
+        eficiencia_pct: 100.0,
+        qualidade_pct: 100.0
+    };
+}
+
+fn _processar_apontamento(string op_ref, string posto, number boas, number refugo, number t_min) ={
+    if (len(op_ref) == 0 || (boas <= 0.0 && refugo <= 0.0)) { return; }
+    string id = upper(trim(op_ref));
+
+    MetricaOperador m = _obter_ou_criar_metrica(id);
+    number n_boas = m.pecas_boas + boas;
+    number n_refugo = m.pecas_refugo + refugo;
+    number n_total = n_boas + n_refugo;
+
+    number h_padrao_ciclo = (boas * t_min) / 60.0;
+    number h_apontada_ciclo = ((boas + refugo) * t_min) / 60.0;
+    if (h_apontada_ciclo <= 0.0) { h_apontada_ciclo = 0.05; }
+
+    number n_h_padrao = _r2(m.horas_padrao + h_padrao_ciclo);
+    number n_h_apontadas = _r2(m.horas_apontadas + h_apontada_ciclo);
+
+    number ef = n_h_apontadas > 0.0 ? _r1((n_h_padrao * 100.0) / n_h_apontadas) : 100.0;
+    number qual = n_total > 0.0 ? _r1((n_boas * 100.0) / n_total) : 100.0;
+
+    MetricaOperador nova = MetricaOperador {
+        matricula: m.matricula,
+        nome: m.nome,
+        turno: m.turno,
+        pecas_boas: n_boas,
+        pecas_refugo: n_refugo,
+        total_pecas: n_total,
+        horas_apontadas: n_h_apontadas,
+        horas_padrao: n_h_padrao,
+        eficiencia_pct: ef,
+        qualidade_pct: qual
+    };
+
+    _metricas[id] = json_encode(nova);
+    db::salvar(_dir, "metricas", _metricas);
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    if (e.tipo == "producao.etapa_apontada") {
+        map<string,string> f = form::ler(e.corpo);
+        string operador = form::campo(f, "operador");
+        string posto = upper(form::campo(f, "posto"));
+        number d_boas = form::numero(f, "delta_boas", 0.0);
+        number d_refugo = form::numero(f, "delta_refugo", 0.0);
+        if (d_boas + d_refugo <= 0.0) {
+            d_boas = form::numero(f, "boas", 0.0);
+            d_refugo = form::numero(f, "refugo", 0.0);
+        }
+        number t_min = form::numero(f, "tempo_min", 0.0);
+        if (t_min <= 0.0) { t_min = 5.0; }
+        _processar_apontamento(operador, posto, d_boas, d_refugo, t_min);
+    }
+    if (e.tipo == "producao.apontada") {
+        map<string,string> f = form::ler(e.corpo);
+        string operador = form::campo(f, "operador");
+        string posto = upper(form::campo(f, "posto"));
+        number boa = form::numero(f, "boa", 0.0);
+        number ref = form::numero(f, "refugo", 0.0);
+        _processar_apontamento(operador, posto, boa, ref, 5.0);
+    }
+    return true;
+}
+
+// ── rotas HTTP ────────────────────────────────────────────
+
+fn _listar_turnos() -> k::Resposta ={
+    string[] lista = [];
+    for (string c in sort(keys(_turnos))) {
+        lista = concat(lista, [_turnos[c]]);
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn _salvar_turno(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string codigo = upper(trim(form::campo(f, "codigo")));
+    string descricao = trim(form::campo(f, "descricao"));
+    string inicio = trim(form::campo(f, "inicio"));
+    string fim = trim(form::campo(f, "fim"));
+    number horas = form::numero(f, "horas_produtivas", 0.0);
+
+    if (len(codigo) == 0) { return k::erro(422, "código do turno é obrigatório"); }
+    if (len(descricao) == 0) { return k::erro(422, "descrição é obrigatória"); }
+    if (horas <= 0.0) { return k::erro(422, "horas_produtivas deve ser maior que zero"); }
+
+    Turno t = Turno {
+        codigo: codigo,
+        descricao: descricao,
+        inicio: inicio,
+        fim: fim,
+        horas_produtivas: horas
+    };
+    _turnos[codigo] = json_encode(t);
+    db::salvar(_dir, "turnos", _turnos);
+    return k::ok(_turnos[codigo]);
+}
+
+fn _listar_operadores(string turno) -> k::Resposta ={
+    string[] lista = [];
+    for (string m in sort(keys(_operadores))) {
+        Operador o = _ler_operador(m);
+        if (len(turno) == 0 || o.turno == turno) {
+            lista = concat(lista, [_operadores[m]]);
+        }
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn _salvar_operador(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string mat = upper(trim(form::campo(f, "matricula")));
+    string nome = trim(form::campo(f, "nome"));
+    string turno = upper(trim(form::campo(f, "turno")));
+    string posto = upper(trim(form::campo(f, "posto_padrao")));
+    bool ativo = form::campo_ou(f, "ativo", "true") == "true";
+
+    if (len(mat) == 0) { return k::erro(422, "matrícula é obrigatória"); }
+    if (len(nome) == 0) { return k::erro(422, "nome é obrigatório"); }
+    if (len(turno) > 0 && !has(_turnos, turno)) { return k::erro(422, "turno " + turno + " não cadastrado"); }
+
+    Operador op = Operador {
+        matricula: mat,
+        nome: nome,
+        turno: turno,
+        posto_padrao: posto,
+        ativo: ativo
+    };
+    _operadores[mat] = json_encode(op);
+    db::salvar(_dir, "operadores", _operadores);
+
+    // Se métrica ainda não existe, cria inicial
+    if (!has(_metricas, mat)) {
+        MetricaOperador m = MetricaOperador {
+            matricula: mat, nome: nome, turno: turno,
+            pecas_boas: 0.0, pecas_refugo: 0.0, total_pecas: 0.0,
+            horas_apontadas: 0.0, horas_padrao: 0.0,
+            eficiencia_pct: 100.0, qualidade_pct: 100.0
+        };
+        _metricas[mat] = json_encode(m);
+        db::salvar(_dir, "metricas", _metricas);
+    }
+
+    return k::ok(_operadores[mat]);
+}
+
+fn _listar_alocacoes() -> k::Resposta ={
+    string[] lista = [];
+    for (string pt in sort(keys(_alocacoes))) {
+        lista = concat(lista, [_alocacoes[pt]]);
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn _salvar_alocacao(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string posto = upper(trim(form::campo(f, "posto")));
+    string mat = upper(trim(form::campo(f, "matricula")));
+
+    if (!cadastros::posto_existe(posto)) { return k::erro(422, "posto " + posto + " não cadastrado"); }
+    if (len(mat) > 0 && !has(_operadores, mat)) { return k::erro(422, "operador " + mat + " não cadastrado"); }
+
+    if (len(mat) == 0) {
+        if (has(_alocacoes, posto)) { remove(_alocacoes, posto); }
+        db::salvar(_dir, "alocacoes", _alocacoes);
+        return k::ok("{\"status\":\"liberado\"}");
+    }
+
+    Operador op = _ler_operador(mat);
+    AlocacaoPosto a = AlocacaoPosto {
+        posto: posto,
+        matricula: mat,
+        operador_nome: op.nome,
+        turno: op.turno,
+        alocado_em: now_ms()
+    };
+    _alocacoes[posto] = json_encode(a);
+    db::salvar(_dir, "alocacoes", _alocacoes);
+
+    ev::publicar("turnos.operador_alocado", "turnos", "posto=" + url_encode(posto)
+        + "&matricula=" + url_encode(mat) + "&operador=" + url_encode(op.nome));
+
+    return k::ok(_alocacoes[posto]);
+}
+
+fn _definir_turno_atual(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string t = upper(trim(form::campo(f, "turno")));
+    if (len(t) == 0) { t = upper(trim(k::param(r, "turno"))); }
+    if (!has(_turnos, t)) { return k::erro(422, "turno " + t + " não existe"); }
+
+    _turno_ativo = t;
+    map<string,string> cfg = {};
+    cfg["turno_ativo"] = _turno_ativo;
+    db::salvar(_dir, "config", cfg);
+
+    ev::publicar("turnos.turno_definido", "turnos", "turno=" + url_encode(t));
+    return k::ok("{\"turno_ativo\":\"" + _turno_ativo + "\"}");
+}
+
+fn _obter_painel() -> k::Resposta ={
+    Turno[] ts = [];
+    for (string c in sort(keys(_turnos))) { ts = concat(ts, [_ler_turno(c)]); }
+
+    AlocacaoPosto[] als = [];
+    for (string pt in sort(keys(_alocacoes))) { als = concat(als, [json_decode(_alocacoes[pt]) as AlocacaoPosto]); }
+
+    MetricaOperador[] m_ops = [];
+    for (string m in sort(keys(_metricas))) { m_ops = concat(m_ops, [_ler_metrica(m)]); }
+
+    // Consolidação por Turno
+    MetricaTurno[] m_turnos = [];
+    for (Turno t in ts) {
+        number boas_t = 0.0;
+        number ref_t = 0.0;
+        int ops_t = 0;
+        for (string m in keys(_operadores)) {
+            Operador op = _ler_operador(m);
+            if (op.turno == t.codigo) { ops_t = ops_t + 1; }
+        }
+        for (MetricaOperador mo in m_ops) {
+            if (mo.turno == t.codigo) {
+                boas_t = boas_t + mo.pecas_boas;
+                ref_t = ref_t + mo.pecas_refugo;
+            }
+        }
+        number tot_t = boas_t + ref_t;
+        number qual_t = tot_t > 0.0 ? _r1((boas_t * 100.0) / tot_t) : 100.0;
+
+        m_turnos = concat(m_turnos, [MetricaTurno {
+            turno: t.codigo,
+            descricao: t.descricao,
+            total_boas: boas_t,
+            total_refugo: ref_t,
+            total_pecas: tot_t,
+            taxa_qualidade_pct: qual_t,
+            operadores_cadastrados: ops_t
+        }]);
+    }
+
+    PainelTurnos p = PainelTurnos {
+        turno_atual: _turno_ativo,
+        turnos: ts,
+        alocacoes: als,
+        metricas_turnos: m_turnos,
+        metricas_operadores: m_ops
+    };
+
+    return k::ok(json_encode(p));
+}
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/turnos" && r.metodo == "GET") { return _listar_turnos(); }
+    if (r.rota == "/turnos" && r.metodo == "POST") { return _salvar_turno(r); }
+    if (r.rota == "/operadores" && r.metodo == "GET") { return _listar_operadores(upper(k::param(r, "turno"))); }
+    if (r.rota == "/operadores" && r.metodo == "POST") { return _salvar_operador(r); }
+    if (r.rota == "/alocacoes" && r.metodo == "GET") { return _listar_alocacoes(); }
+    if (r.rota == "/alocacoes" && r.metodo == "POST") { return _salvar_alocacao(r); }
+    if (r.rota == "/painel" && r.metodo == "GET") { return _obter_painel(); }
+    if (r.rota == "/definir_atual" && r.metodo == "POST") { return _definir_turno_atual(r); }
+    if (r.rota == "/operador" && r.metodo == "GET") {
+        string mat = upper(trim(k::param(r, "matricula")));
+        if (!has(_metricas, mat)) { return k::erro(404, "operador não encontrado"); }
+        return k::ok(_metricas[mat]);
+    }
+    return k::nao_encontrado();
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "turnos",
+        nome: "Gestão de Turnos e Operadores",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/turnos",
+        depende: ["cadastros"],
+        assina: ["producao.etapa_apontada", "producao.apontada"],
+        perfis_escrita: ["admin", "pcp", "manutencao", "operador"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

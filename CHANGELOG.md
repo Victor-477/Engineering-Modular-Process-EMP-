@@ -2,6 +2,18 @@
 
 ## Não lançado
 
+### Novo — fase 7: Gestão de Turnos, Operadores e Eficiência Operacional
+- **Módulo de Turnos e Operadores** (`src/modulos/turnos/`, prefixo `/api/turnos`, escrita por admin/pcp/qualidade):
+  - **Cadastro de Turnos e Horários**: turnos industriais com início, fim e horas de jornada planejadas (`T1`, `T2`, `T3`), com definição de turno ativo da fábrica (`POST /api/turnos/definir_atual`).
+  - **Cadastro e Matrícula de Operadores**: operadores de chão de fábrica com matrícula, nome, turno base e status de atividade.
+  - **Alocação de Operadores nos Postos de Trabalho**: mapeamento dinâmico posto × operador (`POST /api/turnos/alocacoes`), emitindo o evento `turnos.alocacao_alterada` e possibilitando liberação do posto.
+  - **Acúmulo Automático de Métricas Operacionais**: assinatura dos eventos `producao.etapa_apontada` e `producao.apontada` para acumular horas reais, peças boas, refugo e cálculo de horas padrão da engenharia associados ao operador alocado no posto e ao turno vigente.
+  - **Eficiência e Qualidade por Operador**: apuração da taxa de eficiência operacional ($(\text{horas padrão} / \text{horas reais}) \times 100$) e taxa de qualidade ($(\text{boas} / \text{total}) \times 100$).
+  - **Comparativo e Painel de Turnos**: métricas agregadas por turno e por operador para benchmark de produtividade e análise de rendimento por equipe (`GET /api/turnos/comparativo`).
+- **Painel Web**:
+  - Nova aba e seção **Turnos & Operadores** com seletor de turno ativo no topo, cards comparativos por turno, formulários de alocação rápida no posto e de cadastro de operadores, tabela de alocações vigentes com botão Liberar e tabela de eficiência e qualidade por operador com badges de desempenho e exportação CSV.
+- **Testes**: +5 casos em `test_turnos.cryo`, totalizando **86 testes automatizados** passando no `build.ps1` e compilação nativa Windows de `emp.exe`, `compras.exe` e `qualidade.exe`.
+
 ### Novo — fase 6: Custos Industriais e Manutenção Preventiva por Horas e Ciclos
 - **Módulo de Custos Industriais e Apropriação** (`src/modulos/custos/`, prefixo `/api/custos`, escrita por admin/pcp):
   - Configuração de tabela de preços de materiais (`POST /api/custos/precos_materiais`) e taxas horárias de postos de trabalho (`POST /api/custos/taxas_postos`).

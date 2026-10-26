@@ -1,0 +1,186 @@
+// Testes de Gestão de Turnos e Operadores com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_turnos.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"               as k;
+import "../src/nucleo/eventos.cryo"                as ev;
+import "../src/nucleo/persist.cryo"                as db;
+import "../src/modulos/cadastros/cadastros.cryo"     as cadastros;
+import "../src/modulos/turnos/turnos.cryo"          as turnos;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _req(string metodo, string rota, string corpo) -> k::Requisicao ={
+    string r = rota;
+    string q = "";
+    int inter = find(rota, "?");
+    if (inter > 0) {
+        string s_rota = rota;
+        r = s_rota[0..inter];
+        q = s_rota[inter + 1..];
+    }
+    return k::Requisicao {
+        metodo: metodo,
+        caminho: "/api/turnos" + r,
+        rota: r,
+        query: q,
+        corpo: corpo,
+        usuario: "admin",
+        perfil: "admin"
+    };
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_turnos")) { make_dir("build/test_turnos"); }
+    string dir = "build/test_turnos/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+    for (string c in ["postos", "turnos", "operadores", "alocacoes", "metricas", "config"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Postos
+    map<string,string> pts = {};
+    pts["PRENSA"] = "{\"codigo\":\"PRENSA\",\"descricao\":\"Prensa 100t\",\"capacidade_h\":8.0}";
+    pts["SOLDA"] = "{\"codigo\":\"SOLDA\",\"descricao\":\"Posto de Solda\",\"capacidade_h\":8.0}";
+    db::salvar(dir, "postos", pts);
+
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(turnos::descritor().iniciar, dir);
+
+    return dir;
+}
+
+test fn criar_e_listar_turnos_e_operadores() ={
+    string dir = _preparar("turnos_ops");
+
+    // Consulta turnos padrões
+    k::Resposta r_t = _rotear(turnos::descritor().rotear, _req("GET", "/turnos", ""));
+    assert(r_t.status == 200, "listar turnos 200");
+    assert(contains(r_t.corpo, "TURNO-1"), "turno 1 presente");
+    assert(contains(r_t.corpo, "TURNO-2"), "turno 2 presente");
+
+    // Cadastra operador OP-01
+    k::Resposta r_op1 = _rotear(turnos::descritor().rotear,
+        _req("POST", "/operadores", "matricula=OP-01&nome=Carlos+Silva&turno=TURNO-1&posto_padrao=PRENSA"));
+    assert(r_op1.status == 200, "cadastrar op1 200");
+    assert(contains(r_op1.corpo, "Carlos Silva"), "nome op1 gravado");
+
+    // Cadastra operador OP-02
+    k::Resposta r_op2 = _rotear(turnos::descritor().rotear,
+        _req("POST", "/operadores", "matricula=OP-02&nome=Ana+Oliveira&turno=TURNO-2&posto_padrao=SOLDA"));
+    assert(r_op2.status == 200, "cadastrar op2 200");
+
+    // Lista operadores
+    k::Resposta r_list = _rotear(turnos::descritor().rotear, _req("GET", "/operadores", ""));
+    assert(r_list.status == 200, "listar operadores");
+    assert(contains(r_list.corpo, "OP-01"), "op1 listado");
+    assert(contains(r_list.corpo, "OP-02"), "op2 listado");
+
+    // Filtra operadores por turno
+    k::Resposta r_f1 = _rotear(turnos::descritor().rotear, _req("GET", "/operadores?turno=TURNO-1", ""));
+    assert(contains(r_f1.corpo, "OP-01"), "op1 no turno 1");
+    assert(!contains(r_f1.corpo, "OP-02"), "op2 nao no turno 1");
+}
+
+test fn alocacao_de_operadores_nos_postos() ={
+    string dir = _preparar("aloc");
+
+    _rotear(turnos::descritor().rotear,
+        _req("POST", "/operadores", "matricula=OP-01&nome=Carlos+Silva&turno=TURNO-1&posto_padrao=PRENSA"));
+
+    // Aloca OP-01 na PRENSA
+    k::Resposta r_al = _rotear(turnos::descritor().rotear,
+        _req("POST", "/alocacoes", "posto=PRENSA&matricula=OP-01"));
+    assert(r_al.status == 200, "alocar operador 200");
+    assert(contains(r_al.corpo, "\"matricula\":\"OP-01\""), "matricula alocada");
+    assert(contains(r_al.corpo, "Carlos Silva"), "nome operador alocado");
+
+    // Consulta alocações
+    k::Resposta r_list = _rotear(turnos::descritor().rotear, _req("GET", "/alocacoes", ""));
+    assert(r_list.status == 200, "listar alocacoes 200");
+    assert(contains(r_list.corpo, "PRENSA"), "posto prensa alocado");
+
+    // Libera alocação
+    k::Resposta r_lib = _rotear(turnos::descritor().rotear, _req("POST", "/alocacoes", "posto=PRENSA&matricula="));
+    assert(r_lib.status == 200, "liberar alocacao 200");
+
+    k::Resposta r_pos = _rotear(turnos::descritor().rotear, _req("GET", "/alocacoes", ""));
+    assert(!contains(r_pos.corpo, "PRENSA"), "posto liberado");
+}
+
+test fn acumulo_de_metricas_por_apontamento() ={
+    string dir = _preparar("metricas");
+
+    _rotear(turnos::descritor().rotear,
+        _req("POST", "/operadores", "matricula=OP-01&nome=Carlos+Silva&turno=TURNO-1&posto_padrao=PRENSA"));
+
+    // Simula evento producao.etapa_apontada: OP-01 produziu 50 boas e 2 refugo (tempo 3 min)
+    _evento(turnos::descritor().ao_evento, k::Evento {
+        id: 1, tipo: "producao.etapa_apontada", origem: "producao",
+        corpo: "operador=OP-01&posto=PRENSA&delta_boas=50&delta_refugo=2&tempo_min=3.0", criado_em: now_ms()
+    });
+
+    // Consulta métricas do operador
+    k::Resposta r_op = _rotear(turnos::descritor().rotear, _req("GET", "/operador?matricula=OP-01", ""));
+    assert(r_op.status == 200, "consultar metricas op1 200");
+    assert(contains(r_op.corpo, "\"pecas_boas\":50"), "50 pecas boas");
+    assert(contains(r_op.corpo, "\"pecas_refugo\":2"), "2 pecas refugo");
+    assert(contains(r_op.corpo, "\"total_pecas\":52"), "52 pecas totais");
+    assert(contains(r_op.corpo, "\"horas_padrao\":2.5"), "horas padrao 2.5h");
+}
+
+test fn eficiencia_e_taxa_de_qualidade_do_operador() ={
+    string dir = _preparar("eficiencia");
+
+    _rotear(turnos::descritor().rotear,
+        _req("POST", "/operadores", "matricula=OP-01&nome=Carlos+Silva&turno=TURNO-1&posto_padrao=PRENSA"));
+
+    // Primeiro apontamento: 48 boas e 2 refugo
+    _evento(turnos::descritor().ao_evento, k::Evento {
+        id: 1, tipo: "producao.etapa_apontada", origem: "producao",
+        corpo: "operador=OP-01&posto=PRENSA&delta_boas=48&delta_refugo=2&tempo_min=3.0", criado_em: now_ms()
+    });
+
+    // Segundo apontamento: 50 boas e 0 refugo
+    _evento(turnos::descritor().ao_evento, k::Evento {
+        id: 2, tipo: "producao.etapa_apontada", origem: "producao",
+        corpo: "operador=OP-01&posto=PRENSA&delta_boas=50&delta_refugo=0&tempo_min=3.0", criado_em: now_ms()
+    });
+
+    k::Resposta r = _rotear(turnos::descritor().rotear, _req("GET", "/operador?matricula=OP-01", ""));
+    assert(r.status == 200, "metricas operador 200");
+
+    // Total = 98 boas e 2 refugo = 100 peças totais. Taxa qualidade = 98.0%
+    assert(contains(r.corpo, "\"qualidade_pct\":98"), "qualidade 98%");
+    assert(contains(r.corpo, "\"total_pecas\":100"), "total 100 pecas");
+}
+
+test fn comparativo_entre_turnos_no_painel() ={
+    string dir = _preparar("painel_t");
+
+    _rotear(turnos::descritor().rotear,
+        _req("POST", "/operadores", "matricula=OP-01&nome=Carlos+Silva&turno=TURNO-1&posto_padrao=PRENSA"));
+    _rotear(turnos::descritor().rotear,
+        _req("POST", "/operadores", "matricula=OP-02&nome=Ana+Oliveira&turno=TURNO-2&posto_padrao=SOLDA"));
+
+    // Define turno ativo como TURNO-2
+    k::Resposta r_def = _rotear(turnos::descritor().rotear,
+        _req("POST", "/definir_atual", "turno=TURNO-2"));
+    assert(r_def.status == 200, "definir turno atual 200");
+    assert(contains(r_def.corpo, "TURNO-2"), "turno ativo definido");
+
+    // Aponta produção para OP-02 (Turno 2)
+    _evento(turnos::descritor().ao_evento, k::Evento {
+        id: 1, tipo: "producao.etapa_apontada", origem: "producao",
+        corpo: "operador=OP-02&posto=SOLDA&delta_boas=80&delta_refugo=4&tempo_min=2.0", criado_em: now_ms()
+    });
+
+    // Consulta painel geral
+    k::Resposta r_p = _rotear(turnos::descritor().rotear, _req("GET", "/painel", ""));
+    assert(r_p.status == 200, "obter painel 200");
+    assert(contains(r_p.corpo, "\"turno_atual\":\"TURNO-2\""), "turno atual TURNO-2 no painel");
+    assert(contains(r_p.corpo, "metricas_turnos"), "metricas_turnos presente");
+    assert(contains(r_p.corpo, "metricas_operadores"), "metricas_operadores presente");
+}

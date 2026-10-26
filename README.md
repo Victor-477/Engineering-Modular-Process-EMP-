@@ -22,6 +22,7 @@ linguagem: **[ESCOPO.md](ESCOPO.md)** · Histórico: **[CHANGELOG.md](CHANGELOG.
 | **Programação (APS)** | interno | Sequenciamento e capacidade finita: carga × capacidade por posto, identificação de gargalos, fila sequenciada por prioridade e EDD (Earliest Due Date), projeção contínua de cronograma e alerta de atraso |
 | **Lotes & Rastreabilidade** | interno | Rastreabilidade e genealogia industrial: controle de lotes (status/validade), árvore genealógica de insumos consumidos em cada etapa da OP, expedição a clientes e rastreamento bidirecional (backward de insumos e forward recall de clientes) |
 | **Custos Industriais** | interno | Apropriação de custos da produção: custo padrão da engenharia (MD + MOD/GGF) vs. custo real da OP, taxas horárias dos postos, custo de refugo, análise de desvio percentual e fechamento contábil |
+| **Turnos & Operadores** | interno | Gestão de turnos de trabalho, alocação de operadores aos postos, turno ativo da fábrica, produtividade, taxa de qualidade e eficiência operacional por operador |
 | **Qualidade** | **plugin externo** | Não conformidades manuais e automáticas (refugo acima do limite) — processo próprio, sem recompilar o núcleo |
 | **Compras** | **plugin externo** | Gestão de fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas de estoque — processo próprio |
 

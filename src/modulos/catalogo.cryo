@@ -21,6 +21,7 @@ import "mrp/mrp.cryo"                  as mrp;
 import "programacao/programacao.cryo"  as programacao;
 import "lotes/lotes.cryo"              as lotes;
 import "custos/custos.cryo"            as custos;
+import "turnos/turnos.cryo"            as turnos;
 
 pub fn todos() -> k::Modulo[] ={
     return [
@@ -34,6 +35,7 @@ pub fn todos() -> k::Modulo[] ={
         mrp::descritor(),
         programacao::descritor(),
         lotes::descritor(),
-        custos::descritor()
+        custos::descritor(),
+        turnos::descritor()
     ];
 }
