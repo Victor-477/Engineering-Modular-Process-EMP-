@@ -46,6 +46,7 @@ Requisitos que orientaram a arquitetura:
 | **Turnos & Operadores** | interno | Gestão de escalas de turnos, alocação de operadores aos postos, turno ativo, acumulação de métricas por apontamento, eficiência e qualidade por operador | `turnos.alocacao_alterada`, `turnos.atual_alterado` | `producao.etapa_apontada`, `producao.apontada` |
 | **Relatórios e BI** | interno | Painel analítico executivo, nível de serviço de pedidos (OTIF), ranking de perdas/refugos, desempenho e custo de postos e exportações analíticas em CSV | `relatorios.alerta_gerencial` | `pedido.expedido`, `producao.apontada`, `custos.op_fechada` |
 | **Coleta Automática & IoT** | interno | Contadores de pulsos de CLP, telemetria de sensores (temperatura/pressão), intertravamento de segurança com parada automática e apontamento automático de chão de fábrica | `coleta.pulso_registrado`, `coleta.alerta_critico`, `coleta.estado_alterado`, `maquina.parada` | `maquina.parada`, `maquina.liberada` |
+| **Arquivamento e Histórico** | interno | Expurgar/congelar OPs concluídas antigas em arquivo histórico permanente (`tblFinOrder`, `tblFinStep`) com retenção temporal, reversibilidade total para auditoria e garantia de alta performance operacional | `arquivamento.op_arquivada`, `arquivamento.lote_concluido`, `arquivamento.op_desarquivada` | `op.concluida` |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
 | **Compras** | **plugin externo** (processo próprio) | Fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas | — | `estoque.falta`, `estoque.abaixo_minimo` |
 | **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
@@ -80,11 +81,14 @@ anteriores ainda não publicado — o backflush consome o material de boas + tod
 o refugo. Peças que "somem" num `concluir` com menos que a entrada não são
 baixadas do estoque.
 
-### 2.2 Planejado (próximas fases, cada um como módulo)
+### 2.2 Planejado (próximas fases e extensões modulares)
 
-| Módulo | Interno/Plugin | Depende de | Observação |
+Todas as 10 fases modulares planejadas inicialmente foram integralmente implementadas e validadas (101 testes automatizados). Extensões futuras podem incluir:
+
+| Módulo / Recurso | Interno/Plugin | Depende de | Observação |
 |---|---|---|---|
-| Arquivamento histórico de OPs (tblFin*) | interno | producao, custos | Expurgar/congelar OPs concluídas antigas em arquivo histórico para manter alta performance |
+| Gateway OPC-UA / MQTT | plugin externo | coleta | Conexão de rede industrial padronizada para CLP Siemens/Rockwell |
+| Algoritmos Genéticos de APS | interno | programacao | Otimização heurística avançada de sequenciamento multidimensional |
 
 ### 2.3 Fora do escopo
 

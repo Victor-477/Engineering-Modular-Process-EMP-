@@ -1,0 +1,293 @@
+// Testes de Arquivamento Histórico e Fechamento de Produção (tblFin*) com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_arquivamento.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"               as k;
+import "../src/nucleo/eventos.cryo"                as ev;
+import "../src/nucleo/persist.cryo"                as db;
+import "../src/modulos/cadastros/cadastros.cryo"     as cadastros;
+import "../src/modulos/roteiros/roteiros.cryo"       as roteiros;
+import "../src/modulos/producao/producao.cryo"       as producao;
+import "../src/modulos/producao/etapas.cryo"         as etp;
+import "../src/modulos/custos/custos.cryo"           as custos;
+import "../src/modulos/arquivamento/arquivamento.cryo" as arquivamento;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _req(string metodo, string rota, string corpo, string perfil) -> k::Requisicao ={
+    string r = rota;
+    string q = "";
+    int inter = find(rota, "?");
+    if (inter > 0) {
+        string s_rota = rota;
+        r = s_rota[0..inter];
+        q = s_rota[inter + 1..];
+    }
+    return k::Requisicao {
+        metodo: metodo,
+        caminho: "/api/arquivamento" + r,
+        rota: r,
+        query: q,
+        corpo: corpo,
+        usuario: "admin",
+        perfil: perfil
+    };
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_arquivamento")) { make_dir("build/test_arquivamento"); }
+    string dir = "build/test_arquivamento/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+
+    for (string c in ["produtos", "postos", "roteiros", "operacoes", "ordens", "etapas", "ordens_arquivadas", "etapas_arquivadas", "config_arquivamento", "precos", "taxas", "fechamentos"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Cadastro de produto e postos
+    map<string,string> prods = {};
+    prods["PROD-A"] = "{\"codigo\":\"PROD-A\",\"descricao\":\"Produto Alpha\",\"unidade\":\"UN\",\"tipo\":\"PA\"}";
+    prods["PROD-B"] = "{\"codigo\":\"PROD-B\",\"descricao\":\"Produto Beta\",\"unidade\":\"UN\",\"tipo\":\"PA\"}";
+    db::salvar(dir, "produtos", prods);
+
+    map<string,string> pts = {};
+    pts["USINAGEM"] = "{\"codigo\":\"USINAGEM\",\"descricao\":\"Posto Usinagem\",\"capacidade_h\":8.0}";
+    pts["MONTAGEM"] = "{\"codigo\":\"MONTAGEM\",\"descricao\":\"Posto Montagem\",\"capacidade_h\":8.0}";
+    db::salvar(dir, "postos", pts);
+
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(roteiros::descritor().iniciar, dir);
+    _iniciar(producao::descritor().iniciar, dir);
+    _iniciar(custos::descritor().iniciar, dir);
+    _iniciar(arquivamento::descritor().iniciar, dir);
+
+    return dir;
+}
+
+test fn arquivamento_individual_de_op_concluida_e_bloqueio_de_ativa() ={
+    string dir = _preparar("arq_individual");
+
+    // Cria OP de teste
+    int op_id = producao::criar_op("PROD-A", 10.0, "USINAGEM", "PED-101");
+    assert(op_id > 0, "OP criada");
+
+    // Tenta arquivar OP PLANEJADA -> deve falhar com 409
+    k::Resposta res_bloq = _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/op?id=" + to_string(op_id), "", "admin"));
+    assert(res_bloq.status == 409, "bloqueio ao tentar arquivar OP ativa planejada");
+
+    // Libera a OP
+    k::Requisicao req_lib = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/liberar?id=" + to_string(op_id),
+        rota: "/liberar", query: "id=" + to_string(op_id), corpo: "",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_lib);
+
+    // Aponta produção total (10 boas) -> vai para CONCLUIDA
+    k::Requisicao req_apt = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id), corpo: "boa=10&refugo=0&operador=carlos",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_apt);
+
+    producao::OrdemProducao op_conc = producao::ordem(op_id);
+    assert(op_conc.status == "CONCLUIDA", "OP concluida");
+
+    // Agora arquiva a OP
+    k::Resposta res_arq = _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/op?id=" + to_string(op_id), "motivo=FECHAMENTO_QUALIDADE&usuario=inspetor", "admin"));
+    assert(res_arq.status == 200, "status arquivamento 200");
+
+    arquivamento::OrdemArquivada oa = json_decode(res_arq.corpo) as arquivamento::OrdemArquivada;
+    assert(oa.id == op_id, "id da OP arquivada confere");
+    assert(oa.produto == "PROD-A", "produto arquivado confere");
+    assert(oa.status == "CONCLUIDA", "status arquivado confere");
+    assert(oa.motivo_arquivamento == "FECHAMENTO_QUALIDADE", "motivo confere");
+    assert(oa.usuario == "inspetor", "usuario confere");
+    assert(oa.arquivado_em > 0, "timestamp de arquivamento preenchido");
+
+    // OP foi removida da produção ativa
+    producao::OrdemProducao ativa = producao::ordem(op_id);
+    assert(ativa.id == 0, "OP nao deve mais existir na producao ativa");
+
+    // OP existe no arquivo histórico
+    arquivamento::OrdemArquivada hist = arquivamento::ordem_arquivada(op_id);
+    assert(hist.id == op_id, "OP encontrada no modulo de arquivamento");
+}
+
+test fn consulta_historica_e_etapas_arquivadas() ={
+    string dir = _preparar("consulta_hist");
+
+    int op_id = producao::criar_op("PROD-A", 5.0, "MONTAGEM", "PED-202");
+    k::Requisicao req_lib = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/liberar?id=" + to_string(op_id),
+        rota: "/liberar", query: "id=" + to_string(op_id), corpo: "",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_lib);
+
+    k::Requisicao req_apt = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id), corpo: "boa=5&refugo=0&operador=marcos",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_apt);
+
+    // Arquiva OP
+    _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/op?id=" + to_string(op_id), "motivo=AUDITORIA", "admin"));
+
+    // Consulta lista de arquivadas (GET /ordens)
+    k::Resposta res_lista = _rotear(arquivamento::descritor().rotear,
+        _req("GET", "/ordens?produto=PROD-A", "", "admin"));
+    assert(res_lista.status == 200, "status /ordens 200");
+    assert(contains(res_lista.corpo, "\"id\":" + to_string(op_id)), "lista contem a OP");
+
+    // Consulta detalhe da OP arquivada com etapas (GET /ordem?id=N)
+    k::Resposta res_detalhe = _rotear(arquivamento::descritor().rotear,
+        _req("GET", "/ordem?id=" + to_string(op_id), "", "admin"));
+    assert(res_detalhe.status == 200, "status /ordem 200");
+    assert(contains(res_detalhe.corpo, "\"etapas\":["), "detalhe contem array de etapas");
+    assert(contains(res_detalhe.corpo, "APONTAMENTO"), "contem a operacao executada");
+}
+
+test fn arquivamento_em_lote_por_politica_de_retencao() ={
+    string dir = _preparar("arq_lote");
+
+    // Cria OP 1 (permanece PLANEJADA)
+    int op1 = producao::criar_op("PROD-A", 10.0, "USINAGEM", "");
+
+    // Cria OP 2 e conclui
+    int op2 = producao::criar_op("PROD-A", 8.0, "USINAGEM", "");
+    k::Requisicao req_lib2 = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/liberar?id=" + to_string(op2),
+        rota: "/liberar", query: "id=" + to_string(op2), corpo: "",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_lib2);
+    k::Requisicao req_apt2 = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op2),
+        rota: "/apontar", query: "id=" + to_string(op2), corpo: "boa=8&refugo=0",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_apt2);
+
+    // Cria OP 3 e cancela
+    int op3 = producao::criar_op("PROD-B", 4.0, "MONTAGEM", "");
+    k::Requisicao req_canc3 = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/cancelar?id=" + to_string(op3),
+        rota: "/cancelar", query: "id=" + to_string(op3), corpo: "",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_canc3);
+
+    // Executa arquivamento em lote com dias=0 (arquiva todas concluidas/canceladas)
+    k::Resposta res_lote = _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/lote?dias=0", "motivo=EXPURGO_MENSAL", "admin"));
+    assert(res_lote.status == 200, "status /lote 200");
+    assert(contains(res_lote.corpo, "\"total_arquivadas\":2"), "2 ordens arquivadas no lote");
+    assert(contains(res_lote.corpo, to_string(op2)), "contem op2");
+    assert(contains(res_lote.corpo, to_string(op3)), "contem op3");
+
+    // OP 1 continua ativa em producao
+    producao::OrdemProducao ativa1 = producao::ordem(op1);
+    assert(ativa1.id == op1, "OP 1 ainda ativa");
+
+    // OPs 2 e 3 foram expurgadas da producao ativa
+    assert(producao::ordem(op2).id == 0, "OP 2 expurgada da ativa");
+    assert(producao::ordem(op3).id == 0, "OP 3 expurgada da ativa");
+}
+
+test fn desarquivamento_e_restauracao_de_op() ={
+    string dir = _preparar("desarquivar");
+
+    int op_id = producao::criar_op("PROD-A", 12.0, "USINAGEM", "PED-303");
+    k::Requisicao req_lib = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/liberar?id=" + to_string(op_id),
+        rota: "/liberar", query: "id=" + to_string(op_id), corpo: "",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_lib);
+
+    k::Requisicao req_apt = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id), corpo: "boa=12&refugo=0",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_apt);
+
+    // Arquiva OP
+    _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/op?id=" + to_string(op_id), "motivo=ARQUIVAR_TESTE", "admin"));
+    assert(producao::ordem(op_id).id == 0, "OP arquivada");
+
+    // Operador comum nao tem permissao para desarquivar (403)
+    k::Resposta res_sem_perm = _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/desarquivar?id=" + to_string(op_id), "", "operador"));
+    assert(res_sem_perm.status == 403, "bloqueio perfil operador para desarquivar");
+
+    // Admin desarquiva a OP
+    k::Resposta res_restaura = _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/desarquivar?id=" + to_string(op_id), "", "admin"));
+    assert(res_restaura.status == 200, "restauracao bem sucedida 200");
+
+    // Verifica que OP retornou à produção ativa
+    producao::OrdemProducao restaurada = producao::ordem(op_id);
+    assert(restaurada.id == op_id, "OP restaurada na producao ativa");
+    assert(restaurada.status == "CONCLUIDA", "status preservado");
+    assert(restaurada.produzido == 12.0, "quantidade produzida preservada");
+
+    // Verifica que foi removida da base de arquivo
+    assert(arquivamento::ordem_arquivada(op_id).id == 0, "removida de ordens_arquivadas");
+}
+
+test fn politicas_de_retencao_e_estatisticas_gerenciais() ={
+    string dir = _preparar("politicas_resumo");
+
+    // Consulta config padrao
+    k::Resposta res_cfg = _rotear(arquivamento::descritor().rotear,
+        _req("GET", "/config", "", "admin"));
+    assert(res_cfg.status == 200, "status /config 200");
+    arquivamento::ConfigRetencao cfg_ini = json_decode(res_cfg.corpo) as arquivamento::ConfigRetencao;
+    assert(cfg_ini.dias_retencao == 30, "retencao padrao 30 dias");
+
+    // Altera configuracao de retencao
+    k::Resposta res_alt = _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/config", "dias_retencao=15&auto_arquivamento=true", "admin"));
+    assert(res_alt.status == 200, "status POST /config 200");
+    arquivamento::ConfigRetencao cfg_nova = json_decode(res_alt.corpo) as arquivamento::ConfigRetencao;
+    assert(cfg_nova.dias_retencao == 15, "nova retencao 15 dias");
+    assert(cfg_nova.auto_arquivamento == true, "auto_arquivamento ativado");
+
+    // Cria e conclui OP
+    int op_id = producao::criar_op("PROD-B", 20.0, "MONTAGEM", "PED-404");
+    k::Requisicao req_lib = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/liberar?id=" + to_string(op_id),
+        rota: "/liberar", query: "id=" + to_string(op_id), corpo: "",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_lib);
+    k::Requisicao req_apt = k::Requisicao {
+        metodo: "POST", caminho: "/api/producao/apontar?id=" + to_string(op_id),
+        rota: "/apontar", query: "id=" + to_string(op_id), corpo: "boa=20&refugo=0",
+        usuario: "admin", perfil: "admin"
+    };
+    _rotear(producao::descritor().rotear, req_apt);
+
+    // Arquiva OP
+    _rotear(arquivamento::descritor().rotear,
+        _req("POST", "/op?id=" + to_string(op_id), "motivo=POLITICA", "admin"));
+
+    // Consulta resumo gerencial
+    k::Resposta res_resumo = _rotear(arquivamento::descritor().rotear,
+        _req("GET", "/resumo", "", "admin"));
+    assert(res_resumo.status == 200, "status /resumo 200");
+
+    arquivamento::ResumoArquivamento resumo = json_decode(res_resumo.corpo) as arquivamento::ResumoArquivamento;
+    assert(resumo.arquivadas_total == 1, "1 ordem arquivada");
+    assert(resumo.dias_retencao == 15, "dias de retencao 15");
+    assert(resumo.ultimo_arquivamento > 0, "ultimo arquivamento registrado");
+}

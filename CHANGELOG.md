@@ -2,6 +2,21 @@
 
 ## Não lançado
 
+### Novo — fase 10: Arquivamento Histórico e Fechamento de Produção (`tblFin*`)
+- **Módulo de Arquivamento Histórico de OPs** (`src/modulos/arquivamento/`, prefixo `/api/arquivamento`, escrita por admin/pcp):
+  - **Padrão de Engenharia MES/ERP (FactoryViews/MES4)**: separação entre coleções operacionais ativas e histórico finalizado (`tblFinOrder`, `tblFinStep`), mantendo o chão de fábrica, consultas e algoritmos (PCP, APS) velozes com latência mínima.
+  - **Arquivamento Individual sob Demanda**: rota `POST /api/arquivamento/op?id=N` com validação de status terminal (`CONCLUIDA` ou `CANCELADA`), bloqueando tentativas de expurgar OPs em andamento (409) e gravando metadados (`arquivado_em`, `motivo_arquivamento`, `usuario`, `custo_total_real`, `lead_time_min`).
+  - **Arquivamento em Lote Periódico**: rota `POST /api/arquivamento/lote?dias=N` para expurgo em massa por política de retenção temporal (dias desde a conclusão), emitindo o evento `arquivamento.lote_concluido`.
+  - **Desarquivamento e Restauração Transacional**: rota `POST /api/arquivamento/desarquivar?id=N` (restrita a `admin` e `pcp`), permitindo reversibilidade total e restauração de ordens e etapas para a base ativa em casos de auditoria ou retificação contábil, emitindo `arquivamento.op_desarquivada`.
+  - **Consulta e Auditoria Histórica Transparente**: rotas `GET /api/arquivamento/ordens` (com filtros por produto, status e período) e `GET /api/arquivamento/ordem?id=N` com recuperação completa das etapas (`tblFinStep`), apontamentos, medições e operadores.
+  - **Resumo e Métricas Comparativas de Base**: rota `GET /api/arquivamento/resumo` apurando volume de OPs ativas vs. OPs arquivadas, etapas arquivadas e retenção configurada.
+  - **Garantia de IDs Monotônicos**: persistência e inicialização de `producao.cryo` aprimoradas para conferir o maior ID entre ordens ativas e arquivadas, impedindo colisão de IDs após reinicializações.
+- **Painel Web**:
+  - Nova aba e seção **Histórico & Arquivo** no menu de navegação e no dashboard inicial, com Big Numbers comparativos de ordens históricas vs. chão de fábrica, formulários de arquivamento em lote e individual, configuração de retenção, tabela interativa de ordens arquivadas com visualização modal de etapas (`tblFinStep`) e botão de restauração.
+  - Botão de atalho rápido "Arquivar" diretamente na tabela de Ordens de Produção ativas para ordens concluídas ou canceladas.
+  - Badge dinâmico na barra lateral (`qt-arq`) indicando OPs concluídas no chão prontas para arquivamento.
+- **Testes**: +5 casos em `test_arquivamento.cryo`, totalizando **101 testes automatizados** passando no `build.ps1` e compilação nativa Windows de `emp.exe` (5.10 MB), `compras.exe` (382 KB) e `qualidade.exe` (297 KB).
+
 ### Novo — fase 9: Coleta Automática de Chão de Fábrica e Sensores / IoT (`coleta`)
 - **Módulo de Coleta Automática e IoT** (`src/modulos/coleta/`, prefixo `/api/coleta`, escrita por admin/pcp/manutencao/operador):
   - **Cadastro de Dispositivos e Sensores**: suporte a contadores de peças de CLP, sensores analógicos (temperatura, pressão, vibração) e sensores de estado com limites de alerta e crítico (`POST /api/coleta/dispositivos`).

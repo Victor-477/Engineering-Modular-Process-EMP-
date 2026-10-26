@@ -200,7 +200,11 @@ fn iniciar(string dir) -> bool ={
     _dir = dir;
     _ordens = db::carregar(dir, "ordens");
     _execucoes = db::carregar(dir, "etapas");
-    _proximo = db::maior_id(_ordens) + 1;
+    map<string,string> arq = db::carregar(dir, "ordens_arquivadas");
+    int max_ativa = db::maior_id(_ordens);
+    int max_arq = db::maior_id(arq);
+    int maior = max_ativa > max_arq ? max_ativa : max_arq;
+    _proximo = maior + 1;
     return true;
 }
 
@@ -296,6 +300,25 @@ pub fn execucao_da_op(int op_id) -> etp::Execucao ={
     }
     OrdemProducao op = _ler(op_id);
     return _execucao(op);
+}
+
+pub fn remover_ativa(int id) -> bool ={
+    string chave = to_string(id);
+    if (!has(_ordens, chave)) { return false; }
+    remove(_ordens, chave);
+    if (has(_execucoes, chave)) { remove(_execucoes, chave); }
+    db::salvar(_dir, "ordens", _ordens);
+    db::salvar(_dir, "etapas", _execucoes);
+    return true;
+}
+
+pub fn restaurar_ativa(OrdemProducao op, etp::Execucao ex) -> bool ={
+    string chave = to_string(op.id);
+    _ordens[chave] = json_encode(op);
+    _execucoes[chave] = json_encode(ex);
+    db::salvar(_dir, "ordens", _ordens);
+    db::salvar(_dir, "etapas", _execucoes);
+    return true;
 }
 
 fn _criar(k::Requisicao r) -> k::Resposta ={

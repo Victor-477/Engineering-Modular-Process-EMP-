@@ -1,0 +1,497 @@
+// ============================================================
+//  arquivamento.cryo — Módulo de Arquivamento Histórico e Fechamento (tblFin*)
+//
+//  Inspirado no padrão de engenharia MES/ERP (FactoryViews/MES4):
+//  Para manter o chão de fábrica e as consultas operacionais (ordens,
+//  etapas, PCP, APS) leves e com altíssima performance, as OPs
+//  encerradas (status CONCLUIDA ou CANCELADA) são congeladas em
+//  tabelas históricas de arquivo permanente:
+//    - ordens_arquivadas  (tblFinOrder)
+//    - etapas_arquivadas  (tblFinStep)
+//
+//  Funcionalidades:
+//    - Políticas de retenção por idade em dias (ex: 30 dias) ou expurgo imediato
+//    - Arquivamento individual sob demanda com validação de status terminal
+//    - Arquivamento em lote periódico com fechamento contábil e de custos
+//    - Consulta histórica transparente com histórico de etapas e medições
+//    - Desarquivamento / restauração reversível para auditoria (admin/pcp)
+//    - Métricas e resumo comparativo entre base ativa e histórico arquivado
+//
+//  Rotas (prefixo /api/arquivamento):
+//    GET  /config                 configuração e políticas de retenção
+//    POST /config                 atualiza dias_retencao e auto_arquivamento
+//    POST /op?id=N                arquiva OP individualmente (motivo=, usuario=)
+//    POST /lote[?dias=N]          arquivamento em lote de OPs concluídas/canceladas
+//    GET  /ordens[?filtros]       lista OPs arquivadas (tblFinOrder)
+//    GET  /ordem?id=N             detalhes da OP arquivada com etapas (tblFinStep)
+//    POST /desarquivar?id=N       restaura OP arquivada para a produção ativa
+//    GET  /resumo                 estatísticas comparativas (ativas vs arquivadas)
+//
+//  Eventos publicados:
+//    arquivamento.op_arquivada, arquivamento.lote_concluido, arquivamento.op_desarquivada
+//
+//  Eventos assinados:
+//    op.concluida
+// ============================================================
+
+import "../../nucleo/contrato.cryo"  as k;
+import "../../nucleo/persist.cryo"   as db;
+import "../../nucleo/eventos.cryo"   as ev;
+import "../../nucleo/form.cryo"      as form;
+import "../producao/producao.cryo"   as producao;
+import "../producao/etapas.cryo"     as etp;
+import "../custos/custos.cryo"       as custos;
+
+pub struct OrdemArquivada {
+    int id;
+    string produto;
+    number quantidade;
+    number produzido;
+    number refugo;
+    string status;              // "CONCLUIDA" ou "CANCELADA"
+    string posto;
+    int criada_em;
+    int atualizada_em;
+    string origem;
+    int arquivado_em;
+    string motivo_arquivamento; // "MANUAL", "POLITICA_RETENCAO", "FECHAMENTO_MENSAL"
+    string usuario;
+    number custo_total_real;
+    number custo_unitario_real;
+    number lead_time_min;
+    int total_etapas;
+}
+
+pub struct ConfigRetencao {
+    int dias_retencao;
+    bool auto_arquivamento;
+    int ultimo_arquivamento;
+    int total_arquivadas;
+}
+
+pub struct ResumoArquivamento {
+    int ativas_total;
+    int ativas_concluidas;
+    int ativas_em_aberto;
+    int arquivadas_total;
+    int etapas_arquivadas_total;
+    int dias_retencao;
+    int ultimo_arquivamento;
+}
+
+string _dir = "";
+map<string,string> _ordens_arquivadas = {};
+map<string,string> _etapas_arquivadas = {};
+map<string,string> _config = {};
+
+fn _salvar_tudo() -> bool ={
+    db::salvar(_dir, "ordens_arquivadas", _ordens_arquivadas);
+    db::salvar(_dir, "etapas_arquivadas", _etapas_arquivadas);
+    db::salvar(_dir, "config_arquivamento", _config);
+    return true;
+}
+
+// ── rotinas de negócio ────────────────────────────────────
+
+pub fn arquivar_op(int id, string motivo, string usuario) -> string ={
+    producao::OrdemProducao op = producao::ordem(id);
+    if (op.id == 0) {
+        return "OP inexistente ou não encontrada na produção ativa";
+    }
+    if (op.status != "CONCLUIDA" && op.status != "CANCELADA") {
+        return "OP " + to_string(id) + " está " + op.status + ": apenas ordens CONCLUIDA ou CANCELADA podem ser arquivadas";
+    }
+
+    etp::Execucao ex = producao::execucao_da_op(id);
+    int agora = now_ms();
+
+    number lead_time = 0.0;
+    if (op.atualizada_em > op.criada_em && op.criada_em > 0) {
+        lead_time = round(((op.atualizada_em - op.criada_em) / 60000.0) * 10.0) / 10.0;
+    }
+
+    number c_total = 0.0;
+    number c_unit = 0.0;
+    custos::AnaliseCustoOp a = custos::analisar_op(op.id);
+    if (a.op > 0) {
+        c_total = a.total_real;
+        c_unit = a.unitario_real;
+    }
+
+    string mot = len(motivo) > 0 ? motivo : "MANUAL";
+    string usr = len(usuario) > 0 ? usuario : "sistema";
+
+    OrdemArquivada oa = OrdemArquivada {
+        id: op.id,
+        produto: op.produto,
+        quantidade: op.quantidade,
+        produzido: op.produzido,
+        refugo: op.refugo,
+        status: op.status,
+        posto: op.posto,
+        criada_em: op.criada_em,
+        atualizada_em: op.atualizada_em,
+        origem: op.origem,
+        arquivado_em: agora,
+        motivo_arquivamento: mot,
+        usuario: usr,
+        custo_total_real: c_total,
+        custo_unitario_real: c_unit,
+        lead_time_min: lead_time,
+        total_etapas: len(ex.etapas)
+    };
+
+    string s_id = to_string(id);
+    _ordens_arquivadas[s_id] = json_encode(oa);
+    _etapas_arquivadas[s_id] = json_encode(ex);
+
+    int tot_arq = parse_int(_config["total_arquivadas"]) ?? 0;
+    tot_arq = tot_arq + 1;
+    _config["total_arquivadas"] = to_string(tot_arq);
+    _config["ultimo_arquivamento"] = to_string(agora);
+
+    _salvar_tudo();
+
+    // Expulsa da produção ativa para acelerar queries operacionais
+    producao::remover_ativa(id);
+
+    ev::publicar("arquivamento.op_arquivada", "arquivamento", "op=" + to_string(id)
+        + "&produto=" + url_encode(op.produto)
+        + "&status=" + op.status
+        + "&motivo=" + url_encode(mot)
+        + "&usuario=" + url_encode(usr)
+        + "&arquivado_em=" + to_string(agora));
+
+    return "";
+}
+
+pub fn arquivar_lote(int dias, string motivo, string usuario) -> int[] ={
+    int agora = now_ms();
+    number corte_ms = to_number(dias) * 86400000.0;
+    int[] arquivados = [];
+
+    producao::OrdemProducao[] ativas = producao::todas_ordens();
+    for (int i = 0; i < len(ativas); i = i + 1) {
+        producao::OrdemProducao op = ativas[i];
+        if (op.status == "CONCLUIDA" || op.status == "CANCELADA") {
+            bool elegivel = false;
+            if (dias <= 0) {
+                elegivel = true;
+            } else {
+                number delta = to_number(agora - op.atualizada_em);
+                if (delta >= corte_ms) {
+                    elegivel = true;
+                }
+            }
+            if (elegivel) {
+                string res = arquivar_op(op.id, motivo, usuario);
+                if (len(res) == 0) {
+                    arquivados = concat(arquivados, [op.id]);
+                }
+            }
+        }
+    }
+
+    if (len(arquivados) > 0) {
+        ev::publicar("arquivamento.lote_concluido", "arquivamento", "total=" + to_string(len(arquivados))
+            + "&motivo=" + url_encode(motivo)
+            + "&dias=" + to_string(dias)
+            + "&arquivado_em=" + to_string(agora));
+    }
+
+    return arquivados;
+}
+
+pub fn desarquivar_op(int id) -> string ={
+    string s_id = to_string(id);
+    if (!has(_ordens_arquivadas, s_id)) {
+        return "OP arquivada não encontrada";
+    }
+
+    OrdemArquivada oa = json_decode(_ordens_arquivadas[s_id]) as OrdemArquivada;
+    etp::Execucao ex = etp::Execucao { etapas: [], refugo_pendente: 0.0 };
+    if (has(_etapas_arquivadas, s_id)) {
+        ex = json_decode(_etapas_arquivadas[s_id]) as etp::Execucao;
+    }
+
+    producao::OrdemProducao op = producao::OrdemProducao {
+        id: oa.id,
+        produto: oa.produto,
+        quantidade: oa.quantidade,
+        produzido: oa.produzido,
+        refugo: oa.refugo,
+        status: oa.status,
+        posto: oa.posto,
+        criada_em: oa.criada_em,
+        atualizada_em: now_ms(),
+        origem: oa.origem
+    };
+
+    producao::restaurar_ativa(op, ex);
+
+    remove(_ordens_arquivadas, s_id);
+    if (has(_etapas_arquivadas, s_id)) {
+        remove(_etapas_arquivadas, s_id);
+    }
+    _salvar_tudo();
+
+    ev::publicar("arquivamento.op_desarquivada", "arquivamento", "op=" + to_string(id)
+        + "&produto=" + url_encode(op.produto)
+        + "&status=" + op.status);
+
+    return "";
+}
+
+pub fn ordem_arquivada(int id) -> OrdemArquivada ={
+    string s_id = to_string(id);
+    if (!has(_ordens_arquivadas, s_id)) {
+        return OrdemArquivada {
+            id: 0, produto: "", quantidade: 0.0, produzido: 0.0, refugo: 0.0,
+            status: "", posto: "", criada_em: 0, atualizada_em: 0, origem: "",
+            arquivado_em: 0, motivo_arquivamento: "", usuario: "",
+            custo_total_real: 0.0, custo_unitario_real: 0.0, lead_time_min: 0.0,
+            total_etapas: 0
+        };
+    }
+    return json_decode(_ordens_arquivadas[s_id]) as OrdemArquivada;
+}
+
+pub fn todas_arquivadas() -> OrdemArquivada[] ={
+    OrdemArquivada[] lista = [];
+    for (string c in sort(keys(_ordens_arquivadas))) {
+        lista = concat(lista, [json_decode(_ordens_arquivadas[c]) as OrdemArquivada]);
+    }
+    return lista;
+}
+
+pub fn execucao_arquivada(int id) -> etp::Execucao ={
+    string s_id = to_string(id);
+    if (!has(_etapas_arquivadas, s_id)) {
+        etp::EtapaOP[] vazia = [];
+        return etp::Execucao { etapas: vazia, refugo_pendente: 0.0 };
+    }
+    return json_decode(_etapas_arquivadas[s_id]) as etp::Execucao;
+}
+
+pub fn total_arquivadas() -> int ={
+    return len(keys(_ordens_arquivadas));
+}
+
+// ── handlers HTTP ─────────────────────────────────────────
+
+fn _get_config() -> k::Resposta ={
+    int dias = parse_int(_config["dias_retencao"]) ?? 30;
+    bool auto = _config["auto_arquivamento"] == "true";
+    int ultimo = parse_int(_config["ultimo_arquivamento"]) ?? 0;
+    int tot = parse_int(_config["total_arquivadas"]) ?? 0;
+
+    ConfigRetencao c = ConfigRetencao {
+        dias_retencao: dias,
+        auto_arquivamento: auto,
+        ultimo_arquivamento: ultimo,
+        total_arquivadas: tot
+    };
+    return k::ok(json_encode(c));
+}
+
+fn _post_config(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    if (has(f, "dias_retencao")) {
+        _config["dias_retencao"] = to_string(form::inteiro(f, "dias_retencao", 30));
+    }
+    if (has(f, "auto_arquivamento")) {
+        string a = form::campo(f, "auto_arquivamento");
+        _config["auto_arquivamento"] = (a == "true" || a == "1" || a == "sim") ? "true" : "false";
+    }
+    db::salvar(_dir, "config_arquivamento", _config);
+    return _get_config();
+}
+
+fn _post_arquivar_op(k::Requisicao r) -> k::Resposta ={
+    int id = parse_int(k::param(r, "id")) ?? 0;
+    map<string,string> f = form::ler(r.corpo);
+    if (id <= 0) { id = form::inteiro(f, "id", 0); }
+    if (id <= 0) { return k::erro(422, "informe o id da OP"); }
+
+    string motivo = form::campo_ou(f, "motivo", "MANUAL");
+    string usuario = form::campo_ou(f, "usuario", r.usuario);
+
+    string erro = arquivar_op(id, motivo, usuario);
+    if (len(erro) > 0) {
+        if (contains(erro, "inexistente")) { return k::erro(404, erro); }
+        return k::erro(409, erro);
+    }
+
+    return k::ok(_ordens_arquivadas[to_string(id)]);
+}
+
+fn _post_arquivar_lote(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    int dias = form::inteiro(f, "dias", -1);
+    if (dias < 0) {
+        dias = parse_int(k::param(r, "dias")) ?? -1;
+    }
+    if (dias < 0) {
+        dias = parse_int(_config["dias_retencao"]) ?? 30;
+    }
+
+    string motivo = form::campo_ou(f, "motivo", "FECHAMENTO_LOTE");
+    string usuario = form::campo_ou(f, "usuario", r.usuario);
+
+    int[] arquivados = arquivar_lote(dias, motivo, usuario);
+
+    string[] s_ids = [];
+    for (int i = 0; i < len(arquivados); i = i + 1) {
+        s_ids = concat(s_ids, [to_string(arquivados[i])]);
+    }
+
+    return k::ok("{\"total_arquivadas\":" + to_string(len(arquivados))
+        + ",\"dias_retencao\":" + to_string(dias)
+        + ",\"ids\":[" + join(s_ids, ",") + "]}");
+}
+
+fn _get_ordens(k::Requisicao r) -> k::Resposta ={
+    string prod = upper(trim(k::param(r, "produto")));
+    string st = upper(trim(k::param(r, "status")));
+    int de = parse_int(k::param(r, "de")) ?? 0;
+    int ate = parse_int(k::param(r, "ate")) ?? 0;
+
+    string[] lista = [];
+    for (string chave in sort(keys(_ordens_arquivadas))) {
+        OrdemArquivada oa = json_decode(_ordens_arquivadas[chave]) as OrdemArquivada;
+        if (len(prod) > 0 && oa.produto != prod) { continue; }
+        if (len(st) > 0 && oa.status != st) { continue; }
+        if (de > 0 && oa.arquivado_em < de) { continue; }
+        if (ate > 0 && oa.arquivado_em > ate) { continue; }
+        lista = concat(lista, [_ordens_arquivadas[chave]]);
+    }
+    return k::ok("[" + join(lista, ",") + "]");
+}
+
+fn _get_ordem(k::Requisicao r) -> k::Resposta ={
+    int id = parse_int(k::param(r, "id")) ?? 0;
+    string s_id = to_string(id);
+    if (!has(_ordens_arquivadas, s_id)) {
+        return k::erro(404, "OP arquivada inexistente");
+    }
+
+    string base = _ordens_arquivadas[s_id];
+    string etapas_json = "[]";
+    if (has(_etapas_arquivadas, s_id)) {
+        etp::Execucao ex = json_decode(_etapas_arquivadas[s_id]) as etp::Execucao;
+        etapas_json = json_encode(ex.etapas);
+    }
+
+    string json_resp = base[0..len(base) - 1] + ",\"etapas\":" + etapas_json + "}";
+    return k::ok(json_resp);
+}
+
+fn _post_desarquivar(k::Requisicao r) -> k::Resposta ={
+    if (r.perfil != "admin" && r.perfil != "pcp") {
+        return k::erro(403, "apenas administradores ou PCP podem desarquivar ordens");
+    }
+    int id = parse_int(k::param(r, "id")) ?? 0;
+    if (id <= 0) {
+        map<string,string> f = form::ler(r.corpo);
+        id = form::inteiro(f, "id", 0);
+    }
+    if (id <= 0) { return k::erro(422, "informe o id da OP"); }
+
+    string err = desarquivar_op(id);
+    if (len(err) > 0) {
+        return k::erro(404, err);
+    }
+
+    return k::ok(json_encode(producao::ordem(id)));
+}
+
+fn _get_resumo() -> k::Resposta ={
+    producao::OrdemProducao[] ativas = producao::todas_ordens();
+    int tot_ativas = len(ativas);
+    int ativas_conc = 0;
+    int ativas_abertas = 0;
+    for (int i = 0; i < len(ativas); i = i + 1) {
+        if (ativas[i].status == "CONCLUIDA" || ativas[i].status == "CANCELADA") {
+            ativas_conc = ativas_conc + 1;
+        } else {
+            ativas_abertas = ativas_abertas + 1;
+        }
+    }
+
+    int tot_arq = len(keys(_ordens_arquivadas));
+    int tot_etps_arq = len(keys(_etapas_arquivadas));
+    int dias = parse_int(_config["dias_retencao"]) ?? 30;
+    int ultimo = parse_int(_config["ultimo_arquivamento"]) ?? 0;
+
+    ResumoArquivamento res = ResumoArquivamento {
+        ativas_total: tot_ativas,
+        ativas_concluidas: ativas_conc,
+        ativas_em_aberto: ativas_abertas,
+        arquivadas_total: tot_arq,
+        etapas_arquivadas_total: tot_etps_arq,
+        dias_retencao: dias,
+        ultimo_arquivamento: ultimo
+    };
+    return k::ok(json_encode(res));
+}
+
+// ── contrato e roteamento ─────────────────────────────────
+
+fn rotear(k::Requisicao r) -> k::Resposta ={
+    if (r.rota == "/config" && r.metodo == "GET") { return _get_config(); }
+    if (r.rota == "/config" && r.metodo == "POST") { return _post_config(r); }
+    if (r.rota == "/op" && r.metodo == "POST") { return _post_arquivar_op(r); }
+    if (r.rota == "/lote" && r.metodo == "POST") { return _post_arquivar_lote(r); }
+    if (r.rota == "/ordens" && r.metodo == "GET") { return _get_ordens(r); }
+    if (r.rota == "/ordem" && r.metodo == "GET") { return _get_ordem(r); }
+    if (r.rota == "/desarquivar" && r.metodo == "POST") { return _post_desarquivar(r); }
+    if (r.rota == "/resumo" && r.metodo == "GET") { return _get_resumo(); }
+    return k::nao_encontrado();
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _ordens_arquivadas = db::carregar(dir, "ordens_arquivadas");
+    _etapas_arquivadas = db::carregar(dir, "etapas_arquivadas");
+    _config = db::carregar(dir, "config_arquivamento");
+    if (!has(_config, "dias_retencao")) {
+        _config["dias_retencao"] = "30";
+        _config["auto_arquivamento"] = "false";
+        _config["ultimo_arquivamento"] = "0";
+        _config["total_arquivadas"] = "0";
+        db::salvar(dir, "config_arquivamento", _config);
+    }
+    return true;
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    if (e.tipo == "op.concluida") {
+        if (_config["auto_arquivamento"] == "true") {
+            int dias = parse_int(_config["dias_retencao"]) ?? 30;
+            if (dias == 0) {
+                map<string,string> d = form::ler(e.corpo);
+                int op_id = form::inteiro(d, "op", 0);
+                if (op_id > 0) {
+                    arquivar_op(op_id, "AUTO_CONCLUSAO", "sistema");
+                }
+            }
+        }
+    }
+    return true;
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "arquivamento",
+        nome: "Arquivamento Histórico e Fechamento de Produção",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/arquivamento",
+        depende: ["cadastros", "roteiros", "producao", "custos"],
+        assina: ["op.concluida"],
+        perfis_escrita: ["admin", "pcp"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}
