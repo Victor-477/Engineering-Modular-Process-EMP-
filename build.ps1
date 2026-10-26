@@ -46,12 +46,20 @@ Write-Host "== nucleo -> build\emp.exe"
 python $pyro build src/main.cryo -o build/emp.exe
 if ($LASTEXITCODE -ne 0) { throw "build do nucleo falhou" }
 
+Write-Host "== landing page -> build\landing.exe"
+python $pyro build src/landing.cryo -o build/landing.exe
+if ($LASTEXITCODE -ne 0) { throw "build da landing page falhou" }
+
 Get-ChildItem "$emp\plugins_src" -Directory | ForEach-Object {
     $nome = $_.Name
     Write-Host "== plugin $nome -> build\$nome.exe"
     python $pyro build "plugins_src/$nome/$nome.cryo" -o "build/$nome.exe"
     if ($LASTEXITCODE -ne 0) { throw "build do plugin $nome falhou" }
 }
+
+Write-Host "== teste HTTP da landing page (tests/test_landing_http.py)"
+python tests/test_landing_http.py
+if ($LASTEXITCODE -ne 0) { throw "teste da landing page falhou" }
 
 Remove-Item -Force -ErrorAction SilentlyContinue "$emp\build\testes.pyro"
 Get-ChildItem "$emp\build\*.exe" | Select-Object Name, Length

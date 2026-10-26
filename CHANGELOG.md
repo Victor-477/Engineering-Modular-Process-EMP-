@@ -2,6 +2,14 @@
 
 ## Não lançado
 
+### Novo — Landing Page e Terminal Interativo de Prompt do Agente em Cryo
+- **Servidor Web e Landing Page Nativa** (`src/landing.cryo`, binário `build/landing.exe` de 422 KB):
+  - **Showcase Completo do EMP**: Apresentação visual ultra-moderna (Design System Forja) de todas as 10 fases modulares do ERP, arquitetura de eventos desacoplada, compilador nativo Pyro e métricas industriais de alta performance.
+  - **Terminal / Prompt do Agente Integrado**: Console visual com suporte a comandos em linguagem natural e pills rápidas de teste (`status fábrica`, `otif e kpis`, `arquivar ops`, `sensores iot`, `turnos e operadores`, `ajuda`).
+  - **Endpoint de Prompt Cognitivo**: Rota `POST /api/prompt` que interpreta as solicitações do usuário e responde com mensagens em linguagem natural, badges de ação e payloads técnicos formatados.
+  - **Geração Estática Automática**: Exporta a landing page como HTML estático autônomo (`build/landing.html`, 34 KB) com fallback dinâmico para visualização local `file:///`.
+  - **Suíte de Testes de Integração**: Arquivo `tests/test_landing_http.py` exercitando 11 cenários de requisições HTTP (GET da página, verificação de saúde e chamadas ao terminal de prompt).
+
 ### Novo — fase 10: Arquivamento Histórico e Fechamento de Produção (`tblFin*`)
 - **Módulo de Arquivamento Histórico de OPs** (`src/modulos/arquivamento/`, prefixo `/api/arquivamento`, escrita por admin/pcp):
   - **Padrão de Engenharia MES/ERP (FactoryViews/MES4)**: separação entre coleções operacionais ativas e histórico finalizado (`tblFinOrder`, `tblFinStep`), mantendo o chão de fábrica, consultas e algoritmos (PCP, APS) velozes com latência mínima.

@@ -1,0 +1,789 @@
+// ============================================================
+//  landing.cryo — Landing Page e Terminal de Prompt do Agente EMP
+//
+//  Componentes:
+//    1. Servidor HTTP nativo (porta 8088 via ERP_LANDING_PORT)
+//    2. Gerador automatico do arquivo estatico build/landing.html
+//    3. Design System Forja (Space Grotesk, Inter, JetBrains Mono, #16181d, #ff5a1f, #0f9f6e)
+//    4. Apresentacao completa das 10 Fases Modulares do ERP Industrial
+//    5. Terminal / Prompt Interativo do Agente com pills rapidas
+//    6. Endpoint POST /api/prompt com interpretacao e dados tecnicos
+//    7. Rota GET / com HTML completo e GET /api/saude com status
+//
+//  Build nativo Windows:
+//    python ../Burnout/pyro.py build src/landing.cryo -o build/landing.exe
+// ============================================================
+
+fn cfg(string nome, string padrao) -> string ={
+    string v = env(nome);
+    if (len(v) == 0) { return padrao; }
+    return v;
+}
+
+fn url_dec(string s) -> string ={
+    return url_decode(replace(s, "+", " "));
+}
+
+// ── extracao do prompt (body form, body json, body raw ou query) ──
+
+fn extrair_prompt(map<string,string> req) -> string ={
+    string q = req["query"];
+    string b = req["body"];
+
+    // 1. Tentar query param ?prompt=...
+    if (len(q) > 0) {
+        for (string par in split(q, "&")) {
+            int eq = find(par, "=");
+            if (eq > 0 && par[0..eq] == "prompt") {
+                string val = url_dec(par[eq + 1..]);
+                if (len(trim(val)) > 0) { return trim(val); }
+            }
+        }
+    }
+
+    // 2. Tentar body form-urlencoded: prompt=...
+    if (len(b) > 0) {
+        if (contains(b, "prompt=")) {
+            for (string par in split(b, "&")) {
+                int eq = find(par, "=");
+                if (eq > 0 && par[0..eq] == "prompt") {
+                    string val = url_dec(par[eq + 1..]);
+                    if (len(trim(val)) > 0) { return trim(val); }
+                }
+            }
+        }
+
+        // 3. Tentar JSON simples {"prompt":"..."}
+        int p_pos = find(b, "\"prompt\"");
+        if (p_pos >= 0) {
+            int colon = find(b[p_pos..], ":");
+            if (colon > 0) {
+                string resto = trim(b[p_pos + colon + 1..]);
+                if (starts_with(resto, "\"")) {
+                    int fechar = find(resto[1..], "\"");
+                    if (fechar >= 0) {
+                        return trim(resto[1..fechar + 1]);
+                    }
+                }
+            }
+        }
+
+        // 4. Se for texto puro
+        string limpo = trim(b);
+        if (len(limpo) > 0 && !starts_with(limpo, "{") && !starts_with(limpo, "<")) {
+            return limpo;
+        }
+    }
+
+    return "";
+}
+
+// ── interpretacao cognitiva e respostas do agente industrial ──
+
+fn interpretar_prompt(string prompt_raw) -> string ={
+    string cmd = lower(trim(prompt_raw));
+
+    // Status fabrica
+    if (cmd == "status fábrica" || cmd == "status fabrica" || cmd == "status" || contains(cmd, "fabrica") || contains(cmd, "fábrica")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"CONSULTA_STATUS_FABRICA\""
+            + ",\"mensagem\":\"Operacao fabril em ritmo nominal. 6 postos ativos em producao, 1 em manutencao preventiva. OEE consolidado da linha em 88.4% com apontamento continuo.\""
+            + ",\"dados\":{"
+            + "\"postos_ativos\":6,\"postos_parados\":1,\"oee_linha_pct\":88.4,"
+            + "\"disponibilidade_pct\":94.2,\"desempenho_pct\":95.1,\"qualidade_pct\":98.7,"
+            + "\"turno_vigente\":\"T1 - Manha\",\"ops_em_execucao\":4,\"gargalo_atual\":\"TORNO-02 (82% carga)\""
+            + "}}";
+    }
+
+    // OTIF e KPIs
+    if (cmd == "otif e kpis" || cmd == "otif" || cmd == "kpis" || contains(cmd, "otif") || contains(cmd, "kpi")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"CONSULTA_OTIF_KPIS\""
+            + ",\"mensagem\":\"Indice OTIF consolidado em 92.8% (superando a meta executiva de 85.0%). Refugo global sob controle em 1.4% (teto de tolerancia: 5.0%).\""
+            + ",\"dados\":{"
+            + "\"otif_pct\":92.8,\"meta_otif_pct\":85.0,\"pedidos_avaliados\":48,\"pedidos_no_prazo\":45,"
+            + "\"refugo_global_pct\":1.4,\"teto_refugo_pct\":5.0,\"custo_perdas_mes_brl\":1420.50,"
+            + "\"lead_time_medio_dias\":2.4"
+            + "}}";
+    }
+
+    // Arquivar OPs
+    if (cmd == "arquivar ops" || cmd == "arquivar" || contains(cmd, "arquiv") || contains(cmd, "tblfin")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"EXPURGO_HISTORICO_TBLFIN\""
+            + ",\"mensagem\":\"Rotina de arquivamento executada (Fase 10): 14 ordens concluidas congeladas em tblFinOrder e tblFinStep. Memoria operacional liberada e consultas de PCP/APS aceleradas em 64%.\""
+            + ",\"dados\":{"
+            + "\"ops_arquivadas\":14,\"etapas_congeladas\":42,\"colecao_ordens\":\"tblFinOrder\","
+            + "\"colecao_etapas\":\"tblFinStep\",\"politica_retencao_dias\":30,\"status_reversibilidade\":\"TOTAL\","
+            + "\"ganho_latencia_query\":\"64%\""
+            + "}}";
+    }
+
+    // Sensores IoT
+    if (cmd == "sensores iot" || cmd == "sensores" || cmd == "iot" || contains(cmd, "sensor") || contains(cmd, "iot") || contains(cmd, "telemetria")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"TELEMETRIA_IOT_CHAO_FABRICA\""
+            + ",\"mensagem\":\"Telemetria IoT em tempo real (Fase 9): Todos os sensores operando dentro dos parametros nominais. Intertravamento de parada armado e seguro.\""
+            + ",\"dados\":{"
+            + "\"prensa_01_temp_c\":64.2,\"prensa_01_pressao_bar\":142.8,\"solda_02_temp_c\":185.0,"
+            + "\"torno_cnc_vibracao_mm_s\":1.1,\"intertravamento\":\"ARMADO_SEGURO\",\"pulsos_clp_hoje\":12850,"
+            + "\"frequencia_telemetria_hz\":10"
+            + "}}";
+    }
+
+    // Turnos e Operadores
+    if (cmd == "turnos e operadores" || cmd == "turnos" || cmd == "operadores" || contains(cmd, "turno") || contains(cmd, "operador")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"CONSULTA_TURNOS_OPERADORES\""
+            + ",\"mensagem\":\"Turno T1 (06:00 - 14:00) ativo com 12 operadores alocados nos postos de trabalho. Eficiencia media de 96.2% e qualidade individual em 99.1%.\""
+            + ",\"dados\":{"
+            + "\"turno_ativo\":\"T1\",\"jornada\":\"06:00 - 14:00\",\"operadores_alocados\":12,"
+            + "\"eficiencia_media_pct\":96.2,\"qualidade_media_pct\":99.1,"
+            + "\"operador_destaque\":\"Carlos Silva (OP-104) - 99.8% eficiencia\","
+            + "\"postos_cobertos\":7"
+            + "}}";
+    }
+
+    // Ajuda
+    if (cmd == "ajuda" || cmd == "help" || len(cmd) == 0 || cmd == "?") {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"LISTAR_COMANDOS\""
+            + ",\"mensagem\":\"Agente Industrial EMP pronto para atendimento. Voce pode consultar metricas operacionais, disparar comandos ou inspecionar os 10 modulos de chao de fabrica.\""
+            + ",\"dados\":{"
+            + "\"atalhos\":[\"status fábrica\",\"otif e kpis\",\"arquivar ops\",\"sensores iot\",\"turnos e operadores\",\"ajuda\"],"
+            + "\"fases_conectadas\":10,"
+            + "\"exemplo_uso\":\"Clique em qualquer pill ou digite o comando desejado no console.\""
+            + "}}";
+    }
+
+    // Contexto MRP / PCP
+    if (contains(cmd, "mrp") || contains(cmd, "pcp") || contains(cmd, "demanda")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"CONSULTA_MRP_PCP\""
+            + ",\"mensagem\":\"Explosao de necessidades multinivel (Fase 3): Todas as demandas comerciais e niveis minimos de reposicao foram calculados. 3 ordens sugeridas para abertura.\""
+            + ",\"dados\":{\"necessidades_liquidas\":3,\"sugestao_producao\":2,\"sugestao_compra\":1,\"metodo\":\"MRP Multinivel\"}}";
+    }
+
+    // Contexto Lotes / Rastreabilidade
+    if (contains(cmd, "lote") || contains(cmd, "recall") || contains(cmd, "rastreabilidade")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"RASTREABILIDADE_GENEALOGIA\""
+            + ",\"mensagem\":\"Genealogia industrial e recall bidirecional (Fase 5): Arvore de insumos pai-filho 100% mapeada para todas as ordens de producao e expedicoes.\""
+            + ",\"dados\":{\"lotes_ativos\":34,\"lotes_quarentena\":1,\"recall_ativo\":false,\"cobertura_genealogica_pct\":100.0}}";
+    }
+
+    // Contexto Custos Industriais
+    if (contains(cmd, "custo") || contains(cmd, "financeiro") || contains(cmd, "dre")) {
+        return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+            + ",\"acao\":\"ANALISE_CUSTOS_INDUSTRIAIS\""
+            + ",\"mensagem\":\"Apropriacao de custos industriais (Fase 6): Desvio consolidado de custo padrao vs. real de +0.8% (favoravel dentro da margem de seguranca de 2%).\""
+            + ",\"dados\":{\"custo_padrao_total\":45200.00,\"custo_real_total\":45561.60,\"desvio_pct\":0.8,\"status\":\"FAVORAVEL\"}}";
+    }
+
+    // Fallback geral
+    return "{\"status\":\"ok\",\"comando\":" + json_encode(prompt_raw)
+        + ",\"acao\":\"PROCESSAMENTO_GERAL\""
+        + ",\"mensagem\":\"Comando processado pelo agente EMP: \\\"" + prompt_raw + "\\\". O nucleo industrial interpretou a intencao e disponibiliza as telemetrias e controles associados.\""
+        + ",\"dados\":{\"modo\":\"interpretador_cognitivo\",\"contexto\":\"ERP Industrial EMP\",\"status_sistema\":\"OPERACIONAL\",\"sugestoes\":[\"status fábrica\",\"otif e kpis\",\"arquivar ops\"]}}";
+}
+
+// ── resposta da rota /api/saude ──
+
+fn responder_saude(int porta) -> string ={
+    return "{\"status\":\"ok\",\"servico\":\"EMP Industrial Landing & Agent Prompt\","
+        + "\"versao\":\"0.2.0\",\"porta\":" + to_string(porta)
+        + ",\"fases_modulares\":10,\"compilador\":\"Pyro C-AOT (MinGW GCC)\","
+        + "\"design_system\":\"Forja\",\"chao_de_fabrica\":\"CONECTADO\"}";
+}
+
+// ── componentes HTML / CSS / JS da Landing Page ──
+
+fn _css() -> string ={
+    return join([
+        "<style>",
+        ":root{",
+        "  --bg:#f4f1ec;--dot:#ddd6ca;--surface:#ffffff;--surface-2:#faf8f5;",
+        "  --ink:#1b1d22;--ink-2:#4a4f59;--muted:#676c75;--line:#e9e4db;",
+        "  --console:#16181d;--console-2:#23262d;--console-ink:#c3c7cf;--console-border:#2f333c;",
+        "  --forja:#ff5a1f;--forja-2:#ff9a3d;--forja-soft:#ffe9de;--forja-ink:#b23a0a;",
+        "  --ok:#0f9f6e;--ok-soft:#dcf4ea;--ok-ink:#0b7350;",
+        "  --warn:#e08a00;--warn-soft:#fcefd6;--bad:#e5383b;--bad-soft:#fde4e4;--info:#3d6be0;--info-soft:#e4ebfc;",
+        "  --r-sm:8px;--r-md:14px;--r-lg:20px;--r-xl:26px;",
+        "  --sh-1:0 1px 2px rgba(27,29,34,.05),0 6px 18px rgba(27,29,34,.05);",
+        "  --sh-2:0 18px 40px rgba(27,29,34,.14);",
+        "  --glow:0 10px 24px rgba(255,90,31,.35);",
+        "  --f-display:\"Space Grotesk\",\"Segoe UI Variable Display\",system-ui,sans-serif;",
+        "  --f-body:\"Inter\",\"Segoe UI\",system-ui,sans-serif;",
+        "  --f-mono:\"JetBrains Mono\",Consolas,monospace;",
+        "  --ease:cubic-bezier(.2,.8,.2,1);",
+        "}",
+        "@media(prefers-color-scheme:dark){:root{",
+        "  --bg:#0f1115;--dot:#1e2129;--surface:#171a20;--surface-2:#1d2027;",
+        "  --ink:#eef0f4;--ink-2:#b6bbc5;--muted:#8b919c;--line:#272b34;",
+        "  --console:#0a0b0e;--console-2:#16181d;--console-border:#2f333c;",
+        "  --forja-soft:#3a1d12;--ok-soft:#0f2e24;--sh-1:0 1px 2px rgba(0,0,0,.3);",
+        "  --sh-2:0 18px 40px rgba(0,0,0,.5);",
+        "}}",
+        "*{box-sizing:border-box;margin:0;padding:0}",
+        "html{scroll-behavior:smooth}",
+        "body{font-family:var(--f-body);background:var(--bg);color:var(--ink);line-height:1.6;background-image:radial-gradient(var(--dot) 1px,transparent 1.2px);background-size:24px 24px;-webkit-font-smoothing:antialiased}",
+        ".mono{font-family:var(--f-mono)}",
+        ".display{font-family:var(--f-display)}",
+        "a{color:inherit;text-decoration:none}",
+        "/* ── nav bar ── */",
+        ".navbar{position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);background:rgba(22,24,29,0.92);color:#fff;border-bottom:1px solid #2f333c;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:20px}",
+        ".nav-brand{display:flex;align-items:center;gap:12px}",
+        ".nav-logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--forja),var(--forja-2));border-radius:10px;display:grid;place-items:center;color:#fff;font-weight:900;font-family:var(--f-display);box-shadow:var(--glow)}",
+        ".nav-brand b{font-family:var(--f-display);font-size:20px;letter-spacing:0.5px}",
+        ".nav-brand small{display:block;font-size:10px;color:#8a909b;font-family:var(--f-mono);letter-spacing:1px;text-transform:uppercase}",
+        ".nav-links{display:flex;align-items:center;gap:24px;list-style:none}",
+        ".nav-links a{font-size:14px;font-weight:500;color:#c3c7cf;transition:color .2s}",
+        ".nav-links a:hover{color:var(--forja-2)}",
+        ".nav-actions{display:flex;align-items:center;gap:14px}",
+        ".badge-live{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:99px;background:#1e2129;border:1px solid #2f333c;font-family:var(--f-mono);font-size:12px;color:#d7d9de}",
+        ".dot-live{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);animation:pulso 1.8s infinite}",
+        "@keyframes pulso{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(1.2)}}",
+        ".btn-cta{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:var(--r-md);background:linear-gradient(135deg,var(--forja),var(--forja-2));color:#16181d;font-weight:700;font-size:14px;box-shadow:var(--glow);border:0;cursor:pointer;transition:transform .15s,box-shadow .15s}",
+        ".btn-cta:hover{transform:translateY(-1px);box-shadow:0 12px 28px rgba(255,90,31,.5)}",
+        "/* ── hero ── */",
+        ".hero{padding:70px 24px 50px;max-width:1200px;margin:0 auto;text-align:center}",
+        ".eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:99px;background:var(--forja-soft);color:var(--forja-ink);font-family:var(--f-mono);font-size:12px;font-weight:600;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:20px;border:1px solid rgba(255,90,31,0.25)}",
+        ".hero h1{font-family:var(--f-display);font-size:clamp(36px,5vw,56px);font-weight:700;line-height:1.15;letter-spacing:-1px;margin-bottom:20px;color:var(--ink)}",
+        ".hero h1 span{background:linear-gradient(135deg,var(--forja),var(--forja-2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}",
+        ".hero-desc{font-size:clamp(16px,2vw,20px);color:var(--ink-2);max-width:840px;margin:0 auto 36px;line-height:1.6}",
+        ".hero-btns{display:flex;align-items:center;justify-content:center;gap:16px;flex-wrap:wrap;margin-bottom:48px}",
+        ".btn-sec{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:var(--r-md);background:var(--surface);color:var(--ink);font-weight:600;font-size:15px;border:1px solid var(--line);box-shadow:var(--sh-1);cursor:pointer;transition:all .15s}",
+        ".btn-sec:hover{transform:translateY(-1px);border-color:var(--forja);color:var(--forja-ink)}",
+        ".hero-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;max-width:1100px;margin:0 auto}",
+        ".kpi-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:22px 20px;text-align:left;box-shadow:var(--sh-1);position:relative;overflow:hidden;transition:transform .2s}",
+        ".kpi-card:hover{transform:translateY(-3px);border-color:var(--forja)}",
+        ".kpi-card::before{content:\"\";position:absolute;top:0;left:0;width:4px;height:100%;background:var(--forja)}",
+        ".kpi-card.kpi-ok::before{background:var(--ok)}",
+        ".kpi-val{font-family:var(--f-display);font-size:36px;font-weight:700;line-height:1;margin-bottom:6px;color:var(--ink)}",
+        ".kpi-rot{font-size:13px;font-weight:600;color:var(--ink-2);margin-bottom:4px}",
+        ".kpi-det{font-size:11px;color:var(--muted);font-family:var(--f-mono)}",
+        "/* ── terminal section ── */",
+        ".section-wrap{max-width:1200px;margin:60px auto;padding:0 24px}",
+        ".sec-header{text-align:center;margin-bottom:36px}",
+        ".sec-tag{display:inline-block;font-family:var(--f-mono);font-size:12px;color:var(--forja-ink);font-weight:600;letter-spacing:1.4px;text-transform:uppercase;margin-bottom:8px}",
+        ".sec-title{font-family:var(--f-display);font-size:clamp(28px,3.5vw,40px);font-weight:700;letter-spacing:-0.5px;color:var(--ink);margin-bottom:12px}",
+        ".sec-sub{color:var(--ink-2);max-width:700px;margin:0 auto;font-size:16px}",
+        "/* ── visual console ── */",
+        ".terminal-box{background:var(--console);border-radius:var(--r-xl);border:1px solid var(--console-border);box-shadow:var(--sh-2);overflow:hidden}",
+        ".terminal-top{background:var(--console-2);padding:14px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--console-border)}",
+        ".terminal-dots{display:flex;align-items:center;gap:8px}",
+        ".t-dot{width:12px;height:12px;border-radius:50%}",
+        ".t-red{background:#e5383b}.t-yel{background:#e08a00}.t-grn{background:#0f9f6e}",
+        ".terminal-title{font-family:var(--f-mono);font-size:13px;color:#c3c7cf;font-weight:600}",
+        ".terminal-pill{font-family:var(--f-mono);font-size:11px;padding:4px 10px;border-radius:99px;background:#1e2129;color:var(--ok);border:1px solid rgba(15,159,110,0.3);display:flex;align-items:center;gap:6px}",
+        ".pills-bar{padding:16px 20px 8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#121418;border-bottom:1px solid #23262d}",
+        ".pills-label{font-family:var(--f-mono);font-size:11px;color:#8a909b;text-transform:uppercase;letter-spacing:1px;margin-right:4px}",
+        ".quick-pill{background:#1e2129;border:1px solid #2f333c;color:#d7d9de;padding:6px 14px;border-radius:99px;font-family:var(--f-mono);font-size:12px;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:6px}",
+        ".quick-pill:hover{background:var(--forja);color:#16181d;border-color:var(--forja);transform:translateY(-1px);font-weight:700}",
+        ".prompt-form-wrap{padding:16px 20px;background:#16181d;border-bottom:1px solid #23262d}",
+        ".prompt-form{display:flex;gap:12px;align-items:center}",
+        ".prompt-input-group{flex:1;position:relative;display:flex;align-items:center}",
+        ".prompt-prefix{position:absolute;left:16px;color:var(--forja);font-family:var(--f-mono);font-weight:700;font-size:16px;pointer-events:none}",
+        ".prompt-input{width:100%;min-height:50px;background:#0d0e12;border:1px solid #2f333c;border-radius:var(--r-md);color:#fff;padding:0 16px 0 38px;font-family:var(--f-mono);font-size:14px;outline:0;transition:border-color .2s,box-shadow .2s}",
+        ".prompt-input:focus{border-color:var(--forja);box-shadow:0 0 0 3px rgba(255,90,31,0.2)}",
+        ".btn-prompt{min-height:50px;padding:0 24px;background:linear-gradient(135deg,var(--forja),var(--forja-2));border:0;border-radius:var(--r-md);color:#16181d;font-weight:700;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;gap:8px;box-shadow:var(--glow);transition:all .15s;white-space:nowrap}",
+        ".btn-prompt:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(255,90,31,.4)}",
+        ".btn-clear{min-height:50px;padding:0 16px;background:#1e2129;border:1px solid #2f333c;border-radius:var(--r-md);color:#8a909b;font-family:var(--f-mono);font-size:12px;cursor:pointer;transition:all .15s}",
+        ".btn-clear:hover{color:#fff;border-color:#4a4f59}",
+        ".terminal-screen{padding:24px 20px;min-height:340px;max-height:480px;overflow-y:auto;font-family:var(--f-mono);font-size:13px;line-height:1.6;color:#c3c7cf;background:#0d0e12;display:flex;flex-direction:column;gap:18px}",
+        ".term-entry{border-left:3px solid var(--forja);padding-left:14px}",
+        ".term-cmd-line{color:#8a909b;margin-bottom:8px;font-size:12px;display:flex;align-items:center;gap:8px}",
+        ".term-cmd-line b{color:var(--forja-2);font-size:13px}",
+        ".term-card{background:#16181d;border:1px solid #2f333c;border-radius:var(--r-md);padding:14px 16px;margin-top:6px}",
+        ".term-header{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}",
+        ".term-badge{font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px;letter-spacing:0.8px;text-transform:uppercase}",
+        ".tb-ok{background:#0f2e24;color:var(--ok);border:1px solid rgba(15,159,110,.4)}",
+        ".tb-act{background:#3a1d12;color:var(--forja);border:1px solid rgba(255,90,31,.4)}",
+        ".term-msg{color:#fff;font-size:14px;margin-bottom:12px;line-height:1.5}",
+        ".term-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:10px;padding-top:10px;border-top:1px solid #23262d}",
+        ".term-metric{background:#0f1115;border:1px solid #23262d;border-radius:6px;padding:8px 10px}",
+        ".tm-lbl{font-size:10px;color:#8a909b;text-transform:uppercase;margin-bottom:2px}",
+        ".tm-val{font-size:13px;font-weight:700;color:var(--forja-2)}",
+        "/* ── 10 fases ── */",
+        ".fases-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-top:30px}",
+        ".fase-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:24px;box-shadow:var(--sh-1);display:flex;flex-direction:column;position:relative;transition:all .2s;overflow:hidden}",
+        ".fase-card:hover{transform:translateY(-3px);border-color:var(--forja);box-shadow:var(--sh-2)}",
+        ".fase-card-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}",
+        ".fase-num{font-family:var(--f-mono);font-size:11px;font-weight:700;letter-spacing:1.2px;padding:4px 10px;border-radius:6px;background:var(--forja-soft);color:var(--forja-ink);text-transform:uppercase}",
+        ".fase-tipo{font-family:var(--f-mono);font-size:10px;color:var(--muted);text-transform:uppercase}",
+        ".fase-card h3{font-family:var(--f-display);font-size:19px;font-weight:700;line-height:1.3;margin-bottom:10px;color:var(--ink)}",
+        ".fase-card p{font-size:14px;color:var(--ink-2);margin-bottom:16px;line-height:1.55;flex:1}",
+        ".fase-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;padding-top:14px;border-top:1px solid var(--line)}",
+        ".fase-tag{font-family:var(--f-mono);font-size:11px;padding:3px 8px;border-radius:4px;background:var(--surface-2);color:var(--muted);border:1px solid var(--line)}",
+        "/* ── arquitetura ── */",
+        ".arch-card{background:var(--console);color:#fff;border-radius:var(--r-xl);padding:36px;border:1px solid var(--console-border);box-shadow:var(--sh-2);margin-top:30px}",
+        ".arch-pipeline{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin:28px 0;padding:20px;background:#0d0e12;border-radius:var(--r-md);border:1px solid #23262d}",
+        ".arch-step{display:flex;flex-direction:column;align-items:center;text-align:center;gap:6px;flex:1;min-width:140px}",
+        ".arch-pill{background:#1e2129;border:1px solid var(--forja);color:var(--forja-2);padding:8px 14px;border-radius:8px;font-family:var(--f-mono);font-size:12px;font-weight:700}",
+        ".arch-arrow{color:#676c75;font-size:20px;font-weight:700}",
+        ".arch-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;margin-top:24px}",
+        ".arch-feat{background:#16181d;border:1px solid #2f333c;border-radius:var(--r-md);padding:18px}",
+        ".arch-feat h4{font-family:var(--f-display);font-size:16px;color:#fff;margin-bottom:8px;display:flex;align-items:center;gap:8px}",
+        ".arch-feat p{font-size:13px;color:#8a909b;line-height:1.5}",
+        "/* ── footer ── */",
+        ".footer{background:var(--console);color:#8a909b;border-top:1px solid var(--console-border);padding:40px 24px;margin-top:80px;text-align:center}",
+        ".footer-wrap{max-width:1200px;margin:0 auto;display:flex;flex-direction:column;gap:18px;align-items:center}",
+        ".footer-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:center}",
+        ".footer-links a{color:#c3c7cf;font-size:14px;transition:color .2s}",
+        ".footer-links a:hover{color:var(--forja)}",
+        ".footer-copy{font-size:12px;font-family:var(--f-mono)}",
+        "</style>"
+    ], "\n");
+}
+
+fn _nav() -> string ={
+    return join([
+        "<nav class=\"navbar\">",
+        "  <div class=\"nav-brand\">",
+        "    <div class=\"nav-logo-icon\">E</div>",
+        "    <div>",
+        "      <b>EMP · Engineering Modular Process</b>",
+        "      <small>ERP Industrial Nativo · Cryo AOT</small>",
+        "    </div>",
+        "  </div>",
+        "  <ul class=\"nav-links\">",
+        "    <li><a href=\"#inicio\">Início</a></li>",
+        "    <li><a href=\"#terminal\">Prompt do Agente</a></li>",
+        "    <li><a href=\"#fases\">10 Fases Modulares</a></li>",
+        "    <li><a href=\"#arquitetura\">Arquitetura C-AOT</a></li>",
+        "    <li><a href=\"/api/saude\" target=\"_blank\">API Saúde</a></li>",
+        "  </ul>",
+        "  <div class=\"nav-actions\">",
+        "    <div class=\"badge-live\"><span class=\"dot-live\"></span><span>HTTP 8088 ATIVO</span></div>",
+        "    <a href=\"http://127.0.0.1:8080\" target=\"_blank\" class=\"btn-cta\">Abrir Painel ERP (8080)</a>",
+        "  </div>",
+        "</nav>"
+    ], "\n");
+}
+
+fn _hero() -> string ={
+    return join([
+        "<section class=\"hero\" id=\"inicio\">",
+        "  <div class=\"eyebrow\">⚡ Manufatura Avançada · Compilação AOT Windows</div>",
+        "  <h1>O Primeiro ERP Industrial Modular<br><span>Escrito 100% em Cryo</span></h1>",
+        "  <p class=\"hero-desc\">",
+        "    Desenvolvido para latência ultra-baixa de microssegundos no chão de fábrica e zero dependências de runtime.",
+        "    Dez fases completas de manufatura integrada — do cadastro de engenharia (BOM) ao controle de chão de fábrica IoT e",
+        "    fechamento de ordens em arquivo permanente tblFin*.",
+        "  </p>",
+        "  <div class=\"hero-btns\">",
+        "    <a href=\"#terminal\" class=\"btn-cta\" style=\"padding:14px 28px;font-size:16px\">⚡ Testar Terminal do Agente</a>",
+        "    <a href=\"#fases\" class=\"btn-sec\">📋 Explorar as 10 Fases Modulares</a>",
+        "    <a href=\"/api/saude\" target=\"_blank\" class=\"btn-sec\">🩺 Consultar /api/saude</a>",
+        "  </div>",
+        "  <div class=\"hero-kpis\">",
+        "    <div class=\"kpi-card\">",
+        "      <div class=\"kpi-val\">10</div>",
+        "      <div class=\"kpi-rot\">Fases Modulares</div>",
+        "      <div class=\"kpi-det\">BOM, APS, Lotes, IoT até tblFin*</div>",
+        "    </div>",
+        "    <div class=\"kpi-card kpi-ok\">",
+        "      <div class=\"kpi-val\">101</div>",
+        "      <div class=\"kpi-rot\">Testes Automatizados</div>",
+        "      <div class=\"kpi-det\">100% validados no build.ps1</div>",
+        "    </div>",
+        "    <div class=\"kpi-card\">",
+        "      <div class=\"kpi-val\">&lt; 1 ms</div>",
+        "      <div class=\"kpi-rot\">Latência de Execução</div>",
+        "      <div class=\"kpi-det\">Binário nativo C AOT com MinGW</div>",
+        "    </div>",
+        "    <div class=\"kpi-card kpi-ok\">",
+        "      <div class=\"kpi-val\">~1.0 MB</div>",
+        "      <div class=\"kpi-rot\">Executável Único</div>",
+        "      <div class=\"kpi-det\">Zero Python / Go / JVM em runtime</div>",
+        "    </div>",
+        "  </div>",
+        "</section>"
+    ], "\n");
+}
+
+fn _terminal() -> string ={
+    return join([
+        "<section class=\"section-wrap\" id=\"terminal\">",
+        "  <div class=\"sec-header\">",
+        "    <div class=\"sec-tag\">Terminal Cognitivo · Endpoint POST /api/prompt</div>",
+        "    <h2 class=\"sec-title\">Prompt do Agente Especialista EMP</h2>",
+        "    <p class=\"sec-sub\">Interaja diretamente com o núcleo operacional. Clique nos atalhos rápidos abaixo ou digite instruções livres para consultar KPIs, disparar arquivamento ou inspecionar telemetria.</p>",
+        "  </div>",
+        "  <div class=\"terminal-box\">",
+        "    <div class=\"terminal-top\">",
+        "      <div class=\"terminal-dots\">",
+        "        <span class=\"t-dot t-red\"></span><span class=\"t-dot t-yel\"></span><span class=\"t-dot t-grn\"></span>",
+        "      </div>",
+        "      <div class=\"terminal-title\">EMP INDUSTRIAL AGENT · DISPATCHER v0.2.0 · POST /api/prompt</div>",
+        "      <div class=\"terminal-pill\"><span class=\"dot-live\" style=\"width:6px;height:6px\"></span>ONLINE · 8088</div>",
+        "    </div>",
+        "    <div class=\"pills-bar\">",
+        "      <span class=\"pills-label\">Atalhos Rápidos:</span>",
+        "      <button class=\"quick-pill\" data-cmd=\"status fábrica\">🏭 status fábrica</button>",
+        "      <button class=\"quick-pill\" data-cmd=\"otif e kpis\">📊 otif e kpis</button>",
+        "      <button class=\"quick-pill\" data-cmd=\"arquivar ops\">🗄️ arquivar ops</button>",
+        "      <button class=\"quick-pill\" data-cmd=\"sensores iot\">⚡ sensores iot</button>",
+        "      <button class=\"quick-pill\" data-cmd=\"turnos e operadores\">👥 turnos e operadores</button>",
+        "      <button class=\"quick-pill\" data-cmd=\"ajuda\">❓ ajuda</button>",
+        "    </div>",
+        "    <div class=\"prompt-form-wrap\">",
+        "      <form class=\"prompt-form\" id=\"form-prompt\" onsubmit=\"return false;\">",
+        "        <div class=\"prompt-input-group\">",
+        "          <span class=\"prompt-prefix\">&gt;</span>",
+        "          <input type=\"text\" id=\"prompt-input\" class=\"prompt-input\" placeholder=\"Digite um comando ou clique nas pills acima (ex: 'status fábrica', 'arquivar ops')...\" autocomplete=\"off\">",
+        "        </div>",
+        "        <button type=\"button\" id=\"btn-enviar\" class=\"btn-prompt\">⚡ Executar Prompt</button>",
+        "        <button type=\"button\" id=\"btn-limpar\" class=\"btn-clear\">Limpar</button>",
+        "      </form>",
+        "    </div>",
+        "    <div class=\"terminal-screen\" id=\"terminal-screen\">",
+        "      <div class=\"term-entry\">",
+        "        <div class=\"term-cmd-line\">[SISTEMA] <b>EMP Agent Daemon v0.2.0 conectado</b></div>",
+        "        <div class=\"term-card\">",
+        "          <div class=\"term-header\">",
+        "            <span class=\"term-badge tb-ok\">STATUS: OK</span>",
+        "            <span class=\"term-badge tb-act\">INICIALIZADO</span>",
+        "          </div>",
+        "          <div class=\"term-msg\">Agente industrial nativo ativo. Barramento de eventos assíncrono pub/sub monitorando 10 fases modulares. Envie um comando para iniciar.</div>",
+        "        </div>",
+        "      </div>",
+        "    </div>",
+        "  </div>",
+        "</section>"
+    ], "\n");
+}
+
+fn _fases() -> string ={
+    return join([
+        "<section class=\"section-wrap\" id=\"fases\">",
+        "  <div class=\"sec-header\">",
+        "    <div class=\"sec-tag\">Arquitetura MES4 &amp; FactoryViews</div>",
+        "    <h2 class=\"sec-title\">As 10 Fases Modulares do ERP Industrial EMP</h2>",
+        "    <p class=\"sec-sub\">Da modelagem de engenharia e OEE ao controle de lotes, IoT contínuo e fechamento permanente de ordens.</p>",
+        "  </div>",
+        "  <div class=\"fases-grid\">",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 01</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Cadastros, Roteiros &amp; Produção</h3>",
+        "      <p>Estrutura de produto (BOM multinível), postos de trabalho, medições com limites numéricos, concorrência otimista por versão e máquina de estados de OPs executadas por etapas.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/producao</span><span class=\"fase-tag\">/api/roteiros</span><span class=\"fase-tag\">op.liberada</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 02</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Comercial, Estoque &amp; OEE</h3>",
+        "      <p>Gestão de pedidos com prazos, cálculo automático de faltas com reserva, saldos por endereço (Almoxarifado, Linha, Expedição, Quarentena) e cálculo em tempo real de OEE.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/pedidos</span><span class=\"fase-tag\">/api/estoque</span><span class=\"fase-tag\">/api/indicadores</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 03</span><span class=\"fase-tipo\">Núcleo &amp; Plugin</span></div>",
+        "      <h3>PCP / MRP &amp; Compras</h3>",
+        "      <p>Explosão de necessidades líquidas cruzando pedidos e reposição com saldo e OPs em aberto. Geração automática de OPs MRP e plugin externo autônomo de compras.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/mrp</span><span class=\"fase-tag\">/api/compras</span><span class=\"fase-tag\">mrp.ordens_geradas</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 04</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Programação APS &amp; Backflush</h3>",
+        "      <p>Sequenciamento de capacidade finita por prioridade e EDD (Earliest Due Date), identificação de postos gargalo e baixa de componentes na etapa exata de consumo.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/programacao</span><span class=\"fase-tag\">programacao.sobrecarga</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 05</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Lotes, Genealogia &amp; Recall</h3>",
+        "      <p>Rastreabilidade bidirecional total. Árvore genealógica de insumos pai-filho, controle de status (Liberado, Quarentena, Bloqueado) e rastreamento de recall até clientes.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/lotes</span><span class=\"fase-tag\">lote.bloqueado</span><span class=\"fase-tag\">recall</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 06</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Custos &amp; Manutenção Preventiva</h3>",
+        "      <p>Apropriação de custo padrão (MD + MOD/GGF) vs. custo real da OP, análise de desvio financeiro e planos de manutenção preventiva disparados por horas e ciclos de produção.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/custos</span><span class=\"fase-tag\">/api/manutencao</span><span class=\"fase-tag\">custos.op_fechada</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 07</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Turnos &amp; Eficiência Operacional</h3>",
+        "      <p>Escalas industriais (T1, T2, T3), definição de turno ativo, alocação dinâmica posto × operador e cálculo automático de taxas de eficiência e qualidade por colaborador.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/turnos</span><span class=\"fase-tag\">turnos.alocacao_alterada</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 08</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Relatórios Executivos &amp; BI</h3>",
+        "      <p>Painel analítico consolidado, indicador OTIF (On-Time In-Full) de cumprimento de prazos, ranking financeiro de perdas/refugos e exportações analíticas em CSV.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/relatorios</span><span class=\"fase-tag\">relatorios.alerta_gerencial</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 09</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Coleta Automática &amp; IoT</h3>",
+        "      <p>Contadores de pulsos de CLP, telemetria contínua de sensores analógicos (temperatura, pressão, vibração), intertravamento de segurança e parada automática do posto.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/coleta</span><span class=\"fase-tag\">coleta.alerta_critico</span><span class=\"fase-tag\">maquina.parada</span></div>",
+        "    </div>",
+        "    <div class=\"fase-card\">",
+        "      <div class=\"fase-card-top\"><span class=\"fase-num\">Fase 10</span><span class=\"fase-tipo\">Núcleo Interno</span></div>",
+        "      <h3>Arquivamento Histórico (tblFin*)</h3>",
+        "      <p>Padrão FactoryViews/MES4: separação cirúrgica entre ordens ativas e arquivo permanente (tblFinOrder, tblFinStep), expurgo periódico por retenção e restauração reversível para auditoria.</p>",
+        "      <div class=\"fase-tags\"><span class=\"fase-tag\">/api/arquivamento</span><span class=\"fase-tag\">arquivamento.op_arquivada</span></div>",
+        "    </div>",
+        "  </div>",
+        "</section>"
+    ], "\n");
+}
+
+fn _arquitetura() -> string ={
+    return join([
+        "<section class=\"section-wrap\" id=\"arquitetura\">",
+        "  <div class=\"arch-card\">",
+        "    <div class=\"sec-tag\" style=\"color:var(--forja-2)\">Pipeline Nativo Cryo / Pyro</div>",
+        "    <h2 class=\"sec-title\" style=\"color:#fff\">Arquitetura de Compilação &amp; Engenharia</h2>",
+        "    <p style=\"color:#c3c7cf;font-size:16px\">Como o EMP atinge desempenho nativo sem depender de runtimes externos:</p>",
+        "    <div class=\"arch-pipeline\">",
+        "      <div class=\"arch-step\"><div class=\"arch-pill\">Código Cryo (.cryo)</div><small style=\"color:#8a909b\">Tipos Estritos &amp; Regras</small></div>",
+        "      <div class=\"arch-arrow\">➔</div>",
+        "      <div class=\"arch-step\"><div class=\"arch-pill\">Bytecode Pyro (.pyro)</div><small style=\"color:#8a909b\">Validação Semântica</small></div>",
+        "      <div class=\"arch-arrow\">➔</div>",
+        "      <div class=\"arch-step\"><div class=\"arch-pill\">C AOT (Emissão C)</div><small style=\"color:#8a909b\">Sem Garbage Collector</small></div>",
+        "      <div class=\"arch-arrow\">➔</div>",
+        "      <div class=\"arch-step\"><div class=\"arch-pill\">MinGW GCC 6.3.0</div><small style=\"color:#8a909b\">Otimização Máquina</small></div>",
+        "      <div class=\"arch-arrow\">➔</div>",
+        "      <div class=\"arch-step\"><div class=\"arch-pill\" style=\"background:var(--forja);color:#16181d\">Executável .exe</div><small style=\"color:#8a909b\">~1MB Nativo Windows</small></div>",
+        "    </div>",
+        "    <div class=\"arch-grid\">",
+        "      <div class=\"arch-feat\">",
+        "        <h4>💎 Design System Forja</h4>",
+        "        <p>Tipografia Space Grotesk, Inter e JetBrains Mono. Console grafite #16181d, assinatura laranja #ff5a1f e verde operacional #0f9f6e.</p>",
+        "      </div>",
+        "      <div class=\"arch-feat\">",
+        "        <h4>⚡ Barramento Desacoplado</h4>",
+        "        <p>Módulos comunicam-se via eventos pub/sub assíncronos. Um novo módulo pode ser adicionado sem alterar o núcleo ou módulos existentes.</p>",
+        "      </div>",
+        "      <div class=\"arch-feat\">",
+        "        <h4>🛡️ Integridade &amp; Concorrência</h4>",
+        "        <p>Controle otimista por versão de etapa de OP (HTTP 409), gravação atômica em disco e isolamento transacional para chão de fábrica.</p>",
+        "      </div>",
+        "    </div>",
+        "  </div>",
+        "</section>"
+    ], "\n");
+}
+
+fn _footer() -> string ={
+    return join([
+        "<footer class=\"footer\">",
+        "  <div class=\"footer-wrap\">",
+        "    <div style=\"font-family:var(--f-display);font-size:22px;color:#fff;font-weight:700\">EMP · Engineering Modular Process</div>",
+        "    <p>ERP e MES Industrial Modular Desenvolvido 100% em Cryo · Compilação Nativa AOT MinGW GCC</p>",
+        "    <div class=\"footer-links\">",
+        "      <a href=\"#inicio\">Início</a>",
+        "      <a href=\"#terminal\">Terminal do Agente</a>",
+        "      <a href=\"#fases\">10 Fases Modulares</a>",
+        "      <a href=\"#arquitetura\">Arquitetura</a>",
+        "      <a href=\"/api/saude\" target=\"_blank\">Verificar /api/saude</a>",
+        "      <a href=\"http://127.0.0.1:8080\" target=\"_blank\">Painel Fabril (8080)</a>",
+        "    </div>",
+        "    <div class=\"footer-copy\">EMP Industrial v0.2.0 · Executável nativo Windows · 101 Testes Automatizados</div>",
+        "  </div>",
+        "</footer>"
+    ], "\n");
+}
+
+fn _js() -> string ={
+    return join([
+        "<script>",
+        "(function(){",
+        "  var form = document.getElementById('form-prompt');",
+        "  var input = document.getElementById('prompt-input');",
+        "  var btnEnviar = document.getElementById('btn-enviar');",
+        "  var btnLimpar = document.getElementById('btn-limpar');",
+        "  var screen = document.getElementById('terminal-screen');",
+        "  var pills = document.querySelectorAll('.quick-pill');",
+        "",
+        "  function horaAtual(){",
+        "    var d = new Date();",
+        "    return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);",
+        "  }",
+        "",
+        "  function escaparHtml(t){",
+        "    var d = document.createElement('div');",
+        "    d.textContent = t;",
+        "    return d.innerHTML;",
+        "  }",
+        "",
+        "  function formatarResposta(cmd, data, modoSimulado){",
+        "    var wrap = document.createElement('div');",
+        "    wrap.className = 'term-entry';",
+        "    var statusTag = data.status === 'ok' ? '<span class=\"term-badge tb-ok\">STATUS: OK</span>' : '<span class=\"term-badge tb-act\">STATUS: ALERTA</span>';",
+        "    var acaoTag = data.acao ? '<span class=\"term-badge tb-act\">' + escaparHtml(data.acao) + '</span>' : '';",
+        "    var badgeSim = modoSimulado ? '<span class=\"term-badge\" style=\"background:#33260c;color:#f2b448;border:1px solid #e08a00\">MODO ESTÁTICO</span>' : '';",
+        "",
+        "    var gridHtml = '';",
+        "    if(data.dados && typeof data.dados === 'object'){",
+        "      gridHtml = '<div class=\"term-grid\">';",
+        "      for(var k in data.dados){",
+        "        var v = data.dados[k];",
+        "        var vStr = typeof v === 'object' ? JSON.stringify(v) : String(v);",
+        "        gridHtml += '<div class=\"term-metric\"><div class=\"tm-lbl\">' + escaparHtml(k.replace(/_/g,' ')) + '</div><div class=\"tm-val\">' + escaparHtml(vStr) + '</div></div>';",
+        "      }",
+        "      gridHtml += '</div>';",
+        "    }",
+        "",
+        "    wrap.innerHTML = '<div class=\"term-cmd-line\">[' + horaAtual() + '] &gt; <b>' + escaparHtml(cmd) + '</b> ' + badgeSim + '</div>' +",
+        "      '<div class=\"term-card\">' +",
+        "      '  <div class=\"term-header\">' + statusTag + acaoTag + '</div>' +",
+        "      '  <div class=\"term-msg\">' + escaparHtml(data.mensagem || 'Comando processado com sucesso.') + '</div>' +",
+        "      gridHtml +",
+        "      '</div>';",
+        "    screen.appendChild(wrap);",
+        "    screen.scrollTop = screen.scrollHeight;",
+        "  }",
+        "",
+        "  function fallbackLocal(cmd){",
+        "    var c = cmd.toLowerCase().trim();",
+        "    if(c.indexOf('status') >= 0 || c.indexOf('fabrica') >= 0 || c.indexOf('fábrica') >= 0){",
+        "      return { status:'ok', acao:'CONSULTA_STATUS_FABRICA', mensagem:'Operação fabril em ritmo nominal. 6 postos ativos em produção, 1 em manutenção preventiva. OEE consolidado da linha em 88.4%.', dados:{ postos_ativos:6, postos_parados:1, oee_linha_pct:88.4, disponibilidade_pct:94.2, desempenho_pct:95.1, qualidade_pct:98.7, turno_vigente:'T1 - Manhã' } };",
+        "    }",
+        "    if(c.indexOf('otif') >= 0 || c.indexOf('kpi') >= 0){",
+        "      return { status:'ok', acao:'CONSULTA_OTIF_KPIS', mensagem:'Índice OTIF consolidado em 92.8% (superando meta de 85.0%). Refugo global controlado em 1.4% (teto: 5.0%).', dados:{ otif_pct:92.8, meta_otif_pct:85.0, pedidos_avaliados:48, pedidos_no_prazo:45, refugo_global_pct:1.4, teto_refugo_pct:5.0, custo_perdas_mes_brl:1420.50 } };",
+        "    }",
+        "    if(c.indexOf('arquiv') >= 0 || c.indexOf('tblfin') >= 0){",
+        "      return { status:'ok', acao:'EXPURGO_HISTORICO_TBLFIN', mensagem:'Rotina de arquivamento executada (Fase 10): 14 ordens concluídas congeladas em tblFinOrder e tblFinStep. Memória operacional liberada e latência de queries acelerada em 64%.', dados:{ ops_arquivadas:14, etapas_congeladas:42, colecao_ordens:'tblFinOrder', colecao_etapas:'tblFinStep', politica_retencao_dias:30, reversibilidade:'TOTAL' } };",
+        "    }",
+        "    if(c.indexOf('sensor') >= 0 || c.indexOf('iot') >= 0 || c.indexOf('telemetria') >= 0){",
+        "      return { status:'ok', acao:'TELEMETRIA_IOT_CHAO_FABRICA', mensagem:'Telemetria IoT em tempo real (Fase 9): Todos os sensores operando dentro dos parâmetros de segurança. Intertravamento armado e seguro.', dados:{ prensa_01_temp_c:64.2, prensa_01_pressao_bar:142.8, solda_02_temp_c:185.0, torno_cnc_vibracao_mm_s:1.1, intertravamento:'ARMADO_SEGURO', pulsos_clp_hoje:12850 } };",
+        "    }",
+        "    if(c.indexOf('turno') >= 0 || c.indexOf('operador') >= 0){",
+        "      return { status:'ok', acao:'CONSULTA_TURNOS_OPERADORES', mensagem:'Turno T1 (06:00 - 14:00) ativo com 12 operadores alocados nos postos de trabalho. Eficiência média de 96.2% e qualidade em 99.1%.', dados:{ turno_ativo:'T1', jornada:'06:00 - 14:00', operadores_alocados:12, eficiencia_media_pct:96.2, qualidade_media_pct:99.1, destaque:'Carlos Silva (OP-104 - 99.8% ef.)' } };",
+        "    }",
+        "    return { status:'ok', acao:'LISTAR_COMANDOS', mensagem:'Agente Industrial EMP pronto para atendimento. Use os atalhos rápidos ou consulte as 10 fases modulares.', dados:{ comandos:['status fábrica','otif e kpis','arquivar ops','sensores iot','turnos e operadores','ajuda'], fases_suportadas:10 } };",
+        "  }",
+        "",
+        "  function enviarPrompt(cmd){",
+        "    if(!cmd || !cmd.trim()) return;",
+        "    cmd = cmd.trim();",
+        "    btnEnviar.disabled = true;",
+        "    btnEnviar.textContent = 'Processando...';",
+        "",
+        "    fetch('/api/prompt', {",
+        "      method: 'POST',",
+        "      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },",
+        "      body: 'prompt=' + encodeURIComponent(cmd)",
+        "    })",
+        "    .then(function(res){",
+        "      if(!res.ok) throw new Error('HTTP ' + res.status);",
+        "      return res.json();",
+        "    })",
+        "    .then(function(data){",
+        "      formatarResposta(cmd, data, false);",
+        "    })",
+        "    .catch(function(err){",
+        "      console.warn('API /api/prompt offline ou falha:', err);",
+        "      var fallback = fallbackLocal(cmd);",
+        "      formatarResposta(cmd, fallback, true);",
+        "    })",
+        "    .finally(function(){",
+        "      btnEnviar.disabled = false;",
+        "      btnEnviar.textContent = '⚡ Executar Prompt';",
+        "      input.value = '';",
+        "      input.focus();",
+        "    });",
+        "  }",
+        "",
+        "  btnEnviar.addEventListener('click', function(){",
+        "    enviarPrompt(input.value);",
+        "  });",
+        "",
+        "  input.addEventListener('keydown', function(e){",
+        "    if(e.key === 'Enter'){",
+        "      e.preventDefault();",
+        "      enviarPrompt(input.value);",
+        "    }",
+        "  });",
+        "",
+        "  btnLimpar.addEventListener('click', function(){",
+        "    screen.innerHTML = '<div class=\"term-entry\"><div class=\"term-cmd-line\">[SISTEMA] <b>Console reinicializado</b></div><div class=\"term-card\"><div class=\"term-header\"><span class=\"term-badge tb-ok\">PRONTO</span></div><div class=\"term-msg\">Console limpo. Digite um comando ou clique em uma das pills acima.</div></div></div>';",
+        "    input.focus();",
+        "  });",
+        "",
+        "  for(var i=0; i<pills.length; i++){",
+        "    pills[i].addEventListener('click', function(){",
+        "      var c = this.getAttribute('data-cmd');",
+        "      input.value = c;",
+        "      enviarPrompt(c);",
+        "    });",
+        "  }",
+        "})();",
+        "</script>"
+    ], "\n");
+}
+
+pub fn pagina_html() -> string ={
+    return "<!doctype html>\n<html lang=\"pt-br\">\n<head>\n"
+        + "  <meta charset=\"utf-8\">\n"
+        + "  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+        + "  <title>EMP Industrial ERP · Manufatura Modular Nativa em Cryo</title>\n"
+        + "  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n"
+        + "  <link href=\"https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap\" rel=\"stylesheet\">\n"
+        + _css()
+        + "</head>\n<body>\n"
+        + _nav()
+        + "<main>\n"
+        + _hero()
+        + _terminal()
+        + _fases()
+        + _arquitetura()
+        + "</main>\n"
+        + _footer()
+        + _js()
+        + "\n</body>\n</html>";
+}
+
+// ── inicializacao e laco do servidor ──
+
+int porta = parse_int(cfg("ERP_LANDING_PORT", "8088")) ?? 8088;
+
+if (!is_dir("build")) {
+    make_dir("build");
+}
+
+string conteudo_html = pagina_html();
+bool ok_escrita = write_file("build/landing.html", conteudo_html);
+
+if (ok_escrita) {
+    print("[EMP Landing] Pagina estatica salva em build/landing.html (" + to_string(len(conteudo_html)) + " bytes)");
+} else {
+    print("[EMP Landing] AVISO: Nao foi possivel escrever build/landing.html");
+}
+
+if (cfg("ERP_STATIC_ONLY", "0") == "1") {
+    print("[EMP Landing] ERP_STATIC_ONLY=1: finalizando sem iniciar servidor HTTP.");
+} else {
+    if (!http_listen(porta)) {
+        print("[EMP Landing] ERRO: Falha ao abrir porta " + to_string(porta));
+    } else {
+        print("[EMP Landing] Servidor HTTP ativo em http://127.0.0.1:" + to_string(porta));
+        print("  Rotas disponiveis:");
+        print("    GET  /            -> Landing Page completa Forja");
+        print("    GET  /api/saude   -> Estado do servidor em JSON");
+        print("    POST /api/prompt  -> Endpoint de prompt do agente");
+        print("  Aguardando requisicoes (Ctrl+C para encerrar)...");
+
+        while (true) {
+            map<string,string> req = http_accept();
+            string m = req["method"];
+            if (len(m) == 0) { continue; }
+            string p = req["path"];
+
+            if (m == "OPTIONS") {
+                http_respond(204, "text/plain", "");
+            } else if ((p == "/" || p == "/landing.html" || p == "/index.html") && m == "GET") {
+                http_respond(200, "text/html; charset=utf-8", conteudo_html);
+            } else if (p == "/api/saude" && (m == "GET" || m == "HEAD")) {
+                http_respond(200, "application/json; charset=utf-8", responder_saude(porta));
+            } else if (p == "/api/prompt") {
+                string prompt_recebido = extrair_prompt(req);
+                string resposta_json = interpretar_prompt(prompt_recebido);
+                http_respond(200, "application/json; charset=utf-8", resposta_json);
+            } else {
+                http_respond(404, "application/json; charset=utf-8", "{\"status\":\"erro\",\"mensagem\":\"Rota nao encontrada\"}");
+            }
+        }
+    }
+}
