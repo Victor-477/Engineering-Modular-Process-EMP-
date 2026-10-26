@@ -1,0 +1,529 @@
+// ============================================================
+//  coleta.cryo — Módulo de Coleta Automática de Chão de Fábrica e IoT
+//
+//  Conexão de máquinas, CLPs e sensores industriais ao EMP:
+//    - Contadores de pulsos de ciclo e contagem automática de peças;
+//    - Telemetria de grandezas analógicas (temperatura, pressão, vibração);
+//    - Monitoramento de limites operacionais com alerta antecipado;
+//    - Intertravamento de segurança: parada de emergência automática do posto
+//      ao atingir limites críticos de sensores (ex: sobreaquecimento);
+//    - Heartbeat contínuo de conectividade e estado da máquina (OPERANDO, PARADA, OCIOSA);
+//    - Apontamento automático direto na Ordem de Produção ativa no posto.
+//
+//  Rotas (prefixo /api/coleta):
+//    GET  /dispositivos              lista sensores e CLPs cadastrados
+//    POST /dispositivos              codigo=&posto=&tipo=&unidade=&limite_alerta=&limite_critico=&ip_origem=
+//    POST /pulso                     posto=&qtd=&refugo=&op=
+//    POST /telemetria                dispositivo=&posto=&valor=&unidade=
+//    GET  /telemetria[?posto=X]      histórico recente de medições de sensores
+//    POST /heartbeat                 posto=&estado=&motivo=
+//    GET  /status                    dashboard de chão de fábrica IoT em tempo real
+//
+//  Eventos publicados:
+//    coleta.pulso_registrado         posto=&qtd=&refugo=&acumulado=
+//    coleta.alerta_critico           dispositivo=&posto=&valor=&limite=&motivo=
+//    coleta.estado_alterado          posto=&estado=&motivo=
+//    maquina.parada                  parada=&posto=&categoria=&motivo=&inicio= (se emergência crítica)
+//
+//  Eventos assinados:
+//    maquina.parada, maquina.liberada
+// ============================================================
+
+import "../../nucleo/contrato.cryo"  as k;
+import "../../nucleo/persist.cryo"   as db;
+import "../../nucleo/eventos.cryo"   as ev;
+import "../../nucleo/form.cryo"      as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+import "../producao/producao.cryo"   as producao;
+
+pub struct Dispositivo {
+    string codigo;
+    string posto;
+    string tipo;
+    string unidade;
+    number limite_alerta;
+    number limite_critico;
+    string ip_origem;
+    bool ativo;
+    int atualizado_em;
+}
+
+pub struct LeituraTelemetria {
+    int id;
+    string dispositivo;
+    string posto;
+    number valor;
+    string unidade;
+    string status;
+    int ts;
+}
+
+pub struct ContadorPosto {
+    string posto;
+    number pulsos_acumulados;
+    number refugo_acumulado;
+    int total_apontamentos;
+    int ultimo_pulso_em;
+    string estado_maquina;
+    number temperatura_atual;
+    number pressao_atual;
+    string alerta;
+}
+
+string _dir = "";
+map<string,string> _dispositivos = {};
+map<string,string> _contadores = {};
+map<string,string> _leituras = {};
+int _prox_leitura = 1;
+
+fn _r1(number v) -> number ={
+    return round(v * 10.0) / 10.0;
+}
+
+fn _r2(number v) -> number ={
+    return round(v * 100.0) / 100.0;
+}
+
+fn _obter_contador(string posto) -> ContadorPosto ={
+    string p = upper(trim(posto));
+    if (has(_contadores, p)) {
+        return json_decode(_contadores[p]) as ContadorPosto;
+    }
+    return ContadorPosto {
+        posto: p,
+        pulsos_acumulados: 0.0,
+        refugo_acumulado: 0.0,
+        total_apontamentos: 0,
+        ultimo_pulso_em: 0,
+        estado_maquina: "OCIOSA",
+        temperatura_atual: 25.0,
+        pressao_atual: 1.0,
+        alerta: ""
+    };
+}
+
+fn _salvar_contador(ContadorPosto cp) ={
+    _contadores[cp.posto] = json_encode(cp);
+    db::salvar(_dir, "contadores", _contadores);
+}
+
+// ── inicialização e dados padrão ──────────────────────────
+
+fn _inicializar_padroes() ={
+    if (len(keys(_dispositivos)) == 0) {
+        Dispositivo d1 = Dispositivo {
+            codigo: "CLP-PRENSA-01",
+            posto: "PRENSA-01",
+            tipo: "CONTADOR",
+            unidade: "pecas",
+            limite_alerta: 5000.0,
+            limite_critico: 10000.0,
+            ip_origem: "192.168.1.101",
+            ativo: true,
+            atualizado_em: now_ms()
+        };
+        Dispositivo d2 = Dispositivo {
+            codigo: "TEMP-PRENSA-01",
+            posto: "PRENSA-01",
+            tipo: "TEMPERATURA",
+            unidade: "C",
+            limite_alerta: 80.0,
+            limite_critico: 95.0,
+            ip_origem: "192.168.1.102",
+            ativo: true,
+            atualizado_em: now_ms()
+        };
+        Dispositivo d3 = Dispositivo {
+            codigo: "CLP-SOLDA-01",
+            posto: "SOLDA-01",
+            tipo: "CONTADOR",
+            unidade: "pecas",
+            limite_alerta: 3000.0,
+            limite_critico: 6000.0,
+            ip_origem: "192.168.1.103",
+            ativo: true,
+            atualizado_em: now_ms()
+        };
+        _dispositivos[d1.codigo] = json_encode(d1);
+        _dispositivos[d2.codigo] = json_encode(d2);
+        _dispositivos[d3.codigo] = json_encode(d3);
+        db::salvar(_dir, "dispositivos", _dispositivos);
+    }
+}
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    _dispositivos = db::carregar(dir, "dispositivos");
+    _contadores = db::carregar(dir, "contadores");
+    _leituras = db::carregar(dir, "telemetria");
+    _prox_leitura = db::maior_id(_leituras) + 1;
+    _inicializar_padroes();
+    return true;
+}
+
+// ── rotas de dispositivos ─────────────────────────────────
+
+pub fn salvar_dispositivo(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string codigo = upper(trim(form::campo(f, "codigo")));
+    string posto = upper(trim(form::campo(f, "posto")));
+    if (len(codigo) == 0 || len(posto) == 0) {
+        return k::erro(422, "codigo e posto sao obrigatorios");
+    }
+
+    string tipo = upper(trim(form::campo(f, "tipo")));
+    if (len(tipo) == 0) { tipo = "CONTADOR"; }
+
+    string unidade = form::campo(f, "unidade");
+    if (len(unidade) == 0) { unidade = "pecas"; }
+
+    number l_alerta = form::numero(f, "limite_alerta", 80.0);
+    number l_critico = form::numero(f, "limite_critico", 95.0);
+    string ip = form::campo(f, "ip_origem");
+    if (len(ip) == 0) { ip = "127.0.0.1"; }
+
+    Dispositivo d = Dispositivo {
+        codigo: codigo,
+        posto: posto,
+        tipo: tipo,
+        unidade: unidade,
+        limite_alerta: l_alerta,
+        limite_critico: l_critico,
+        ip_origem: ip,
+        ativo: true,
+        atualizado_em: now_ms()
+    };
+
+    _dispositivos[codigo] = json_encode(d);
+    db::salvar(_dir, "dispositivos", _dispositivos);
+    return k::criado(json_encode(d));
+}
+
+pub fn listar_dispositivos() -> Dispositivo[] ={
+    Dispositivo[] lista = [];
+    for (string c in sort(keys(_dispositivos))) {
+        Dispositivo d = json_decode(_dispositivos[c]) as Dispositivo;
+        lista.push(d);
+    }
+    return lista;
+}
+
+// ── recepção de pulsos de CLP ─────────────────────────────
+
+pub fn registrar_pulso(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string posto = upper(trim(form::campo(f, "posto")));
+    if (len(posto) == 0) {
+        return k::erro(422, "posto e obrigatorio");
+    }
+
+    number qtd = form::numero(f, "qtd", 1.0);
+    number refugo = form::numero(f, "refugo", 0.0);
+    int op_id = form::inteiro(f, "op", 0);
+
+    ContadorPosto cp = _obter_contador(posto);
+    number novo_acum = cp.pulsos_acumulados + qtd;
+    number novo_ref = cp.refugo_acumulado + refugo;
+    int novo_aponts = cp.total_apontamentos;
+
+    // Se fornecida uma OP, dispara apontamento automático no módulo de produção
+    if (op_id > 0) {
+        novo_aponts = novo_aponts + 1;
+        ev::publicar("producao.apontada", "coleta",
+            "op=" + to_string(op_id) +
+            "&boa=" + to_string(qtd) +
+            "&refugo=" + to_string(refugo) +
+            "&posto=" + posto +
+            "&operador=CLP_AUTO");
+    }
+
+    int agora = now_ms();
+    ContadorPosto atualizado = ContadorPosto {
+        posto: posto,
+        pulsos_acumulados: novo_acum,
+        refugo_acumulado: novo_ref,
+        total_apontamentos: novo_aponts,
+        ultimo_pulso_em: agora,
+        estado_maquina: "OPERANDO",
+        temperatura_atual: cp.temperatura_atual,
+        pressao_atual: cp.pressao_atual,
+        alerta: cp.alerta
+    };
+
+    _salvar_contador(atualizado);
+
+    ev::publicar("coleta.pulso_registrado", "coleta",
+        "posto=" + posto +
+        "&qtd=" + to_string(qtd) +
+        "&refugo=" + to_string(refugo) +
+        "&acumulado=" + to_string(novo_acum));
+
+    return k::ok(json_encode(atualizado));
+}
+
+// ── telemetria e intertravamento de segurança ─────────────
+
+pub fn registrar_telemetria(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string disp_cod = upper(trim(form::campo(f, "dispositivo")));
+    string posto = upper(trim(form::campo(f, "posto")));
+    number valor = form::numero(f, "valor", 0.0);
+    string unidade = form::campo(f, "unidade");
+
+    number l_alerta = 80.0;
+    number l_critico = 95.0;
+
+    if (has(_dispositivos, disp_cod)) {
+        Dispositivo d = json_decode(_dispositivos[disp_cod]) as Dispositivo;
+        if (len(posto) == 0) { posto = d.posto; }
+        if (len(unidade) == 0) { unidade = d.unidade; }
+        l_alerta = d.limite_alerta;
+        l_critico = d.limite_critico;
+    }
+
+    if (len(posto) == 0) {
+        posto = "GERAL";
+    }
+
+    string st = "NORMAL";
+    string alerta_txt = "";
+
+    if (valor >= l_critico) {
+        st = "CRITICO";
+        alerta_txt = "LIMITE CRÍTICO: " + disp_cod + " (" + to_string(valor) + " " + unidade + " >= " + to_string(l_critico) + ")";
+        
+        // Emissão de alerta crítico e parada de emergência automática
+        ev::publicar("coleta.alerta_critico", "coleta",
+            "dispositivo=" + disp_cod +
+            "&posto=" + posto +
+            "&valor=" + to_string(valor) +
+            "&limite=" + to_string(l_critico) +
+            "&motivo=" + url_encode(alerta_txt));
+
+        // Aciona parada automática no barramento
+        ev::publicar("maquina.parada", "coleta",
+            "parada=AUTO-" + to_string(_prox_leitura) +
+            "&posto=" + posto +
+            "&categoria=SEGURANCA" +
+            "&motivo=" + url_encode(alerta_txt) +
+            "&inicio=" + to_string(now_ms()));
+    } else if (valor >= l_alerta) {
+        st = "ALERTA";
+        alerta_txt = "Aviso: " + disp_cod + " (" + to_string(valor) + " " + unidade + " >= " + to_string(l_alerta) + ")";
+    }
+
+    int id = _prox_leitura;
+    _prox_leitura = _prox_leitura + 1;
+    int agora = now_ms();
+
+    LeituraTelemetria lt = LeituraTelemetria {
+        id: id,
+        dispositivo: disp_cod,
+        posto: posto,
+        valor: valor,
+        unidade: unidade,
+        status: st,
+        ts: agora
+    };
+
+    _leituras[to_string(id)] = json_encode(lt);
+    if (len(keys(_leituras)) > 100) {
+        // Mantém últimas 100 leituras para não estourar memória
+        string menor = "999999999";
+        for (string k_id in keys(_leituras)) {
+            if (parse_int(k_id) ?? 0 < parse_int(menor) ?? 999999999) {
+                menor = k_id;
+            }
+        }
+        remove(_leituras, menor);
+    }
+    db::salvar(_dir, "telemetria", _leituras);
+
+    // Atualiza contador do posto com grandezas atuais
+    ContadorPosto cp = _obter_contador(posto);
+    number t_at = cp.temperatura_atual;
+    number p_at = cp.pressao_atual;
+    string est = cp.estado_maquina;
+
+    if (unidade == "C" || contains(disp_cod, "TEMP")) {
+        t_at = valor;
+    }
+    if (unidade == "bar" || contains(disp_cod, "PRESS")) {
+        p_at = valor;
+    }
+    if (st == "CRITICO") {
+        est = "PARADA";
+    }
+
+    ContadorPosto cp_novo = ContadorPosto {
+        posto: posto,
+        pulsos_acumulados: cp.pulsos_acumulados,
+        refugo_acumulado: cp.refugo_acumulado,
+        total_apontamentos: cp.total_apontamentos,
+        ultimo_pulso_em: cp.ultimo_pulso_em,
+        estado_maquina: est,
+        temperatura_atual: t_at,
+        pressao_atual: p_at,
+        alerta: alerta_txt
+    };
+    _salvar_contador(cp_novo);
+
+    return k::criado(json_encode(lt));
+}
+
+pub fn listar_telemetria(string posto_filtro) -> LeituraTelemetria[] ={
+    LeituraTelemetria[] lista = [];
+    string p_filtro = upper(trim(posto_filtro));
+
+    for (string id in sort(keys(_leituras))) {
+        LeituraTelemetria l = json_decode(_leituras[id]) as LeituraTelemetria;
+        if (len(p_filtro) == 0 || l.posto == p_filtro) {
+            lista.push(l);
+        }
+    }
+    return lista;
+}
+
+// ── heartbeat e monitoramento de conectividade ─────────────
+
+pub fn registrar_heartbeat(k::Requisicao r) -> k::Resposta ={
+    map<string,string> f = form::ler(r.corpo);
+    string posto = upper(trim(form::campo(f, "posto")));
+    if (len(posto) == 0) {
+        return k::erro(422, "posto e obrigatorio");
+    }
+
+    string est = upper(trim(form::campo(f, "estado")));
+    if (len(est) == 0) { est = "OPERANDO"; }
+
+    string motivo = form::campo(f, "motivo");
+
+    ContadorPosto cp = _obter_contador(posto);
+    ContadorPosto atualizado = ContadorPosto {
+        posto: posto,
+        pulsos_acumulados: cp.pulsos_acumulados,
+        refugo_acumulado: cp.refugo_acumulado,
+        total_apontamentos: cp.total_apontamentos,
+        ultimo_pulso_em: now_ms(),
+        estado_maquina: est,
+        temperatura_atual: cp.temperatura_atual,
+        pressao_atual: cp.pressao_atual,
+        alerta: motivo
+    };
+
+    _salvar_contador(atualizado);
+
+    ev::publicar("coleta.estado_alterado", "coleta",
+        "posto=" + posto +
+        "&estado=" + est +
+        "&motivo=" + url_encode(motivo));
+
+    return k::ok(json_encode(atualizado));
+}
+
+// ── painel de status em tempo real ────────────────────────
+
+pub fn obter_status() -> ContadorPosto[] ={
+    string[] postos = cadastros::postos_codigos();
+    ContadorPosto[] lista = [];
+
+    for (int i = 0; i < len(postos); i = i + 1) {
+        string p = postos[i];
+        ContadorPosto cp = _obter_contador(p);
+        lista.push(cp);
+    }
+    return lista;
+}
+
+// ── roteador e eventos ────────────────────────────────────
+
+fn rotear(k::Requisicao req) -> k::Resposta ={
+    string rota = req.rota;
+    string metodo = req.metodo;
+
+    if (metodo == "GET") {
+        if (rota == "/dispositivos") {
+            Dispositivo[] ds = listar_dispositivos();
+            return k::json(200, json_encode(ds));
+        }
+        if (rota == "/telemetria") {
+            string p = k::param(req, "posto");
+            LeituraTelemetria[] lts = listar_telemetria(p);
+            return k::json(200, json_encode(lts));
+        }
+        if (rota == "/status") {
+            ContadorPosto[] cps = obter_status();
+            return k::json(200, json_encode(cps));
+        }
+    }
+
+    if (metodo == "POST") {
+        if (rota == "/dispositivos") {
+            return salvar_dispositivo(req);
+        }
+        if (rota == "/pulso") {
+            return registrar_pulso(req);
+        }
+        if (rota == "/telemetria") {
+            return registrar_telemetria(req);
+        }
+        if (rota == "/heartbeat") {
+            return registrar_heartbeat(req);
+        }
+    }
+
+    return k::erro(404, "rota de coleta nao encontrada");
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    map<string,string> f = form::ler(e.dados);
+    string posto = upper(form::campo(f, "posto"));
+
+    if (len(posto) > 0) {
+        ContadorPosto cp = _obter_contador(posto);
+        if (e.tipo == "maquina.parada") {
+            ContadorPosto novo = ContadorPosto {
+                posto: posto,
+                pulsos_acumulados: cp.pulsos_acumulados,
+                refugo_acumulado: cp.refugo_acumulado,
+                total_apontamentos: cp.total_apontamentos,
+                ultimo_pulso_em: cp.ultimo_pulso_em,
+                estado_maquina: "PARADA",
+                temperatura_atual: cp.temperatura_atual,
+                pressao_atual: cp.pressao_atual,
+                alerta: form::campo(f, "motivo")
+            };
+            _salvar_contador(novo);
+        } else if (e.tipo == "maquina.liberada") {
+            ContadorPosto novo = ContadorPosto {
+                posto: posto,
+                pulsos_acumulados: cp.pulsos_acumulados,
+                refugo_acumulado: cp.refugo_acumulado,
+                total_apontamentos: cp.total_apontamentos,
+                ultimo_pulso_em: cp.ultimo_pulso_em,
+                estado_maquina: "OPERANDO",
+                temperatura_atual: cp.temperatura_atual,
+                pressao_atual: cp.pressao_atual,
+                alerta: ""
+            };
+            _salvar_contador(novo);
+        }
+    }
+    return true;
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "coleta",
+        nome: "Coleta Automática de Chão de Fábrica e Sensores",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/coleta",
+        depende: ["cadastros"],
+        assina: ["maquina.parada", "maquina.liberada"],
+        perfis_escrita: ["admin", "pcp", "manutencao", "operador"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}

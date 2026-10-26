@@ -2,6 +2,17 @@
 
 ## Não lançado
 
+### Novo — fase 9: Coleta Automática de Chão de Fábrica e Sensores / IoT (`coleta`)
+- **Módulo de Coleta Automática e IoT** (`src/modulos/coleta/`, prefixo `/api/coleta`, escrita por admin/pcp/manutencao/operador):
+  - **Cadastro de Dispositivos e Sensores**: suporte a contadores de peças de CLP, sensores analógicos (temperatura, pressão, vibração) e sensores de estado com limites de alerta e crítico (`POST /api/coleta/dispositivos`).
+  - **Recepção de Pulsos de Máquina / CLP**: endpoint de alta frequência `POST /api/coleta/pulso` com contagem automática de peças boas e refugo, acumulação contínua e disparo de apontamento automático de lotes para a produção do EMP.
+  - **Telemetria e Intertravamento de Segurança**: endpoint `POST /api/coleta/telemetria` para medições analógicas contínuas; detecção de sobreaquecimento ou anomalias críticas com disparo imediato do alarme `coleta.alerta_critico` e intertravamento de segurança com parada automática do posto (`maquina.parada` com categoria `SEGURANCA`).
+  - **Heartbeat e Monitoramento de Conectividade**: monitoramento contínuo de conectividade das máquinas (`POST /api/coleta/heartbeat`) com transição de estados (`OPERANDO`, `PARADA`, `OCIOSA`) e registro do motivo de parada.
+  - **Dashboard IoT em Tempo Real**: visão integrada do chão de fábrica conectado (`GET /api/coleta/status`) com status de cada posto, contadores acumulados, últimas leituras de grandezas físicas e alertas ativos.
+- **Painel Web**:
+  - Nova aba e seção **Coleta & IoT** no menu principal e no dashboard inicial, com cards visuais de monitoramento em tempo real das máquinas, simulador interativo de pulsos de CLP, transmissor manual de telemetria analógica e tabelas de sensores e leituras.
+- **Testes**: +5 casos em `test_coleta.cryo`, totalizando **96 testes automatizados** passando no `build.ps1` e compilação nativa Windows de `emp.exe`, `compras.exe` e `qualidade.exe`.
+
 ### Novo — fase 8: Relatórios Executivos e BI Industrial (Analytics)
 - **Módulo de Relatórios e BI Industrial** (`src/modulos/relatorios/`, prefixo `/api/relatorios`, leitura ampla e escrita restrita por admin/pcp/diretoria):
   - **KPIs Executivos Consolidados**: rota `GET /api/relatorios/kpis` integrando pedidos, produção, custos, perdas, capacidade e turnos.

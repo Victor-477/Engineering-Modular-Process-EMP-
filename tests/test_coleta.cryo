@@ -1,0 +1,175 @@
+// Testes de Coleta Automática de Chão de Fábrica e IoT com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_coleta.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"               as k;
+import "../src/nucleo/eventos.cryo"                as ev;
+import "../src/nucleo/persist.cryo"                as db;
+import "../src/modulos/cadastros/cadastros.cryo"     as cadastros;
+import "../src/modulos/coleta/coleta.cryo"          as coleta;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _req(string metodo, string rota, string corpo) -> k::Requisicao ={
+    string r = rota;
+    string q = "";
+    int inter = find(rota, "?");
+    if (inter > 0) {
+        string s_rota = rota;
+        r = s_rota[0..inter];
+        q = s_rota[inter + 1..];
+    }
+    return k::Requisicao {
+        metodo: metodo,
+        caminho: "/api/coleta" + r,
+        rota: r,
+        query: q,
+        corpo: corpo,
+        usuario: "admin",
+        perfil: "admin"
+    };
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_coleta")) { make_dir("build/test_coleta"); }
+    string dir = "build/test_coleta/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+
+    for (string c in ["postos", "dispositivos", "contadores", "telemetria"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Postos
+    map<string,string> pts = {};
+    pts["PRENSA"] = "{\"codigo\":\"PRENSA\",\"descricao\":\"Prensa 100t\",\"capacidade_h\":8.0}";
+    pts["SOLDA"] = "{\"codigo\":\"SOLDA\",\"descricao\":\"Posto de Solda\",\"capacidade_h\":8.0}";
+    db::salvar(dir, "postos", pts);
+
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(coleta::descritor().iniciar, dir);
+
+    return dir;
+}
+
+test fn cadastro_e_configuracao_de_dispositivos() ={
+    string dir = _preparar("disp_cad");
+
+    // Cadastra novo dispositivo CLP
+    k::Resposta res = _rotear(coleta::descritor().rotear,
+        _req("POST", "/dispositivos", "codigo=CLP-NOVO&posto=PRENSA&tipo=CONTADOR&unidade=pecas&limite_alerta=1000&limite_critico=2000&ip_origem=192.168.1.55"));
+    assert(res.status == 201, "status POST /dispositivos 201");
+
+    coleta::Dispositivo d = json_decode(res.corpo) as coleta::Dispositivo;
+    assert(d.codigo == "CLP-NOVO", "codigo deve ser CLP-NOVO");
+    assert(d.posto == "PRENSA", "posto deve ser PRENSA");
+    assert(d.limite_alerta == 1000.0, "limite alerta 1000");
+    assert(d.limite_critico == 2000.0, "limite critico 2000");
+
+    // Lista dispositivos
+    k::Resposta res_list = _rotear(coleta::descritor().rotear, _req("GET", "/dispositivos", ""));
+    assert(res_list.status == 200, "status GET /dispositivos 200");
+    coleta::Dispositivo[] lista = json_decode(res_list.corpo) as coleta::Dispositivo[];
+    assert(len(lista) >= 1, "ao menos 1 dispositivo na lista");
+}
+
+test fn recepcao_de_pulsos_do_clp_e_acumulo() ={
+    string dir = _preparar("pulsos_acum");
+
+    // Envia primeiro lote de pulsos do CLP da Prensa
+    k::Resposta res1 = _rotear(coleta::descritor().rotear,
+        _req("POST", "/pulso", "posto=PRENSA&qtd=50&refugo=2"));
+    assert(res1.status == 200, "status POST /pulso lote 1 200");
+
+    coleta::ContadorPosto cp1 = json_decode(res1.corpo) as coleta::ContadorPosto;
+    assert(cp1.posto == "PRENSA", "posto PRENSA");
+    assert(cp1.pulsos_acumulados == 50.0, "50 pulsos acumulados");
+    assert(cp1.refugo_acumulado == 2.0, "2 refugos acumulados");
+    assert(cp1.estado_maquina == "OPERANDO", "estado deve ser OPERANDO");
+
+    // Envia segundo lote de pulsos
+    k::Resposta res2 = _rotear(coleta::descritor().rotear,
+        _req("POST", "/pulso", "posto=PRENSA&qtd=30&refugo=1"));
+    assert(res2.status == 200, "status POST /pulso lote 2 200");
+
+    coleta::ContadorPosto cp2 = json_decode(res2.corpo) as coleta::ContadorPosto;
+    assert(cp2.pulsos_acumulados == 80.0, "80 pulsos acumulados no total");
+    assert(cp2.refugo_acumulado == 3.0, "3 refugos acumulados no total");
+}
+
+test fn telemetria_com_deteccao_de_alerta_e_parada_critica() ={
+    string dir = _preparar("telemetria_alerta");
+
+    // 1. Leitura normal (temperatura 65°C < 80°C alerta)
+    k::Resposta r_norm = _rotear(coleta::descritor().rotear,
+        _req("POST", "/telemetria", "dispositivo=TEMP-01&posto=PRENSA&valor=65.0&unidade=C"));
+    assert(r_norm.status == 201, "leitura normal 201");
+    coleta::LeituraTelemetria lt_norm = json_decode(r_norm.corpo) as coleta::LeituraTelemetria;
+    assert(lt_norm.status == "NORMAL", "status NORMAL");
+
+    // 2. Leitura de alerta (temperatura 85°C >= 80°C alerta e < 95°C critico)
+    k::Resposta r_alt = _rotear(coleta::descritor().rotear,
+        _req("POST", "/telemetria", "dispositivo=TEMP-01&posto=PRENSA&valor=85.0&unidade=C"));
+    assert(r_alt.status == 201, "leitura alerta 201");
+    coleta::LeituraTelemetria lt_alt = json_decode(r_alt.corpo) as coleta::LeituraTelemetria;
+    assert(lt_alt.status == "ALERTA", "status ALERTA");
+
+    // 3. Leitura crítica (temperatura 98°C >= 95°C critico)
+    k::Resposta r_crit = _rotear(coleta::descritor().rotear,
+        _req("POST", "/telemetria", "dispositivo=TEMP-01&posto=PRENSA&valor=98.0&unidade=C"));
+    assert(r_crit.status == 201, "leitura critica 201");
+    coleta::LeituraTelemetria lt_crit = json_decode(r_crit.corpo) as coleta::LeituraTelemetria;
+    assert(lt_crit.status == "CRITICO", "status CRITICO");
+
+    // Verifica que o estado do posto mudou para PARADA
+    coleta::ContadorPosto[] status_lista = coleta::obter_status();
+    bool achou_parada = false;
+    for (int i = 0; i < len(status_lista); i = i + 1) {
+        coleta::ContadorPosto cp = status_lista[i];
+        if (cp.posto == "PRENSA") {
+            assert(cp.estado_maquina == "PARADA", "posto deve ficar PARADA apos leitura critica");
+            assert(cp.temperatura_atual == 98.0, "temperatura registrada deve ser 98.0");
+            achou_parada = true;
+        }
+    }
+    assert(achou_parada, "posto PRENSA foi avaliado no status");
+}
+
+test fn heartbeat_e_transicao_de_estados_da_maquina() ={
+    string dir = _preparar("heartbeat_estado");
+
+    // Envia heartbeat com máquina operando
+    k::Resposta r1 = _rotear(coleta::descritor().rotear,
+        _req("POST", "/heartbeat", "posto=SOLDA&estado=OPERANDO"));
+    assert(r1.status == 200, "heartbeat operando 200");
+    coleta::ContadorPosto cp1 = json_decode(r1.corpo) as coleta::ContadorPosto;
+    assert(cp1.estado_maquina == "OPERANDO", "estado deve ser OPERANDO");
+
+    // Envia heartbeat com máquina parada por motivo de manutenção
+    k::Resposta r2 = _rotear(coleta::descritor().rotear,
+        _req("POST", "/heartbeat", "posto=SOLDA&estado=PARADA&motivo=Troca+de+eletrodo"));
+    assert(r2.status == 200, "heartbeat parada 200");
+    coleta::ContadorPosto cp2 = json_decode(r2.corpo) as coleta::ContadorPosto;
+    assert(cp2.estado_maquina == "PARADA", "estado deve ser PARADA");
+    assert(contains(cp2.alerta, "Troca de eletrodo"), "motivo registrado no alerta");
+}
+
+test fn status_consolidado_do_chao_de_fabrica_iot() ={
+    string dir = _preparar("status_iot");
+
+    k::Resposta res = _rotear(coleta::descritor().rotear, _req("GET", "/status", ""));
+    assert(res.status == 200, "status GET /status 200");
+
+    coleta::ContadorPosto[] lista = json_decode(res.corpo) as coleta::ContadorPosto[];
+    assert(len(lista) >= 2, "deve retornar resumo de ao menos 2 postos");
+
+    bool achou_prensa = false;
+    bool achou_solda = false;
+    for (int i = 0; i < len(lista); i = i + 1) {
+        coleta::ContadorPosto cp = lista[i];
+        if (cp.posto == "PRENSA") { achou_prensa = true; }
+        if (cp.posto == "SOLDA") { achou_solda = true; }
+    }
+    assert(achou_prensa && achou_solda, "ambos os postos PRENSA e SOLDA presentes no status");
+}

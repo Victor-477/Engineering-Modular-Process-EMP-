@@ -45,6 +45,7 @@ Requisitos que orientaram a arquitetura:
 | **Custos Industriais** | interno | Custo padrão da engenharia (MD + MOD/GGF) vs. custo real da OP, apropriação de materiais e horas, taxa de refugo, análise de desvio e fechamento contábil | `custos.op_fechada` | `op.concluida`, `producao.apontada` |
 | **Turnos & Operadores** | interno | Gestão de escalas de turnos, alocação de operadores aos postos, turno ativo, acumulação de métricas por apontamento, eficiência e qualidade por operador | `turnos.alocacao_alterada`, `turnos.atual_alterado` | `producao.etapa_apontada`, `producao.apontada` |
 | **Relatórios e BI** | interno | Painel analítico executivo, nível de serviço de pedidos (OTIF), ranking de perdas/refugos, desempenho e custo de postos e exportações analíticas em CSV | `relatorios.alerta_gerencial` | `pedido.expedido`, `producao.apontada`, `custos.op_fechada` |
+| **Coleta Automática & IoT** | interno | Contadores de pulsos de CLP, telemetria de sensores (temperatura/pressão), intertravamento de segurança com parada automática e apontamento automático de chão de fábrica | `coleta.pulso_registrado`, `coleta.alerta_critico`, `coleta.estado_alterado`, `maquina.parada` | `maquina.parada`, `maquina.liberada` |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
 | **Compras** | **plugin externo** (processo próprio) | Fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas | — | `estoque.falta`, `estoque.abaixo_minimo` |
 | **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
@@ -83,7 +84,7 @@ baixadas do estoque.
 
 | Módulo | Interno/Plugin | Depende de | Observação |
 |---|---|---|---|
-| Coleta automática de chão de fábrica | plugin | indicadores | O OEE entrou na fase 2 com apontamento manual; ler contadores do CLP depende de L-19 |
+| Arquivamento histórico de OPs (tblFin*) | interno | producao, custos | Expurgar/congelar OPs concluídas antigas em arquivo histórico para manter alta performance |
 
 ### 2.3 Fora do escopo
 

@@ -24,6 +24,7 @@ linguagem: **[ESCOPO.md](ESCOPO.md)** · Histórico: **[CHANGELOG.md](CHANGELOG.
 | **Custos Industriais** | interno | Apropriação de custos da produção: custo padrão da engenharia (MD + MOD/GGF) vs. custo real da OP, taxas horárias dos postos, custo de refugo, análise de desvio percentual e fechamento contábil |
 | **Turnos & Operadores** | interno | Gestão de turnos de trabalho, alocação de operadores aos postos, turno ativo da fábrica, produtividade, taxa de qualidade e eficiência operacional por operador |
 | **BI & Relatórios** | interno | Painel analítico executivo, índice OTIF de pontualidade de pedidos, ranking de refugos/perdas financeiras, desempenho de postos e exportações analíticas em CSV |
+| **Coleta Automática & IoT** | interno | Contadores de pulsos de CLP, telemetria de sensores (temperatura/pressão), intertravamento com parada automática e apontamento automático no chão de fábrica |
 | **Qualidade** | **plugin externo** | Não conformidades manuais e automáticas (refugo acima do limite) — processo próprio, sem recompilar o núcleo |
 | **Compras** | **plugin externo** | Gestão de fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas de estoque — processo próprio |
 
