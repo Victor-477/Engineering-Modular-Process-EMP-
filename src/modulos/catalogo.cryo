@@ -22,6 +22,7 @@ import "programacao/programacao.cryo"  as programacao;
 import "lotes/lotes.cryo"              as lotes;
 import "custos/custos.cryo"            as custos;
 import "turnos/turnos.cryo"            as turnos;
+import "relatorios/relatorios.cryo"    as relatorios;
 
 pub fn todos() -> k::Modulo[] ={
     return [
@@ -36,6 +37,7 @@ pub fn todos() -> k::Modulo[] ={
         programacao::descritor(),
         lotes::descritor(),
         custos::descritor(),
-        turnos::descritor()
+        turnos::descritor(),
+        relatorios::descritor()
     ];
 }

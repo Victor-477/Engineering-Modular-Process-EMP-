@@ -44,6 +44,7 @@ Requisitos que orientaram a arquitetura:
 | **Lotes & Rastreabilidade** | interno | Controle de lotes (status/validade), árvore genealógica industrial pai-filho no consumo de etapas, geração de lote em OP, expedição a clientes e rastreamento bidirecional (backward e forward recall) | `lote.criado`, `lote.bloqueado`, `lote.liberado`, `lote.consumido` | `op.concluida`, `producao.etapa_apontada`, `pedido.expedido`, `estoque.movimentado` |
 | **Custos Industriais** | interno | Custo padrão da engenharia (MD + MOD/GGF) vs. custo real da OP, apropriação de materiais e horas, taxa de refugo, análise de desvio e fechamento contábil | `custos.op_fechada` | `op.concluida`, `producao.apontada` |
 | **Turnos & Operadores** | interno | Gestão de escalas de turnos, alocação de operadores aos postos, turno ativo, acumulação de métricas por apontamento, eficiência e qualidade por operador | `turnos.alocacao_alterada`, `turnos.atual_alterado` | `producao.etapa_apontada`, `producao.apontada` |
+| **Relatórios e BI** | interno | Painel analítico executivo, nível de serviço de pedidos (OTIF), ranking de perdas/refugos, desempenho e custo de postos e exportações analíticas em CSV | `relatorios.alerta_gerencial` | `pedido.expedido`, `producao.apontada`, `custos.op_fechada` |
 | **Qualidade** | **plugin externo** (processo próprio) | Não conformidades (NC) manuais e automáticas (refugo acima do limite) | — | `producao.apontada` |
 | **Compras** | **plugin externo** (processo próprio) | Fornecedores, pedidos de compra, recebimento com entrada automática no estoque do EMP e reação a faltas | — | `estoque.falta`, `estoque.abaixo_minimo` |
 | **Sistema** | núcleo | Saúde, módulos e estado, feed de eventos, sessão, autenticação, perfis, auditoria, painel web com abas e formulários | — | — |
@@ -83,7 +84,6 @@ baixadas do estoque.
 | Módulo | Interno/Plugin | Depende de | Observação |
 |---|---|---|---|
 | Coleta automática de chão de fábrica | plugin | indicadores | O OEE entrou na fase 2 com apontamento manual; ler contadores do CLP depende de L-19 |
-| Relatórios / BI | plugin / interno | todos (leitura) | Exportação CSV e consolidação gerencial para tomada de decisão |
 
 ### 2.3 Fora do escopo
 

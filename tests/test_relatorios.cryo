@@ -1,0 +1,238 @@
+// Testes do Módulo de Relatórios e BI Industrial com `test fn` — rodar com:
+//   python ../Burnout/cryoc.py test tests/test_relatorios.cryo --backend pyro
+
+import "../src/nucleo/contrato.cryo"               as k;
+import "../src/nucleo/eventos.cryo"                as ev;
+import "../src/nucleo/persist.cryo"                as db;
+import "../src/modulos/cadastros/cadastros.cryo"     as cadastros;
+import "../src/modulos/producao/producao.cryo"       as producao;
+import "../src/modulos/pedidos/pedidos.cryo"         as pedidos;
+import "../src/modulos/custos/custos.cryo"           as custos;
+import "../src/modulos/relatorios/relatorios.cryo"   as relatorios;
+
+fn _iniciar(fn(string)->bool f, string dir) -> bool ={ return f(dir); }
+fn _rotear(fn(k::Requisicao)->k::Resposta f, k::Requisicao r) -> k::Resposta ={ return f(r); }
+fn _evento(fn(k::Evento)->bool f, k::Evento e) -> bool ={ return f(e); }
+
+fn _req(string metodo, string rota, string corpo) -> k::Requisicao ={
+    string r = rota;
+    string q = "";
+    int inter = find(rota, "?");
+    if (inter > 0) {
+        string s_rota = rota;
+        r = s_rota[0..inter];
+        q = s_rota[inter + 1..];
+    }
+    return k::Requisicao {
+        metodo: metodo,
+        caminho: "/api/relatorios" + r,
+        rota: r,
+        query: q,
+        corpo: corpo,
+        usuario: "admin",
+        perfil: "admin"
+    };
+}
+
+fn _preparar(string caso) -> string ={
+    if (!is_dir("build")) { make_dir("build"); }
+    if (!is_dir("build/test_relatorios")) { make_dir("build/test_relatorios"); }
+    string dir = "build/test_relatorios/" + caso;
+    if (!is_dir(dir)) { make_dir(dir); }
+
+    for (string c in ["produtos", "postos", "estruturas", "ordens", "etapas", "pedidos", "precos_materiais", "taxas_postos", "operadores", "config"]) {
+        if (file_exists(db::caminho(dir, c))) { delete_file(db::caminho(dir, c)); }
+    }
+
+    // Produtos e Postos
+    map<string,string> prods = {};
+    prods["SUPORTE"] = "{\"codigo\":\"SUPORTE\",\"nome\":\"Suporte de Aco\",\"unidade\":\"UN\"}";
+    prods["CHAPA"] = "{\"codigo\":\"CHAPA\",\"nome\":\"Chapa de Aco\",\"unidade\":\"UN\"}";
+    db::salvar(dir, "produtos", prods);
+
+    map<string,string> pts = {};
+    pts["PRENSA"] = "{\"codigo\":\"PRENSA\",\"descricao\":\"Prensa 100t\",\"capacidade_h\":8.0}";
+    pts["SOLDA"] = "{\"codigo\":\"SOLDA\",\"descricao\":\"Posto de Solda\",\"capacidade_h\":8.0}";
+    db::salvar(dir, "postos", pts);
+
+    // Preços e Taxas
+    map<string,string> precos = {};
+    precos["SUPORTE"] = "{\"produto\":\"SUPORTE\",\"preco_unitario\":45.0,\"atualizado_em\":1000}";
+    precos["CHAPA"] = "{\"produto\":\"CHAPA\",\"preco_unitario\":12.0,\"atualizado_em\":1000}";
+    db::salvar(dir, "precos_materiais", precos);
+
+    map<string,string> taxas = {};
+    taxas["PRENSA"] = "{\"posto\":\"PRENSA\",\"taxa_h\":80.0,\"atualizado_em\":1000}";
+    taxas["SOLDA"] = "{\"posto\":\"SOLDA\",\"taxa_h\":95.0,\"atualizado_em\":1000}";
+    db::salvar(dir, "taxas_postos", taxas);
+
+    // Inicializa módulos
+    _iniciar(cadastros::descritor().iniciar, dir);
+    _iniciar(producao::descritor().iniciar, dir);
+    _iniciar(pedidos::descritor().iniciar, dir);
+    _iniciar(custos::descritor().iniciar, dir);
+    _iniciar(relatorios::descritor().iniciar, dir);
+
+    return dir;
+}
+
+test fn kpis_gerenciais_consolidados() ={
+    string dir = _preparar("kpis_gerais");
+
+    int agora = now_ms();
+    // Cadastra 1 pedido
+    map<string,string> peds = {};
+    peds["1"] = "{\"id\":1,\"cliente\":\"CLI-01\",\"itens\":[{\"produto\":\"SUPORTE\",\"quantidade\":100.0,\"ops\":[]}],\"status\":\"ABERTO\",\"criado_em\":" + to_string(agora) + ",\"entrega_prevista\":" + to_string(agora + 86400000) + ",\"expedido_em\":0,\"observacao\":\"\",\"motivo\":\"\",\"atualizado_em\":" + to_string(agora) + "}";
+    db::salvar(dir, "pedidos", peds);
+
+    // Executa requisição de KPIs
+    k::Resposta res = _rotear(relatorios::descritor().rotear, _req("GET", "/kpis", ""));
+    assert(res.status == 200, "status GET /kpis 200");
+
+    relatorios::KpisExecutivos kpi = json_decode(res.corpo) as relatorios::KpisExecutivos;
+    assert(kpi.total_pedidos == 1, "total de pedidos deve ser 1");
+    assert(kpi.taxa_otif_pct == 100.0, "taxa OTIF inicial deve ser 100%");
+    assert(kpi.postos_cadastrados >= 2, "ao menos 2 postos cadastrados");
+    assert(kpi.turno_ativo == "TURNO-1", "turno ativo padrão deve ser TURNO-1");
+}
+
+test fn calculo_de_otif_e_lead_time_pedidos() ={
+    string dir = _preparar("otif_pedidos");
+
+    // Pedido 1: expedido no prazo (expedido_em <= entrega_prevista)
+    // Pedido 2: expedido atrasado (expedido_em > entrega_prevista) em 2 dias
+    // Pedido 3: cancelado
+    map<string,string> peds = {};
+    peds["1"] = "{\"id\":1,\"cliente\":\"CLI-A\",\"itens\":[{\"produto\":\"SUPORTE\",\"quantidade\":50.0,\"ops\":[]}],\"status\":\"EXPEDIDO\",\"criado_em\":1000,\"entrega_prevista\":500000000,\"expedido_em\":400000000,\"observacao\":\"\",\"motivo\":\"\",\"atualizado_em\":400000000}";
+    peds["2"] = "{\"id\":2,\"cliente\":\"CLI-B\",\"itens\":[{\"produto\":\"CHAPA\",\"quantidade\":30.0,\"ops\":[]}],\"status\":\"EXPEDIDO\",\"criado_em\":1000,\"entrega_prevista\":500000000,\"expedido_em\":672800000,\"observacao\":\"\",\"motivo\":\"\",\"atualizado_em\":672800000}";
+    peds["3"] = "{\"id\":3,\"cliente\":\"CLI-C\",\"itens\":[{\"produto\":\"CHAPA\",\"quantidade\":10.0,\"ops\":[]}],\"status\":\"CANCELADO\",\"criado_em\":1000,\"entrega_prevista\":500000000,\"expedido_em\":0,\"observacao\":\"\",\"motivo\":\"cancelado pelo cliente\",\"atualizado_em\":2000}";
+    db::salvar(dir, "pedidos", peds);
+
+    k::Resposta res = _rotear(relatorios::descritor().rotear, _req("GET", "/pedidos_otif", ""));
+    assert(res.status == 200, "status GET /pedidos_otif 200");
+
+    relatorios::AnaliseOtifPedido[] lista = json_decode(res.corpo) as relatorios::AnaliseOtifPedido[];
+    assert(len(lista) == 3, "deve retornar 3 pedidos na analise");
+
+    bool achou_p1 = false;
+    bool achou_p2 = false;
+    bool achou_p3 = false;
+
+    for (int i = 0; i < len(lista); i = i + 1) {
+        relatorios::AnaliseOtifPedido a = lista[i];
+        if (a.pedido_id == 1) {
+            assert(a.situacao_prazo == "NO_PRAZO", "pedido 1 deve estar NO_PRAZO");
+            achou_p1 = true;
+        }
+        if (a.pedido_id == 2) {
+            assert(a.situacao_prazo == "ATRASADO", "pedido 2 deve estar ATRASADO");
+            assert(a.dias_atraso > 0.0, "pedido 2 dias de atraso deve ser positivo");
+            achou_p2 = true;
+        }
+        if (a.pedido_id == 3) {
+            assert(a.situacao_prazo == "CANCELADO", "pedido 3 deve estar CANCELADO");
+            achou_p3 = true;
+        }
+    }
+    assert(achou_p1 && achou_p2 && achou_p3, "todos os 3 pedidos foram verificados");
+
+    // Verifica OTIF calculado
+    relatorios::KpisExecutivos kpi = relatorios::calcular_kpis();
+    assert(kpi.pedidos_expedidos == 2, "2 pedidos expedidos");
+    assert(kpi.pedidos_atrasados == 1, "1 pedido atrasado");
+    assert(kpi.taxa_otif_pct == 50.0, "OTIF deve ser 50% (1 no prazo de 2)");
+}
+
+test fn analise_de_perdas_e_ranking_refugos() ={
+    string dir = _preparar("perdas_refugos");
+
+    // Cria OP com etapa apontada contendo boas e refugo
+    map<string,string> ords = {};
+    ords["1"] = "{\"id\":1,\"produto\":\"SUPORTE\",\"quantidade\":100.0,\"produzido\":90.0,\"refugo\":10.0,\"status\":\"CONCLUIDA\",\"posto\":\"PRENSA\",\"criada_em\":1000,\"atualizada_em\":2000,\"origem\":\"\"}";
+    db::salvar(dir, "ordens", ords);
+
+    map<string,string> execs = {};
+    execs["1"] = "{\"op\":1,\"versao\":2,\"etapas\":[{\"numero\":10,\"operacao\":\"ESTAMPAR\",\"descricao\":\"Estamparia\",\"posto\":\"PRENSA\",\"instrucao\":\"\",\"tempo_min\":3.0,\"status\":\"CONCLUIDA\",\"entrada\":100.0,\"boas\":90.0,\"refugo\":10.0,\"inicio_planejado\":1000,\"fim_planejado\":2000,\"inicio\":1000,\"fim\":2000,\"operador\":\"OP-01\",\"erro\":\"\",\"versao\":2,\"medicoes\":[]}],\"refugo_pendente\":0.0}";
+    db::salvar(dir, "etapas", execs);
+
+    _iniciar(producao::descritor().iniciar, dir);
+
+    k::Resposta res = _rotear(relatorios::descritor().rotear, _req("GET", "/refugos", ""));
+    assert(res.status == 200, "status GET /refugos 200");
+
+    relatorios::AnalisePerdaRefugo[] refs = json_decode(res.corpo) as relatorios::AnalisePerdaRefugo[];
+    assert(len(refs) == 1, "deve retornar 1 registro de perda");
+    assert(refs[0].produto == "SUPORTE", "produto deve ser SUPORTE");
+    assert(refs[0].posto == "PRENSA", "posto deve ser PRENSA");
+    assert(refs[0].pecas_refugo == 10.0, "10 pecas de refugo");
+    assert(refs[0].taxa_refugo_pct == 10.0, "taxa de refugo deve ser 10% (10 de 100)");
+    assert(refs[0].custo_estimado_perda == 450.0, "custo estimado deve ser 10 x 45.0 = 450.0");
+}
+
+test fn desempenho_consolidado_dos_postos() ={
+    string dir = _preparar("postos_desempenho");
+
+    // Cria OPs com apontamentos nos postos PRENSA e SOLDA
+    map<string,string> ords = {};
+    ords["1"] = "{\"id\":1,\"produto\":\"SUPORTE\",\"quantidade\":100.0,\"produzido\":100.0,\"refugo\":0.0,\"status\":\"CONCLUIDA\",\"posto\":\"PRENSA\",\"criada_em\":1000,\"atualizada_em\":2000,\"origem\":\"\"}";
+    db::salvar(dir, "ordens", ords);
+
+    map<string,string> execs = {};
+    execs["1"] = "{\"op\":1,\"versao\":2,\"etapas\":[{\"numero\":10,\"operacao\":\"ESTAMPAR\",\"descricao\":\"Estamparia\",\"posto\":\"PRENSA\",\"instrucao\":\"\",\"tempo_min\":3.0,\"status\":\"CONCLUIDA\",\"entrada\":100.0,\"boas\":100.0,\"refugo\":0.0,\"inicio_planejado\":1000,\"fim_planejado\":19000000,\"inicio\":1000,\"fim\":18001000,\"operador\":\"OP-01\",\"erro\":\"\",\"versao\":2,\"medicoes\":[]}],\"refugo_pendente\":0.0}";
+    db::salvar(dir, "etapas", execs);
+
+    _iniciar(producao::descritor().iniciar, dir);
+
+    k::Resposta res = _rotear(relatorios::descritor().rotear, _req("GET", "/postos", ""));
+    assert(res.status == 200, "status GET /postos 200");
+
+    relatorios::DesempenhoPosto[] ps = json_decode(res.corpo) as relatorios::DesempenhoPosto[];
+    assert(len(ps) >= 2, "ao menos 2 postos analisados");
+
+    bool achou_prensa = false;
+    for (int i = 0; i < len(ps); i = i + 1) {
+        relatorios::DesempenhoPosto p = ps[i];
+        if (p.posto == "PRENSA") {
+            assert(p.ops_processadas == 1, "1 OP processada na Prensa");
+            assert(p.pecas_boas == 100.0, "100 pecas boas na Prensa");
+            assert(p.pecas_refugo == 0.0, "0 refugo na Prensa");
+            assert(p.taxa_horaria == 80.0, "taxa horaria deve ser R$ 80");
+            assert(p.custo_maquina > 0.0, "custo de maquina deve ser calculado");
+            achou_prensa = true;
+        }
+    }
+    assert(achou_prensa, "posto PRENSA foi encontrado");
+}
+
+test fn exportacao_de_relatorios_em_csv() ={
+    string dir = _preparar("export_csv");
+
+    // Testa exportação de KPIs
+    k::Resposta r_kpi = _rotear(relatorios::descritor().rotear, _req("GET", "/exportar?tipo=kpis", ""));
+    assert(r_kpi.status == 200, "GET /exportar?tipo=kpis 200");
+    relatorios::ExportacaoCsv exp_kpi = json_decode(r_kpi.corpo) as relatorios::ExportacaoCsv;
+    assert(exp_kpi.tipo == "kpis", "tipo deve ser kpis");
+    assert(contains(exp_kpi.cabecalho, "Indicador"), "cabecalho deve conter Indicador");
+    assert(contains(exp_kpi.csv_completo, "Total Pedidos"), "csv deve conter Total Pedidos");
+
+    // Testa exportação de Postos
+    k::Resposta r_pst = _rotear(relatorios::descritor().rotear, _req("GET", "/exportar?tipo=postos", ""));
+    assert(r_pst.status == 200, "GET /exportar?tipo=postos 200");
+    relatorios::ExportacaoCsv exp_pst = json_decode(r_pst.corpo) as relatorios::ExportacaoCsv;
+    assert(exp_pst.tipo == "postos", "tipo deve ser postos");
+    assert(contains(exp_pst.cabecalho, "Posto"), "cabecalho deve conter Posto");
+
+    // Testa exportação de Pedidos
+    k::Resposta r_ped = _rotear(relatorios::descritor().rotear, _req("GET", "/exportar?tipo=pedidos", ""));
+    assert(r_ped.status == 200, "GET /exportar?tipo=pedidos 200");
+    relatorios::ExportacaoCsv exp_ped = json_decode(r_ped.corpo) as relatorios::ExportacaoCsv;
+    assert(exp_ped.tipo == "pedidos", "tipo deve ser pedidos");
+    assert(contains(exp_ped.cabecalho, "Pedido"), "cabecalho deve conter Pedido");
+
+    // Testa exportação de Refugos
+    k::Resposta r_ref = _rotear(relatorios::descritor().rotear, _req("GET", "/exportar?tipo=refugos", ""));
+    assert(r_ref.status == 200, "GET /exportar?tipo=refugos 200");
+    relatorios::ExportacaoCsv exp_ref = json_decode(r_ref.corpo) as relatorios::ExportacaoCsv;
+    assert(exp_ref.tipo == "refugos", "tipo deve ser refugos");
+    assert(contains(exp_ref.cabecalho, "Refugo"), "cabecalho deve conter Refugo");
+}

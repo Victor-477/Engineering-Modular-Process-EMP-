@@ -2,6 +2,18 @@
 
 ## Não lançado
 
+### Novo — fase 8: Relatórios Executivos e BI Industrial (Analytics)
+- **Módulo de Relatórios e BI Industrial** (`src/modulos/relatorios/`, prefixo `/api/relatorios`, leitura ampla e escrita restrita por admin/pcp/diretoria):
+  - **KPIs Executivos Consolidados**: rota `GET /api/relatorios/kpis` integrando pedidos, produção, custos, perdas, capacidade e turnos.
+  - **Nível de Serviço e Cumprimento de Prazos (OTIF)**: apuração do On-Time In-Full ($(\text{pedidos no prazo} / \text{total avaliados}) \times 100$) e lead time em dias de cada pedido (`GET /api/relatorios/pedidos_otif`).
+  - **Desempenho e Custos Operacionais por Posto**: apuração de OPs processadas, horas reais apontadas vs. horas padrão da engenharia, taxa de eficiência, taxa de refugo e custo de máquina apropriado com base nas taxas horárias do módulo de custos (`GET /api/relatorios/postos`).
+  - **Ranking de Perdas e Refugos Industriais**: agrupamento analítico por produto e posto com cálculo da taxa de refugo e impacto financeiro estimado em R$ das perdas (`GET /api/relatorios/refugos`).
+  - **Central de Exportações Analíticas em CSV**: geração sob demanda de arquivos CSV para planilhas (`GET /api/relatorios/exportar?tipo=kpis|postos|pedidos|refugos`).
+  - **Alertas Executivos Automáticos**: emissão do evento `relatorios.alerta_gerencial` quando o OTIF cair abaixo da meta de 85% ou o refugo global ultrapassar o teto de 5%.
+- **Painel Web**:
+  - Nova aba e seção **BI & Relatórios** no menu principal e no dashboard inicial, com Big Numbers de OTIF, refugo global e custo real, tabelas interativas de postos, refugos e pedidos com badges de status e botões de exportação direta em CSV via Blob URL.
+- **Testes**: +5 casos em `test_relatorios.cryo`, totalizando **91 testes automatizados** passando no `build.ps1` e compilação nativa Windows de `emp.exe`, `compras.exe` e `qualidade.exe`.
+
 ### Novo — fase 7: Gestão de Turnos, Operadores e Eficiência Operacional
 - **Módulo de Turnos e Operadores** (`src/modulos/turnos/`, prefixo `/api/turnos`, escrita por admin/pcp/qualidade):
   - **Cadastro de Turnos e Horários**: turnos industriais com início, fim e horas de jornada planejadas (`T1`, `T2`, `T3`), com definição de turno ativo da fábrica (`POST /api/turnos/definir_atual`).

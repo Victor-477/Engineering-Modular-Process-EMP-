@@ -1,0 +1,569 @@
+// ============================================================
+//  relatorios.cryo — Módulo de Relatórios Executivos e BI Industrial
+//
+//  Inteligência analítica industrial consolidando métricas de todos os
+//  módulos do EMP:
+//    - KPIs executivos (OTIF, Refugo Global, OEE, Custos, Lead Time)
+//    - Desempenho e custos por posto de trabalho
+//    - Nível de serviço de pedidos e cumprimento de prazos (OTIF)
+//    - Análise de perdas e refugos industriais
+//    - Exportações tabulares formatadas em CSV para análise em planilhas
+//    - Emissão de alertas executivos gerenciais (relatorios.alerta_gerencial)
+//
+//  Rotas (prefixo /api/relatorios):
+//    GET  /kpis                  resumo executivo consolidado da fábrica
+//    GET  /postos                desempenho operacional e custos por posto
+//    GET  /pedidos_otif          análise de pontualidade e OTIF de pedidos
+//    GET  /refugos               ranking de refugos e perdas financeiras
+//    GET  /exportar?tipo=X       gera arquivo tabular em CSV (kpis, postos, pedidos, refugos)
+//
+//  Eventos publicados:
+//    relatorios.alerta_gerencial motivo=&otif=&refugo=&alerta=
+//
+//  Eventos assinados:
+//    pedido.expedido, producao.apontada, custos.op_fechada
+// ============================================================
+
+import "../../nucleo/contrato.cryo"  as k;
+import "../../nucleo/persist.cryo"   as db;
+import "../../nucleo/eventos.cryo"   as ev;
+import "../../nucleo/form.cryo"      as form;
+import "../cadastros/cadastros.cryo" as cadastros;
+import "../producao/producao.cryo"   as producao;
+import "../producao/etapas.cryo"     as etp;
+import "../pedidos/pedidos.cryo"     as pedidos;
+import "../custos/custos.cryo"       as custos;
+
+pub struct KpisExecutivos {
+    int total_pedidos;
+    int pedidos_expedidos;
+    int pedidos_atrasados;
+    number taxa_otif_pct;
+    int total_ops;
+    int ops_concluidas;
+    int ops_em_producao;
+    number pecas_boas_total;
+    number pecas_refugo_total;
+    number taxa_refugo_global_pct;
+    number custo_producao_total;
+    number desvio_custo_total;
+    number taxa_desvio_pct;
+    int operadores_cadastrados;
+    int postos_cadastrados;
+    string turno_ativo;
+    string alerta_critico;
+}
+
+pub struct DesempenhoPosto {
+    string posto;
+    string nome;
+    int ops_processadas;
+    number pecas_boas;
+    number pecas_refugo;
+    number total_pecas;
+    number taxa_refugo_pct;
+    number horas_apontadas;
+    number horas_padrao;
+    number eficiencia_pct;
+    number taxa_horaria;
+    number custo_maquina;
+}
+
+pub struct AnaliseOtifPedido {
+    int pedido_id;
+    string cliente;
+    string status;
+    string itens;
+    int criado_em;
+    int entrega_prevista;
+    int expedido_em;
+    string situacao_prazo;
+    number dias_atraso;
+}
+
+pub struct AnalisePerdaRefugo {
+    string produto;
+    string posto;
+    number pecas_boas;
+    number pecas_refugo;
+    number taxa_refugo_pct;
+    number custo_estimado_perda;
+}
+
+pub struct ExportacaoCsv {
+    string tipo;
+    string cabecalho;
+    string[] linhas;
+    string csv_completo;
+}
+
+string _dir = "";
+
+fn _r1(number v) -> number ={
+    return round(v * 10.0) / 10.0;
+}
+
+fn _r2(number v) -> number ={
+    return round(v * 100.0) / 100.0;
+}
+
+// ── apuração de KPIs Executivos ───────────────────────────
+
+pub fn calcular_kpis() -> KpisExecutivos ={
+    map<string,string> map_pedidos = db::carregar(_dir, "pedidos");
+    map<string,string> map_turnos_cfg = db::carregar(_dir, "config");
+    map<string,string> map_operadores = db::carregar(_dir, "operadores");
+
+    string turno_ativo = "TURNO-1";
+    if (has(map_turnos_cfg, "turno_ativo")) {
+        turno_ativo = map_turnos_cfg["turno_ativo"];
+    }
+
+    int agora = now_ms();
+
+    int total_peds = len(keys(map_pedidos));
+    int peds_expedidos = 0;
+    int peds_atrasados = 0;
+    int peds_no_prazo = 0;
+
+    for (string chave in keys(map_pedidos)) {
+        pedidos::Pedido p = json_decode(map_pedidos[chave]) as pedidos::Pedido;
+        if (p.status == "EXPEDIDO") {
+            peds_expedidos = peds_expedidos + 1;
+            if (p.expedido_em <= p.entrega_prevista || p.entrega_prevista <= 0) {
+                peds_no_prazo = peds_no_prazo + 1;
+            } else {
+                peds_atrasados = peds_atrasados + 1;
+            }
+        } else if (p.status != "CANCELADO") {
+            if (p.entrega_prevista > 0 && agora > p.entrega_prevista) {
+                peds_atrasados = peds_atrasados + 1;
+            } else {
+                peds_no_prazo = peds_no_prazo + 1;
+            }
+        }
+    }
+
+    number otif_pct = 100.0;
+    int total_avaliados = peds_no_prazo + peds_atrasados;
+    if (total_avaliados > 0) {
+        otif_pct = _r1((peds_no_prazo * 100.0) / total_avaliados);
+    }
+
+    producao::OrdemProducao[] ordens = producao::todas_ordens();
+    int total_ops = len(ordens);
+    int ops_concluidas = 0;
+    int ops_em_prod = 0;
+    number boas_total = 0.0;
+    number refugo_total = 0.0;
+
+    for (int i = 0; i < len(ordens); i = i + 1) {
+        producao::OrdemProducao o = ordens[i];
+        if (o.status == "CONCLUIDA") {
+            ops_concluidas = ops_concluidas + 1;
+        } else if (o.status == "LIBERADA" || o.status == "EM_PRODUCAO") {
+            ops_em_prod = ops_em_prod + 1;
+        }
+
+        etp::Execucao exec = producao::execucao_da_op(o.id);
+        for (int j = 0; j < len(exec.etapas); j = j + 1) {
+            etp::EtapaOP e = exec.etapas[j];
+            boas_total = boas_total + e.boas;
+            refugo_total = refugo_total + e.refugo;
+        }
+    }
+
+    number taxa_refugo = 0.0;
+    number total_pecas = boas_total + refugo_total;
+    if (total_pecas > 0.0) {
+        taxa_refugo = _r2((refugo_total * 100.0) / total_pecas);
+    }
+
+    custos::ResumoCustos rc = custos::resumo_custos();
+
+    string alerta = "";
+    if (otif_pct < 85.0 && total_peds > 0) {
+        alerta = "ALERTA: OTIF (" + to_string(otif_pct) + "%) abaixo da meta de 85%!";
+    }
+    if (taxa_refugo > 5.0 && total_pecas > 0.0) {
+        if (len(alerta) > 0) {
+            alerta = alerta + " | ";
+        }
+        alerta = alerta + "ALERTA: Taxa de refugo global (" + to_string(taxa_refugo) + "%) excede o teto de 5%!";
+    }
+
+    string[] postos = cadastros::postos_codigos();
+
+    return KpisExecutivos {
+        total_pedidos: total_peds,
+        pedidos_expedidos: peds_expedidos,
+        pedidos_atrasados: peds_atrasados,
+        taxa_otif_pct: otif_pct,
+        total_ops: total_ops,
+        ops_concluidas: ops_concluidas,
+        ops_em_producao: ops_em_prod,
+        pecas_boas_total: boas_total,
+        pecas_refugo_total: refugo_total,
+        taxa_refugo_global_pct: taxa_refugo,
+        custo_producao_total: rc.custo_total_real,
+        desvio_custo_total: rc.desvio_total,
+        taxa_desvio_pct: rc.desvio_pct,
+        operadores_cadastrados: len(keys(map_operadores)),
+        postos_cadastrados: len(postos),
+        turno_ativo: turno_ativo,
+        alerta_critico: alerta
+    };
+}
+
+// ── relatório de desempenho e custos por posto ────────────
+
+pub fn relatorio_postos() -> DesempenhoPosto[] ={
+    string[] postos = cadastros::postos_codigos();
+    map<string,string> map_taxas = db::carregar(_dir, "taxas_postos");
+
+    producao::OrdemProducao[] ordens = producao::todas_ordens();
+    DesempenhoPosto[] resultado = [];
+
+    for (int p_idx = 0; p_idx < len(postos); p_idx = p_idx + 1) {
+        string p_cod = postos[p_idx];
+
+        number taxa_h = 75.0; // padrão se não configurado
+        if (has(map_taxas, p_cod)) {
+            custos::TaxaPosto tp = json_decode(map_taxas[p_cod]) as custos::TaxaPosto;
+            taxa_h = tp.taxa_h;
+        }
+
+        int ops_cont = 0;
+        number boas_posto = 0.0;
+        number refugo_posto = 0.0;
+        number horas_reais = 0.0;
+        number horas_padrao = 0.0;
+
+        for (int o_idx = 0; o_idx < len(ordens); o_idx = o_idx + 1) {
+            producao::OrdemProducao o = ordens[o_idx];
+            etp::Execucao exec = producao::execucao_da_op(o.id);
+            bool passou_no_posto = false;
+
+            for (int e_idx = 0; e_idx < len(exec.etapas); e_idx = e_idx + 1) {
+                etp::EtapaOP e = exec.etapas[e_idx];
+                if (e.posto == p_cod) {
+                    passou_no_posto = true;
+                    boas_posto = boas_posto + e.boas;
+                    refugo_posto = refugo_posto + e.refugo;
+
+                    if (e.fim > e.inicio && e.inicio > 0) {
+                        horas_reais = horas_reais + ((e.fim - e.inicio) / 3600000.0);
+                    } else if (e.boas > 0.0 || e.refugo > 0.0) {
+                        horas_reais = horas_reais + ((e.tempo_min * (e.boas + e.refugo)) / 60.0);
+                    }
+
+                    horas_padrao = horas_padrao + ((e.tempo_min * e.boas) / 60.0);
+                }
+            }
+            if (passou_no_posto) {
+                ops_cont = ops_cont + 1;
+            }
+        }
+
+        number tot = boas_posto + refugo_posto;
+        number taxa_ref = 0.0;
+        if (tot > 0.0) {
+            taxa_ref = _r2((refugo_posto * 100.0) / tot);
+        }
+
+        number ef_pct = 100.0;
+        if (horas_reais > 0.0) {
+            ef_pct = _r1((horas_padrao * 100.0) / horas_reais);
+        }
+
+        number custo_maq = _r2(horas_reais * taxa_h);
+
+        DesempenhoPosto dp = DesempenhoPosto {
+            posto: p_cod,
+            nome: p_cod,
+            ops_processadas: ops_cont,
+            pecas_boas: boas_posto,
+            pecas_refugo: refugo_posto,
+            total_pecas: tot,
+            taxa_refugo_pct: taxa_ref,
+            horas_apontadas: _r2(horas_reais),
+            horas_padrao: _r2(horas_padrao),
+            eficiencia_pct: ef_pct,
+            taxa_horaria: taxa_h,
+            custo_maquina: custo_maq
+        };
+        resultado.push(dp);
+    }
+
+    return resultado;
+}
+
+// ── relatório de nível de serviço e OTIF de pedidos ───────
+
+pub fn relatorio_pedidos_otif() -> AnaliseOtifPedido[] ={
+    map<string,string> map_pedidos = db::carregar(_dir, "pedidos");
+    int agora = now_ms();
+
+    AnaliseOtifPedido[] resultado = [];
+
+    for (string chave in keys(map_pedidos)) {
+        pedidos::Pedido p = json_decode(map_pedidos[chave]) as pedidos::Pedido;
+
+        string sit = "EM_DIA";
+        number dias = 0.0;
+
+        if (p.status == "CANCELADO") {
+            sit = "CANCELADO";
+        } else if (p.status == "EXPEDIDO") {
+            if (p.entrega_prevista > 0 && p.expedido_em > p.entrega_prevista) {
+                sit = "ATRASADO";
+                dias = _r1((p.expedido_em - p.entrega_prevista) / 86400000.0);
+            } else {
+                sit = "NO_PRAZO";
+                if (p.entrega_prevista > 0 && p.expedido_em > 0) {
+                    dias = _r1((p.expedido_em - p.entrega_prevista) / 86400000.0);
+                }
+            }
+        } else {
+            if (p.entrega_prevista > 0 && agora > p.entrega_prevista) {
+                sit = "ATRASADO";
+                dias = _r1((agora - p.entrega_prevista) / 86400000.0);
+            } else if (p.entrega_prevista > 0) {
+                sit = "EM_DIA";
+                dias = _r1((agora - p.entrega_prevista) / 86400000.0);
+            }
+        }
+
+        AnaliseOtifPedido a = AnaliseOtifPedido {
+            pedido_id: p.id,
+            cliente: p.cliente,
+            status: p.status,
+            itens: pedidos::itens_texto(p.itens),
+            criado_em: p.criado_em,
+            entrega_prevista: p.entrega_prevista,
+            expedido_em: p.expedido_em,
+            situacao_prazo: sit,
+            dias_atraso: dias
+        };
+        resultado.push(a);
+    }
+
+    return resultado;
+}
+
+// ── relatório de perdas e refugos industriais ─────────────
+
+pub fn relatorio_refugos() -> AnalisePerdaRefugo[] ={
+    producao::OrdemProducao[] ordens = producao::todas_ordens();
+    map<string,string> map_precos = db::carregar(_dir, "precos_materiais");
+
+    map<string,number> boas_map = {};
+    map<string,number> ref_map = {};
+    string[] chaves_vistas = [];
+
+    for (int i = 0; i < len(ordens); i = i + 1) {
+        producao::OrdemProducao o = ordens[i];
+        etp::Execucao exec = producao::execucao_da_op(o.id);
+
+        for (int j = 0; j < len(exec.etapas); j = j + 1) {
+            etp::EtapaOP e = exec.etapas[j];
+            string k_id = o.produto + "|" + e.posto;
+
+            if (!has(boas_map, k_id)) {
+                boas_map[k_id] = 0.0;
+                ref_map[k_id] = 0.0;
+                chaves_vistas.push(k_id);
+            }
+            boas_map[k_id] = boas_map[k_id] + e.boas;
+            ref_map[k_id] = ref_map[k_id] + e.refugo;
+        }
+    }
+
+    AnalisePerdaRefugo[] resultado = [];
+
+    for (int k_idx = 0; k_idx < len(chaves_vistas); k_idx = k_idx + 1) {
+        string k_id = chaves_vistas[k_idx];
+        string[] partes = split(k_id, "|");
+        string prod = partes[0];
+        string pst = partes[1];
+
+        number b = boas_map[k_id];
+        number r = ref_map[k_id];
+        number tot = b + r;
+
+        number tx = 0.0;
+        if (tot > 0.0) {
+            tx = _r2((r * 100.0) / tot);
+        }
+
+        number preco_un = 25.0; // custo base de referência
+        if (has(map_precos, prod)) {
+            custos::PrecoMaterial pm = json_decode(map_precos[prod]) as custos::PrecoMaterial;
+            preco_un = pm.preco_unitario;
+        }
+
+        number perda_rs = _r2(r * preco_un);
+
+        AnalisePerdaRefugo item = AnalisePerdaRefugo {
+            produto: prod,
+            posto: pst,
+            pecas_boas: b,
+            pecas_refugo: r,
+            taxa_refugo_pct: tx,
+            custo_estimado_perda: perda_rs
+        };
+        resultado.push(item);
+    }
+
+    return resultado;
+}
+
+// ── exportações estruturadas em CSV ───────────────────────
+
+pub fn gerar_csv(string tipo) -> ExportacaoCsv ={
+    string cab = "";
+    string[] lin = [];
+
+    if (tipo == "postos") {
+        cab = "Posto,Nome,OPs,Pecas Boas,Refugo,Total Pecas,Taxa Refugo (%),Horas Reais,Horas Padrao,Eficiencia (%),Taxa Horaria (R$),Custo Maquina (R$)";
+        DesempenhoPosto[] ps = relatorio_postos();
+        for (int i = 0; i < len(ps); i = i + 1) {
+            DesempenhoPosto p = ps[i];
+            string l = p.posto + "," + p.nome + "," + to_string(p.ops_processadas) + "," +
+                       to_string(p.pecas_boas) + "," + to_string(p.pecas_refugo) + "," + to_string(p.total_pecas) + "," +
+                       to_string(p.taxa_refugo_pct) + "%," + to_string(p.horas_apontadas) + "h," + to_string(p.horas_padrao) + "h," +
+                       to_string(p.eficiencia_pct) + "%," + to_string(p.taxa_horaria) + "," + to_string(p.custo_maquina);
+            lin.push(l);
+        }
+    } else if (tipo == "pedidos") {
+        cab = "Pedido,Cliente,Status,Itens,Situacao Prazo,Dias Atraso";
+        AnaliseOtifPedido[] peds = relatorio_pedidos_otif();
+        for (int i = 0; i < len(peds); i = i + 1) {
+            AnaliseOtifPedido p = peds[i];
+            string l = to_string(p.pedido_id) + "," + p.cliente + "," + p.status + ",\"" + p.itens + "\"," +
+                       p.situacao_prazo + "," + to_string(p.dias_atraso);
+            lin.push(l);
+        }
+    } else if (tipo == "refugos") {
+        cab = "Produto,Posto,Pecas Boas,Refugo,Taxa Refugo (%),Custo Estimado Perda (R$)";
+        AnalisePerdaRefugo[] refs = relatorio_refugos();
+        for (int i = 0; i < len(refs); i = i + 1) {
+            AnalisePerdaRefugo r = refs[i];
+            string l = r.produto + "," + r.posto + "," + to_string(r.pecas_boas) + "," +
+                       to_string(r.pecas_refugo) + "," + to_string(r.taxa_refugo_pct) + "%," + to_string(r.custo_estimado_perda);
+            lin.push(l);
+        }
+    } else {
+        tipo = "kpis";
+        cab = "Indicador,Valor";
+        KpisExecutivos kpi = calcular_kpis();
+        lin.push("Total Pedidos," + to_string(kpi.total_pedidos));
+        lin.push("Pedidos Expedidos," + to_string(kpi.pedidos_expedidos));
+        lin.push("Pedidos Atrasados," + to_string(kpi.pedidos_atrasados));
+        lin.push("Taxa OTIF (%)," + to_string(kpi.taxa_otif_pct) + "%");
+        lin.push("Total OPs," + to_string(kpi.total_ops));
+        lin.push("OPs Concluidas," + to_string(kpi.ops_concluidas));
+        lin.push("OPs Em Producao," + to_string(kpi.ops_em_producao));
+        lin.push("Pecas Boas," + to_string(kpi.pecas_boas_total));
+        lin.push("Refugo Total," + to_string(kpi.pecas_refugo_total));
+        lin.push("Taxa Refugo Global (%)," + to_string(kpi.taxa_refugo_global_pct) + "%");
+        lin.push("Custo Producao Total (R$)," + to_string(kpi.custo_producao_total));
+        lin.push("Desvio Custo Total (R$)," + to_string(kpi.desvio_custo_total));
+        lin.push("Taxa Desvio Custo (%)," + to_string(kpi.taxa_desvio_pct) + "%");
+        lin.push("Operadores Cadastrados," + to_string(kpi.operadores_cadastrados));
+        lin.push("Postos Cadastrados," + to_string(kpi.postos_cadastrados));
+        lin.push("Turno Ativo," + kpi.turno_ativo);
+    }
+
+    string csv_txt = cab + "\n";
+    for (int idx = 0; idx < len(lin); idx = idx + 1) {
+        csv_txt = csv_txt + lin[idx] + "\n";
+    }
+
+    return ExportacaoCsv {
+        tipo: tipo,
+        cabecalho: cab,
+        linhas: lin,
+        csv_completo: csv_txt
+    };
+}
+
+// ── rotas HTTP do módulo ──────────────────────────────────
+
+fn iniciar(string dir) -> bool ={
+    _dir = dir;
+    return true;
+}
+
+fn rotear(k::Requisicao req) -> k::Resposta ={
+    string rota = req.rota;
+
+    if (req.metodo == "GET") {
+        if (rota == "/kpis") {
+            KpisExecutivos kpi = calcular_kpis();
+            if (len(kpi.alerta_critico) > 0) {
+                ev::publicar("relatorios.alerta_gerencial", "relatorios",
+                    "otif=" + to_string(kpi.taxa_otif_pct) +
+                    "&refugo=" + to_string(kpi.taxa_refugo_global_pct) +
+                    "&alerta=" + kpi.alerta_critico);
+            }
+            return k::json(200, json_encode(kpi));
+        }
+
+        if (rota == "/postos") {
+            DesempenhoPosto[] ps = relatorio_postos();
+            return k::json(200, json_encode(ps));
+        }
+
+        if (rota == "/pedidos_otif") {
+            AnaliseOtifPedido[] peds = relatorio_pedidos_otif();
+            return k::json(200, json_encode(peds));
+        }
+
+        if (rota == "/refugos") {
+            AnalisePerdaRefugo[] refs = relatorio_refugos();
+            return k::json(200, json_encode(refs));
+        }
+
+        if (rota == "/exportar") {
+            string tipo = k::param(req, "tipo");
+            if (len(tipo) == 0) {
+                tipo = "kpis";
+            }
+            ExportacaoCsv exp = gerar_csv(tipo);
+            return k::json(200, json_encode(exp));
+        }
+    }
+
+    return k::erro(404, "rota de relatorios nao encontrada");
+}
+
+fn ao_evento(k::Evento e) -> bool ={
+    string nome = e.tipo;
+    if (nome == "pedido.expedido" || nome == "producao.apontada" || nome == "custos.op_fechada") {
+        KpisExecutivos kpi = calcular_kpis();
+        if (len(kpi.alerta_critico) > 0) {
+            ev::publicar("relatorios.alerta_gerencial", "relatorios",
+                "otif=" + to_string(kpi.taxa_otif_pct) +
+                "&refugo=" + to_string(kpi.taxa_refugo_global_pct) +
+                "&alerta=" + kpi.alerta_critico);
+        }
+    }
+    return true;
+}
+
+pub fn descritor() -> k::Modulo ={
+    return k::Modulo {
+        id: "relatorios",
+        nome: "Relatórios e BI Industrial",
+        versao: "1.0.0",
+        contrato: 1,
+        prefixo: "/api/relatorios",
+        depende: ["cadastros"],
+        assina: ["pedido.expedido", "producao.apontada", "custos.op_fechada"],
+        perfis_escrita: ["admin", "pcp", "diretoria"],
+        iniciar: iniciar,
+        rotear: rotear,
+        ao_evento: ao_evento
+    };
+}
