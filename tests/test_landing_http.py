@@ -1,5 +1,6 @@
 # tests/test_landing_http.py
 # Inicia build/landing.exe e valida todas as rotas e comandos do prompt via HTTP.
+import os
 import subprocess
 import time
 import urllib.request
@@ -8,7 +9,9 @@ import json
 import sys
 
 def run_tests():
-    exe_path = "build/landing.exe"
+    # Caminho absoluto: no Windows o CreateProcess não resolve "build/landing.exe"
+    # (relativo com barra normal) e o Popen dá FileNotFoundError.
+    exe_path = os.path.abspath(os.path.join("build", "landing.exe"))
     print(f"== Iniciando {exe_path} na porta 8088...")
     proc = subprocess.Popen([exe_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     

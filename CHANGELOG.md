@@ -2,6 +2,40 @@
 
 ## Não lançado
 
+### Corrigido — pendências das fases 2 e 3
+- **Recebimento de compra perdia a entrada no estoque.** O plugin de compras
+  chamava `POST /api/estoque/entrada` no meio do próprio `/req`, mas o
+  servidor do EMP atende uma requisição por vez e estava esperando esse `/req`:
+  a chamada só terminava no tempo-limite, o usuário via 502, o pedido ficava
+  **RECEBIDO** e o saldo **não mudava** (reproduzido: 5 s, saldo 0). Agora o
+  plugin não chama o EMP: a resposta traz o evento `compras.pedido_recebido` e
+  o estoque dá a entrada (`ENTRADA_COMPRA`, origem `COMPRA-n`) — conferido por
+  HTTP: 24 ms, saldo correto. Itens de produto inexistente ou com fração em
+  unidade contável não entram e geram `estoque.compra_item_rejeitado`. Sem a
+  chamada de volta, também deixa de importar se `ERP_TOKENS` está ligado.
+- **Protocolo de plugin: eventos.** A resposta do `/req` pode trazer linhas
+  `@evento <tipo>|<dados>` entre o cabeçalho e o corpo; o núcleo as publica no
+  barramento com origem = id do plugin. Só são aceitos tipos `<id>.*` (um
+  plugin não forja `maquina.parada`). Plugins antigos continuam iguais.
+  `src/nucleo/plugins.cryo` (`ler_resposta`, testado em `test_eventos`).
+- **O disjuntor voltou às chamadas de plugin** (`_proxy`): só os eventos o
+  usavam desde a migração para este repositório.
+- **Sugestões de reposição COMPRAR descontam o que está em compra**: o
+  estoque acompanha `compras.pedido_criado`/`recebido`/`cancelado`
+  (`estoque::em_compra`, coleção `compras_abertas`, sobrevive ao reinício). As
+  sugestões trazem `em_compra`; no painel a coluna vira "A caminho"
+  (em produção + em compra).
+- **"Em produção" contava peças duas vezes**: somava a OP inteira, inclusive as
+  boas já apontadas, que já estão no saldo — a reposição e o **MRP** sugeriam
+  de menos. Agora é a quantidade da OP menos as boas apontadas
+  (`producao.apontada`), nunca negativo.
+- **Fração em unidade contável também é recusada no estoque**: entrada,
+  ajuste (saldo contado) e transferência (422 "deve ser inteira").
+- `tests/test_landing_http.py` iniciava `build/landing.exe` por caminho
+  relativo com barra, que o Windows não resolve: o `build.ps1` falhava sempre
+  no último passo. Agora usa o caminho absoluto.
+- Testes: +3 em `test_estoque` (15), +2 em `test_eventos` (4).
+
 ### Novo — Testes de Interação Cognitiva em Tempo Real do Agente LLM & Documentação Completa
 - **Suíte de Testes Fim a Fim em Tempo Real** (`tests/test_realtime_llm.py`):
   - **Validação Concorrente Multi-Serviço**: 12 etapas automáticas cruzando simultaneamente o ERP Core (`emp.exe`, porta 8080) e o servidor da Landing Page (`landing.exe`, porta 8088).

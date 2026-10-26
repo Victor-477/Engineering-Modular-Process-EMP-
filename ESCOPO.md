@@ -405,7 +405,11 @@ supervisiona processos (L-18).
 ### 9.2 Plugin externo (sem recompilar o núcleo)
 
 1. Escrever `plugins_src/<id>/<id>.cryo` implementando `GET /saude`, `POST /req`,
-   `POST /evento` (modelo: `qualidade.cryo`).
+   `POST /evento` (modelo: `qualidade.cryo`). Para avisar o ERP de um fato, o
+   plugin põe linhas `@evento <id>.<nome>|<dados>` na resposta do `/req` — o
+   núcleo as publica no barramento. **Nunca** chamar a API do EMP de dentro de
+   um `/req`: o servidor é sequencial e está esperando essa resposta (modelo:
+   `compras.cryo`).
 2. Compilar para `<id>.exe`, copiar para o servidor e iniciar.
 3. Criar `plugins/<id>.plugin` (id, prefixo, url, assina, perfis_escrita).
 4. Reiniciar o `emp.exe`. O módulo aparece em `/api/sistema/modulos` e no painel.

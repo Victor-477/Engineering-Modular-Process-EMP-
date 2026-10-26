@@ -137,6 +137,8 @@ Assinados: `producao.apontada`, `op.liberada`, **`pedido.expedido`**.
   não diz em que etapa cada componente entra.
 - `op.liberada` confere a falta pelo saldo **total**, não pelo endereço de onde o
   backflush vai tirar.
-- `/sugestoes` não desconta OPs já abertas nem compras: depois de "Criar OP" a
+- *Resolvido depois:* `/sugestoes` desconta o que falta produzir das OPs abertas
+  (fase 3 e correção da dupla contagem) e os pedidos de compra em aberto do plugin
+  (eventos `compras.pedido_*`). Texto original: `/sugestoes` não desconta OPs já abertas nem compras: depois de "Criar OP" a
   sugestão continua até a produção entrar.
 - Não há rota para apagar endereço ou regra.
